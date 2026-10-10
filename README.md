@@ -1,7 +1,7 @@
 # BugHunter Agent
 
-Phase 8 adds isolated browser-session metadata, optional Playwright execution,
-and human-assisted login infrastructure to the standalone Python project.
+Phase 9 adds a local, vendor-neutral Traffic Store with protected HTTP evidence
+and browser-session attribution. It does not capture live traffic or replay requests.
 The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
@@ -25,6 +25,8 @@ python3 -m venv .venv
 .venv/bin/hackbot auth status example org1_admin
 .venv/bin/hackbot browser create example --anonymous
 .venv/bin/hackbot browser list example
+.venv/bin/hackbot traffic list example
+.venv/bin/hackbot traffic stats example
 ```
 
 The `example` commands require `[targets].root` to point at
@@ -131,3 +133,6 @@ identity-verification gate are documented in
 caller uses the manager API to launch and verify a session; the CLI does not
 start target browsing or own a background browser process. The optional VNC
 helper is not started automatically.
+
+Traffic storage, redacted CLI views, bounded queries, and the later Burp handoff
+are documented in [`docs/PHASE9_TRAFFIC_STORE.md`](docs/PHASE9_TRAFFIC_STORE.md).

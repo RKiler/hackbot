@@ -20,6 +20,7 @@ from .logging import SecretRedactor
 from .secrets import RoutedSecretProvider, SecretError
 from .store import StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository, load_target_package
+from .traffic import TrafficError, TrafficExchange, TrafficStore
 
 
 def _nearest_existing(path: Path) -> Path:
@@ -59,8 +60,8 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 8,
-        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_auth_and_browser_sessions",
+        "phase": 9,
+        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_auth_browser_sessions_and_traffic_store",
         "recon_integration": "adapter_available_not_connected",
         "identity_registry": "local_metadata_only_not_checked",
         "auth_contexts": "local_metadata_only_not_checked",
@@ -92,6 +93,13 @@ def _status(config: AppConfig) -> dict[str, object]:
             )
         },
     }
+
+
+def _traffic_identity_alias(store: TrafficStore, exchange: TrafficExchange) -> str:
+    if exchange.attribution.verified_identity_id is None:
+        return exchange.attribution.auth_state.value
+    identity = store.registry.get_identity(exchange.target_id, exchange.attribution.verified_identity_id)
+    return identity.alias if identity is not None else "VERIFIED_IDENTITY_UNAVAILABLE"
 
 
 def main(
@@ -147,6 +155,17 @@ def main(
     browser_stop.add_argument("session")
     browser_reconcile = browser_commands.add_parser("reconcile", help="fail closed if a browser process is unavailable")
     browser_reconcile.add_argument("session")
+    traffic = commands.add_parser("traffic", help="inspect local protected traffic metadata")
+    traffic_commands = traffic.add_subparsers(dest="traffic_command", required=True)
+    traffic_list = traffic_commands.add_parser("list", help="page a target's exchanges")
+    traffic_list.add_argument("target")
+    traffic_list.add_argument("--limit", type=int, default=20)
+    traffic_list.add_argument("--cursor")
+    traffic_show = traffic_commands.add_parser("show", help="show one redacted exchange")
+    traffic_show.add_argument("exchange")
+    traffic_stats = traffic_commands.add_parser("stats", help="bounded target traffic sample")
+    traffic_stats.add_argument("target")
+    traffic_stats.add_argument("--sample-limit", type=int, default=1000)
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -184,6 +203,45 @@ def main(
             result = {"available": False, "provider": None, "kind": "UNKNOWN"}
         print(json.dumps(result, sort_keys=True), file=out)
         return 0 if result["available"] else 1
+
+    if args.command == "traffic":
+        try:
+            assert config.targets is not None
+            store = TrafficStore.from_config(config)
+            if args.traffic_command == "show":
+                exchange = store.get_exchange(args.exchange)
+                if exchange is None:
+                    print("hackbot: exchange not found", file=err)
+                    return 1
+                result = exchange.to_dict()
+                result["identity_alias"] = _traffic_identity_alias(store, exchange)
+            else:
+                package = TargetPackageRepository(config.targets.root).get_target_package(args.target)
+                if package is None:
+                    print("hackbot: target package not found", file=err)
+                    return 1
+                if args.traffic_command == "list":
+                    page = store.list_exchanges_for_target(package.target.id, limit=args.limit, cursor=args.cursor)
+                    result = {"target": package.id, "items": [
+                        {"id": item.id, "method": item.request.record.method,
+                         "origin": item.request.origin, "path": item.request.display_path,
+                         "status": item.response.record.status_code if item.response else None,
+                         "identity_alias": _traffic_identity_alias(store, item),
+                         "auth_state": item.attribution.auth_state.value,
+                         "declared_tenant_ids": list(item.attribution.declared_tenant_ids),
+                         "declared_role_ids": list(item.attribution.declared_role_ids),
+                         "source": item.source.value, "observed_at": item.observed_at.isoformat(),
+                         "fingerprint": item.request.structural_fingerprint,
+                         "scope": item.scope_result.value, "state": item.state.value}
+                        for item in page.items], "next_cursor": page.next_cursor}
+                else:
+                    result = store.stats(package.target.id, sample_limit=args.sample_limit)
+        except (TrafficError, ValueError, OSError, TypeError, sqlite3.Error,
+                StoreNotInitialized, StoreSchemaError):
+            print("hackbot: traffic metadata is unavailable or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
 
     if args.command == "browser":
         try:

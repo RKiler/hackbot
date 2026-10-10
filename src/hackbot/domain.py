@@ -288,6 +288,8 @@ class TrafficSource(StrEnum):
     BROWSER = "BROWSER"
     HACKBOT = "HACKBOT"
     IMPORT = "IMPORT"
+    HAR_IMPORT = "HAR_IMPORT"
+    MANUAL_IMPORT = "MANUAL_IMPORT"
     FIXTURE = "FIXTURE"
 
 

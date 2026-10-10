@@ -104,3 +104,13 @@ integration decisions, not silent defaults.
 | D-044 | Store only non-secret BrowserSession metadata/events in BugHunter SQLite schema version 4. Put each profile under a generated target/identity/session path, require a BugHunter ownership marker, and preserve authenticated profiles unless explicitly purged. | Session continuity needs durable references, but cookies/browser storage are sensitive capabilities and never belong in SQLite or CLI output. |
 | D-045 | Treat manual completion and imported cookies as `VERIFYING_IDENTITY`, never `VALID`. Atomically mark BrowserSession and AuthContext valid only after an exact expected user/tenant match; missing or wrong proof fails closed. | The recon broker's generic completion marker is not reliable account proof, and cookies/browser launch do not establish who is logged in. |
 | D-046 | Keep browser proxy configuration generic and CA trust explicit. Do not attach to recon CDP, install Burp CA globally, or introduce Burp-specific core models. | A later interception proxy can be inserted behind a browser provider without changing session identity or traffic provenance. |
+
+## Phase 9
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-047 | Persist vendor-neutral logical HTTP observations in BugHunter SQLite schema version 5, with immutable request/response rows and a mutable completion state for each exchange. | Phase 9 needs traceable complete and incomplete captures without touching recon PostgreSQL or coupling to Burp. |
+| D-048 | Keep retained request/response observations in SECRET Phase 3 Evidence/Artifact storage; omit captured authentication headers and credential-like query values, and withhold bodies with recognizable credential material. Preserve original body size/hash separately. | Non-auth structure remains available under explicit access, while replay must resolve current credentials through AuthContext. |
+| D-049 | Trust an Identity for browser traffic only from a currently verified Phase 8 SessionContext. Preserve declared identity separately; treat tenant/role metadata as declared hints and principal as observed only when evidence-backed. | A wrong, stale, or unverified browser session must never become another account's traffic baseline. |
+| D-050 | Index only safe structural metadata, hash correlation labels, page all traffic queries by target and keyset, and cap statistics to a recent sample. | Future high traffic volume and sensitive URLs rule out unbounded scans and value indexing. |
+| D-051 | Defer Burp capture to Phase 10 behind `TrafficCaptureProvider`; no browser service, replay, active executor, or validator is introduced in Phase 9. | Burp is a source/proxy backend, not the canonical traffic or reasoning model. |
