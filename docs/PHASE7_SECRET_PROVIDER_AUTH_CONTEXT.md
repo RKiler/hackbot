@@ -88,8 +88,8 @@ Statuses:
 
 Preparation outcomes refine status: READY, MANUAL_LOGIN_REQUIRED,
 IMPORTED_SESSION_REFERENCE_AVAILABLE, MISSING_SECRET, DISABLED,
-UNSUPPORTED_PROVIDER, and UNKNOWN. An imported-session reference means only
-that its **metadata** is configured; no session was imported or verified.
+UNSUPPORTED_PROVIDER, and UNKNOWN. An available imported-session reference
+means protected material is present; no session was imported or verified.
 Configured `IdentityStatus.ACTIVE` means eligible metadata, not logged in.
 Disabled identities prepare as LOCKED; pending/unknown identities do not
 prepare READY. `prepare` never resolves a value. The manager can mark EXPIRED,

@@ -87,8 +87,9 @@ class AuthContext:
         if not isinstance(self.preparation, AuthPreparation):
             raise ValueError("Invalid authentication preparation")
         validate_secret_ref(self.secret_ref)
-        for ref in (self.browser_session_ref, self.csrf_metadata_ref):
-            validate_secret_ref(ref)
+        if self.browser_session_ref is not None:
+            validate_entity_id(self.browser_session_ref, "BSESSION")
+        validate_secret_ref(self.csrf_metadata_ref)
         if self.evidence_id is not None:
             validate_entity_id(self.evidence_id, "EV")
         if self.provider is not None and self.provider not in PROVIDER_LABELS:
@@ -186,8 +187,10 @@ class AuthContextManager:
             status, preparation = AuthStatus.REAUTH_REQUIRED, AuthPreparation.MANUAL_LOGIN_REQUIRED
         elif selected is AuthMechanism.IMPORTED_SESSION:
             status = AuthStatus.REAUTH_REQUIRED
-            preparation = (AuthPreparation.IMPORTED_SESSION_REFERENCE_AVAILABLE if identity.secret_ref is not None
-                           and not provider_error and not missing else AuthPreparation.MISSING_SECRET)
+            preparation = (AuthPreparation.IMPORTED_SESSION_REFERENCE_AVAILABLE
+                           if identity.secret_ref is not None and details is not None and details.available
+                           and details.kind is SecretKind.SESSION_IMPORT_REFERENCE
+                           else AuthPreparation.MISSING_SECRET)
         elif provider_error:
             status, preparation = AuthStatus.INVALID, AuthPreparation.UNSUPPORTED_PROVIDER
         elif missing or details is None or not details.available:
@@ -255,7 +258,7 @@ class AuthContextManager:
             raise ValueError("AuthContext is not prepared")
         now = max(datetime.now(timezone.utc), current.updated_at + timedelta(microseconds=1))
         with self.registry.store._connection() as connection:
-            updated = connection.execute("""UPDATE auth_contexts SET status=?,updated_at=?
+            updated = connection.execute("""UPDATE auth_contexts SET status=?,browser_session_ref=NULL,updated_at=?
                 WHERE auth_context_id=? AND updated_at=?""",
                 (status.value, now.isoformat(), current.id, current.updated_at.isoformat())).rowcount
             if updated != 1:
@@ -272,3 +275,18 @@ class AuthContextManager:
 
     def mark_reauth_required(self, target_id: str, identity_id: str) -> AuthContext:
         return self.set_status(target_id, identity_id, AuthStatus.REAUTH_REQUIRED)
+
+    def _mark_verified_in_transaction(self, connection: sqlite3.Connection, context: AuthContext,
+                                      session_id: str, verified_at: datetime) -> None:
+        """Called only by the browser manager after a matching verifier result."""
+        validate_entity_id(session_id, "BSESSION")
+        updated = connection.execute("""UPDATE auth_contexts
+            SET status='VALID',browser_session_ref=?,updated_at=?
+            WHERE auth_context_id=? AND updated_at=?""",
+            (session_id, verified_at.isoformat(), context.id, context.updated_at.isoformat())).rowcount
+        if updated != 1:
+            raise ValueError("AuthContext changed during session verification")
+        connection.execute("""INSERT INTO auth_context_events
+            (auth_context_id,event_type,old_status,new_status,occurred_at) VALUES (?,?,?,?,?)""",
+            (context.id, "STATUS_CHANGED", context.status.value, AuthStatus.VALID.value,
+             verified_at.isoformat()))

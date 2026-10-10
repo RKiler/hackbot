@@ -1,4 +1,4 @@
-"""Read-only local command-line interface."""
+"""Local CLI; only explicit identity/browser operations mutate BugHunter state."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from typing import Mapping, Sequence, TextIO
 
 from . import __version__
 from .auth import AuthContextManager
+from .browser import BrowserError, BrowserSessionManager
+from .browser_playwright import PlaywrightBrowserDriver
 from .config import AppConfig, ConfigError, load_config
 from .identity_registry import IdentityRegistry
 from .logging import SecretRedactor
@@ -57,11 +59,17 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 7,
-        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_and_auth_metadata",
+        "phase": 8,
+        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_auth_and_browser_sessions",
         "recon_integration": "adapter_available_not_connected",
         "identity_registry": "local_metadata_only_not_checked",
         "auth_contexts": "local_metadata_only_not_checked",
+        "browser_sessions": "local_metadata_only_not_checked",
+        "browser": {
+            "profile_root": str(config.browser.profile_root) if config.browser else None,
+            "dedicated_display_configured": bool(config.browser and config.browser.display),
+            "vnc_configured": bool(config.browser and config.browser.vnc_url),
+        },
         "target_packages": {
             "authority": "TARGET_PACKAGE",
             "recon_inventory": "NOT_CONSULTED",
@@ -123,6 +131,22 @@ def main(
     secret = commands.add_parser("secret", help="inspect configured secret availability")
     secret_commands = secret.add_subparsers(dest="secret_command", required=True)
     secret_commands.add_parser("check", help="check availability without showing a value").add_argument("secret_ref")
+    browser = commands.add_parser("browser", help="inspect or manage local browser session metadata")
+    browser_commands = browser.add_subparsers(dest="browser_command", required=True)
+    browser_list = browser_commands.add_parser("list", help="list a target's local browser sessions")
+    browser_list.add_argument("target")
+    browser_list.add_argument("--limit", type=int, default=20)
+    browser_list.add_argument("--cursor")
+    browser_status = browser_commands.add_parser("status", help="show one local browser session")
+    browser_status.add_argument("session")
+    browser_create = browser_commands.add_parser("create", help="create an isolated profile; does not launch")
+    browser_create.add_argument("target")
+    browser_create.add_argument("identity", nargs="?")
+    browser_create.add_argument("--anonymous", action="store_true")
+    browser_stop = browser_commands.add_parser("stop", help="stop a local browser session")
+    browser_stop.add_argument("session")
+    browser_reconcile = browser_commands.add_parser("reconcile", help="fail closed if a browser process is unavailable")
+    browser_reconcile.add_argument("session")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -160,6 +184,46 @@ def main(
             result = {"available": False, "provider": None, "kind": "UNKNOWN"}
         print(json.dumps(result, sort_keys=True), file=out)
         return 0 if result["available"] else 1
+
+    if args.command == "browser":
+        try:
+            assert config.browser is not None and config.secrets is not None and config.targets is not None
+            registry = IdentityRegistry.from_config(config)
+            manager = BrowserSessionManager(
+                registry, AuthContextManager(registry, RoutedSecretProvider(config.secrets, environ)),
+                PlaywrightBrowserDriver(config.browser.chromium_executable), config.browser,
+            )
+            if args.browser_command in {"list", "create"}:
+                package = TargetPackageRepository(config.targets.root).get_target_package(args.target)
+                if package is None or registry.target_id_for_package(package.id) != package.target.id:
+                    print("hackbot: target is not registered locally", file=err)
+                    return 1
+                if args.browser_command == "list":
+                    page = manager.list_sessions_for_target(package.target.id, limit=args.limit, cursor=args.cursor)
+                    result = {"items": [item.to_dict() for item in page.items], "next_cursor": page.next_cursor}
+                else:
+                    if args.anonymous and args.identity or not args.anonymous and not args.identity:
+                        raise BrowserError("Specify one identity or --anonymous")
+                    identity_record = None if args.anonymous else registry.get_identity(package.target.id, args.identity)
+                    if not args.anonymous and identity_record is None:
+                        print("hackbot: identity not registered for target", file=err)
+                        return 1
+                    result = manager.create(package.target.id, identity_record.id if identity_record else None).to_dict()
+            elif args.browser_command == "status":
+                session = manager.get(args.session)
+                if session is None:
+                    print("hackbot: browser session not found", file=err)
+                    return 1
+                result = {"session": session.to_dict(), "context": manager.session_context(session.id).to_dict()}
+            elif args.browser_command == "stop":
+                result = manager.stop(args.session).to_dict()
+            else:
+                result = manager.reconcile_stale(args.session).to_dict()
+        except (ValueError, OSError, TypeError, sqlite3.Error, StoreNotInitialized, StoreSchemaError):
+            print("hackbot: browser metadata is unavailable or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
 
     if args.command == "auth":
         try:

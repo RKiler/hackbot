@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import tomllib
 from typing import Mapping
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -48,6 +49,7 @@ class AppConfig:
     store: StoreSettings | None = None
     targets: TargetSettings | None = None
     secrets: SecretSettings | None = None
+    browser: BrowserSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,49 @@ class SecretSettings:
                 raise ConfigError("Secret environment reference is outside allowed prefixes")
 
 
+@dataclass(frozen=True)
+class BrowserSettings:
+    profile_root: Path
+    display: str | None = None
+    vnc_url: str | None = None
+    chromium_executable: Path | None = None
+    max_sessions: int = 20
+    max_page_size: int = 50
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.profile_root, Path) or not self.profile_root.is_absolute()
+                or ".." in self.profile_root.parts):
+            raise ConfigError("Browser profile root must be absolute")
+        if self.display is not None and (not isinstance(self.display, str)
+                                         or not re.fullmatch(r":\d{3,4}", self.display)
+                                         or int(self.display[1:]) == 99):
+            raise ConfigError("Invalid dedicated browser display")
+        if self.vnc_url is not None:
+            if not isinstance(self.vnc_url, str):
+                raise ConfigError("Invalid dedicated VNC endpoint")
+            try:
+                parsed = urlsplit(self.vnc_url)
+                valid = (parsed.scheme == "http" and parsed.hostname == "127.0.0.1"
+                         and parsed.port is not None and parsed.port != 6080
+                         and parsed.path == "/vnc.html" and not parsed.username
+                         and not parsed.password and not parsed.query and not parsed.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ConfigError("Invalid dedicated VNC endpoint")
+        if self.vnc_url is not None and self.display is None:
+            raise ConfigError("Dedicated VNC endpoint requires a browser display")
+        if self.chromium_executable is not None and (
+            not isinstance(self.chromium_executable, Path) or not self.chromium_executable.is_absolute()
+            or ".." in self.chromium_executable.parts
+        ):
+            raise ConfigError("Chromium executable must be an absolute path")
+        if type(self.max_sessions) is not int or not 1 <= self.max_sessions <= 100:
+            raise ConfigError("Browser max_sessions must be between 1 and 100")
+        if type(self.max_page_size) is not int or not 1 <= self.max_page_size <= 100:
+            raise ConfigError("Browser max_page_size must be between 1 and 100")
+
+
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -161,7 +206,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -176,6 +221,10 @@ def load_config(
     )
     targets_table = _table(top.get("targets", {}), frozenset({"root"}), "targets")
     secrets_table = _table(top.get("secrets", {}), frozenset({"allowed_env_prefixes", "references"}), "secrets")
+    browser_table = _table(top.get("browser", {}),
+                           frozenset({"profile_root", "display", "vnc_url", "chromium_executable",
+                                      "max_sessions", "max_page_size"}),
+                           "browser")
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -257,6 +306,31 @@ def load_config(
             raise ConfigError("Invalid secret kind")
         bindings.append(SecretBindingConfig(ref, provider_ref, kind))
 
+    profile_root_value = browser_table.get("profile_root")
+    if profile_root_value is None:
+        profile_root = root / "browser-profiles"
+    elif isinstance(profile_root_value, str) and profile_root_value.strip() and ".." not in Path(profile_root_value).parts:
+        candidate = Path(profile_root_value).expanduser()
+        profile_root = candidate if candidate.is_absolute() else file_path.parent / candidate
+        profile_root = profile_root.absolute()
+    else:
+        raise ConfigError("Invalid browser profile root")
+    executable_value = browser_table.get("chromium_executable")
+    if executable_value is None:
+        executable = None
+    elif isinstance(executable_value, str) and executable_value.startswith("/") and ".." not in Path(executable_value).parts:
+        executable = Path(executable_value)
+    else:
+        raise ConfigError("Invalid Chromium executable path")
+    browser_settings = BrowserSettings(
+        profile_root=profile_root,
+        display=browser_table.get("display"),
+        vnc_url=browser_table.get("vnc_url"),
+        chromium_executable=executable,
+        max_sessions=browser_table.get("max_sessions", 20),
+        max_page_size=browser_table.get("max_page_size", 50),
+    )
+
     return AppConfig(
         paths=LocalPaths(config_file=file_path, root=root),
         log_level=level.upper(),
@@ -264,4 +338,5 @@ def load_config(
         store=StoreSettings(artifact_root, inline_limit, store_page_limit),
         targets=TargetSettings(target_root),
         secrets=SecretSettings(tuple(prefixes), tuple(bindings)),
+        browser=browser_settings,
     )

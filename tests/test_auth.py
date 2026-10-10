@@ -217,8 +217,13 @@ class AuthManagerTests(unittest.TestCase):
             SecretBindingConfig("ref:imported_fixture", "manual:imported_fixture", "SESSION_IMPORT_REFERENCE"),
         )), {})
         configured = AuthContextManager(self.registry, provider).prepare(self.target_id, imported.id)
-        self.assertEqual(configured.preparation, AuthPreparation.IMPORTED_SESSION_REFERENCE_AVAILABLE)
+        self.assertEqual(configured.preparation, AuthPreparation.MISSING_SECRET)
         self.assertEqual(configured.status, AuthStatus.REAUTH_REQUIRED)
+        available = RoutedSecretProvider(SecretSettings(bindings=(
+            SecretBindingConfig("ref:imported_fixture", "env:HACKBOT_SECRET_SESSION", "SESSION_IMPORT_REFERENCE"),
+        )), {"HACKBOT_SECRET_SESSION": "fake-import-material"})
+        self.assertEqual(AuthContextManager(self.registry, available).prepare(self.target_id, imported.id).preparation,
+                         AuthPreparation.IMPORTED_SESSION_REFERENCE_AVAILABLE)
 
     def test_disabled_pending_wrong_target_and_unknown_provider(self):
         disabled = self._identity("disabled", secret_ref="ref:fixture_admin")
@@ -289,12 +294,14 @@ class AuthManagerTests(unittest.TestCase):
     def test_schema_migrates_v2_and_has_only_opaque_references(self):
         identity = self._identity("preserved")
         with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE browser_session_events")
+            connection.execute("DROP TABLE browser_sessions")
             connection.execute("DROP TABLE auth_context_events")
             connection.execute("DROP TABLE auth_contexts")
             connection.execute("PRAGMA user_version=2")
         self.store.initialize()
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
             names = {row[1] for row in connection.execute("PRAGMA table_info(auth_contexts)")}
         self.assertIn("secret_ref", names)
         self.assertEqual(self.registry.get_identity(self.target_id, identity.id), identity)

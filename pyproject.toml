@@ -12,6 +12,7 @@ dependencies = ["PyYAML>=6,<7"]
 
 [project.optional-dependencies]
 recon = ["psycopg2-binary>=2.9,<3"]
+browser = ["playwright>=1.50,<2"]
 
 [project.scripts]
 hackbot = "hackbot.cli:main"

@@ -1,7 +1,8 @@
 # BugHunter Agent
 
-Phase 7 adds protected secret references and local AuthContext metadata to the
-standalone Python foundation. The source blueprint is preserved in
+Phase 8 adds isolated browser-session metadata, optional Playwright execution,
+and human-assisted login infrastructure to the standalone Python project.
+The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
 [`docs/RECON_INTEGRATION.md`](docs/RECON_INTEGRATION.md),
@@ -22,13 +23,16 @@ python3 -m venv .venv
 .venv/bin/hackbot identity show example org1_admin
 .venv/bin/hackbot secret check ref:fixture_admin
 .venv/bin/hackbot auth status example org1_admin
+.venv/bin/hackbot browser create example --anonymous
+.venv/bin/hackbot browser list example
 ```
 
 The `example` commands require `[targets].root` to point at
 `tests/examples/targets`; `secret check` reports unavailable until an explicit
 provider binding is configured. No fixture credential is supplied.
 
-The install includes PyYAML for strict local Target Package loading. In an
+The install includes PyYAML for strict local Target Package loading. Install
+`.[browser]` to use the optional Playwright browser driver. In an
 offline environment, use preinstalled or locally supplied wheels. Run tests with
 `.venv/bin/python -m unittest discover -s tests -v`.
 
@@ -52,6 +56,13 @@ allowed_env_prefixes = ["HACKBOT_SECRET_"]
 [secrets.references."ref:fixture_admin"]
 provider_ref = "env:HACKBOT_SECRET_FIXTURE_ADMIN"
 kind = "COOKIE"
+
+[browser]
+profile_root = "/path/to/local/bughunter-data/browser-profiles"
+# Optional dedicated manual-login display and loopback noVNC URL:
+# display = ":901"
+# vnc_url = "http://127.0.0.1:6901/vnc.html"
+# chromium_executable = "/path/to/trusted/chromium"
 ```
 
 `HACKBOT_HOME` overrides the default state root when TOML does not specify
@@ -59,7 +70,8 @@ one. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are also respected. The default
 config path is `~/.config/bughunter-agent/config.toml`; the temporary local
 state root is `~/.local/state/bughunter-agent`. A relative TOML root resolves
 from the config file directory; a relative `HACKBOT_HOME` resolves from the
-working directory. No command creates these directories.
+working directory. `version`, `health`, and `status` do not create them;
+explicit state-changing commands may.
 
 Under the configured root, `state/` is reserved for BugHunter-owned runtime
 state, `artifacts/` for generated outputs, `artifacts/evidence/` for
@@ -77,7 +89,8 @@ the adapter outside fixture tests.
 
 The standalone SQLite Evidence and Fact Store is documented in
 [`docs/PHASE3_EVIDENCE_FACT_STORE.md`](docs/PHASE3_EVIDENCE_FACT_STORE.md).
-It is initialized only by explicit library use, never by the CLI. It has no
+It is initialized only by explicit registry/library operations, never by
+`version`, `health`, or `status`. It has no
 production PostgreSQL dependency and performs no automatic ingestion.
 
 The typed attack-surface, identity-boundary, object, operation, and traffic
@@ -96,8 +109,9 @@ The local, secret-free Identity Registry is documented in
 [`docs/PHASE6_IDENTITY_REGISTRY.md`](docs/PHASE6_IDENTITY_REGISTRY.md).
 It reuses the BugHunter SQLite file through an explicit version-2 migration.
 Use `identity import` explicitly after configuring `[targets].root`; no account
-declaration is imported automatically. There is no
-credential provider, login, session health, browser profile, or traffic replay.
+declaration is imported automatically. Phase 6 itself did not provide
+credentials or browser sessions; later phases add those pieces without
+changing the registry's secret-free data model.
 
 `health` checks only configuration and local paths. `status` reports only
 BugHunter's local foundation and adapter availability. Neither contacts
@@ -109,3 +123,11 @@ Secret values belong only in the selected provider, never in TOML, SQLite,
 Target Packages, evidence, CLI output, or prompts. `secret check` reports only
 availability; it does not resolve or print values. `auth status` reads local
 metadata. See [`docs/PHASE7_SECRET_PROVIDER_AUTH_CONTEXT.md`](docs/PHASE7_SECRET_PROVIDER_AUTH_CONTEXT.md).
+
+Browser session design, manual VNC login, imported-cookie limits, and the
+identity-verification gate are documented in
+[`docs/PHASE8_BROWSER_SESSION_MANAGER.md`](docs/PHASE8_BROWSER_SESSION_MANAGER.md).
+`browser create` only allocates metadata/profile storage. A trusted long-running
+caller uses the manager API to launch and verify a session; the CLI does not
+start target browsing or own a background browser process. The optional VNC
+helper is not started automatically.
