@@ -45,3 +45,14 @@ integration decisions, not silent defaults.
 | D-015 | Require a host, endpoint, asset, or API-surface type for large related lists; use `(last_seen,id)` or `(subdomain,id)` keyset cursors and clamp pages to a configured maximum. | Live catalog indexes and bounded `EXPLAIN` plans support these shapes; domain-wide endpoint/JS scans are not a Phase 2 API. |
 | D-016 | Read with a fresh `BEGIN READ ONLY` transaction, transaction-local timeout, and rollback. Resolve DSN only from a named environment variable; recommend a dedicated SELECT-only role without creating one. | Production isolation and credential handling must hold even when current integration credentials are privileged. |
 | D-017 | Return compact extraction counts and provenance, never raw JS/source-map bodies, full extraction JSON, parameter examples, or endpoint-JS found values. | The live schema stores metadata/extracted signals, not immutable JS bodies or canonical traffic. |
+
+## Phase 3
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-018 | Persist BugHunter Evidence and Facts in an explicitly initialized local SQLite store, separate from recon PostgreSQL. | The Phase 3 state is BugHunter-owned; no production schema changes or recon ingestion are needed. |
+| D-019 | Give Evidence and Facts generated namespaced IDs, immutable base rows, and append-only retention/status histories. Correct evidence by replacement link. | Historical observations and contradictions must remain auditable and cannot be silently rewritten. |
+| D-020 | Keep large and restricted evidence bytes in a configurable SHA-256 content-addressed artifact store; permit small PUBLIC/INTERNAL bytes inline. | Multiple evidence records can share one artifact without duplicating large bodies in SQLite. |
+| D-021 | Require supporting Evidence for non-manual Facts; make confidence bounded but not equivalent to vulnerability confirmation. | Facts are traceable observations or inferences, not unsupported model assertions or confirmed findings. |
+| D-022 | Mask SENSITIVE/SECRET references by default and separate bounded content retrieval from metadata lookup. | Context packets and routine logs should not expose protected values. |
+| D-023 | Leave the final production block-volume path, encryption, backup/restore, and artifact expiration policy unresolved. | Phase 0 did not establish ownership/retention requirements; Phase 3 provides only safe local defaults and policy metadata. |

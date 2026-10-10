@@ -1,4 +1,4 @@
-"""Read-only Phase 1 command-line interface."""
+"""Read-only local command-line interface."""
 
 from __future__ import annotations
 
@@ -50,9 +50,14 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 2,
-        "runtime": "local_cli_and_read_only_recon_adapter",
+        "phase": 3,
+        "runtime": "local_cli_recon_adapter_and_evidence_fact_store",
         "recon_integration": "adapter_available_not_connected",
+        "evidence_store": {
+            "path": str(paths.state / "bughunter.sqlite3"),
+            "exists": (paths.state / "bughunter.sqlite3").is_file(),
+            "artifact_root": str(config.store.artifact_root) if config.store else None,
+        },
         "local_paths": {
             name: {"path": str(path), "exists": path.is_dir()}
             for name, path in (
@@ -81,7 +86,7 @@ def main(
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("version", help="print installed version")
     commands.add_parser("health", help="check local configuration and prerequisites")
-    commands.add_parser("status", help="show local Phase 1 state")
+    commands.add_parser("status", help="show local BugHunter state")
     args = parser.parse_args(argv)
 
     if args.command == "version":

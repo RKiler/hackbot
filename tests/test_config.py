@@ -23,6 +23,18 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.paths.root, Path(directory) / "data")
             self.assertEqual(config.log_level, "DEBUG")
 
+    def test_store_path_and_limits(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[store]\nartifact_root = "blob-store"\nmax_inline_bytes = 16\nmax_page_size = 7\n')
+            config = load_config(path, environ={"HOME": directory})
+            self.assertEqual(config.store.artifact_root, Path(directory) / "blob-store")
+            self.assertEqual(config.store.max_inline_bytes, 16)
+            self.assertEqual(config.store.max_page_size, 7)
+            path.write_text('[store]\nmax_inline_bytes = 16385\n')
+            with self.assertRaises(ConfigError):
+                load_config(path, environ={"HOME": directory})
+
     def test_environment_path_overrides(self) -> None:
         with TemporaryDirectory() as directory:
             config = load_config(environ={"HOME": directory, "HACKBOT_HOME": "my-state"})
