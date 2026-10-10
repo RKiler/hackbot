@@ -56,3 +56,13 @@ integration decisions, not silent defaults.
 | D-021 | Require supporting Evidence for non-manual Facts; make confidence bounded but not equivalent to vulnerability confirmation. | Facts are traceable observations or inferences, not unsupported model assertions or confirmed findings. |
 | D-022 | Mask SENSITIVE/SECRET references by default and separate bounded content retrieval from metadata lookup. | Context packets and routine logs should not expose protected values. |
 | D-023 | Leave the final production block-volume path, encryption, backup/restore, and artifact expiration policy unresolved. | Phase 0 did not establish ownership/retention requirements; Phase 3 provides only safe local defaults and policy metadata. |
+
+## Phase 4
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-024 | Use frozen, typed, vendor-neutral logical domain models with generated namespaced BugHunter IDs; keep recon row IDs as provenance only. | Facts and later components need stable references without inheriting production recon schema or ID semantics. |
+| D-025 | Keep generic entity relationships in Phase 3 Facts; treat ObjectReference tenant/owner/creator fields as non-authoritative hints. | Ownership and permission conclusions must remain evidence-backed and revisable. |
+| D-026 | Default model serialization is redacted; complete private serialization requires an explicit opt-in. Store raw request/response content through Evidence later. | URLs, external IDs, and correlation labels may contain secrets and should not leak through ordinary logs or context packets. |
+| D-027 | Keep Phase 4 models unpersisted; add only pure Phase 2 recon DTO mapping with caller-supplied BugHunter IDs and creation times. | The roadmap asks for the logical model, and the blueprint warns against premature duplicate host/endpoint/JS tables. |
+| D-028 | Represent traffic with generic RequestRecord/ResponseRecord and a source enum; Burp is a possible provider, not a core type. | Future capture/interception can be inserted without changing reasoning or domain records. |

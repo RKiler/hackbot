@@ -1,6 +1,6 @@
 # BugHunter Agent
 
-Phase 3 adds a local Evidence and Fact Store to the standalone Python
+Phase 4 adds vendor-neutral logical domain models to the standalone Python
 foundation. The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
@@ -59,6 +59,11 @@ The standalone SQLite Evidence and Fact Store is documented in
 [`docs/PHASE3_EVIDENCE_FACT_STORE.md`](docs/PHASE3_EVIDENCE_FACT_STORE.md).
 It is initialized only by explicit library use, never by the CLI. It has no
 production PostgreSQL dependency and performs no automatic ingestion.
+
+The typed attack-surface, identity-boundary, object, operation, and traffic
+records are documented in
+[`docs/PHASE4_CORE_DOMAIN_MODEL.md`](docs/PHASE4_CORE_DOMAIN_MODEL.md).
+They have no Phase 4 persistence or active traffic executor.
 
 `health` checks only configuration and local paths. `status` reports only
 BugHunter's local foundation and adapter availability. Neither contacts

@@ -50,8 +50,8 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 3,
-        "runtime": "local_cli_recon_adapter_and_evidence_fact_store",
+        "phase": 4,
+        "runtime": "local_cli_recon_adapter_evidence_fact_store_and_domain_models",
         "recon_integration": "adapter_available_not_connected",
         "evidence_store": {
             "path": str(paths.state / "bughunter.sqlite3"),
