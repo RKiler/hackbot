@@ -1,0 +1,32 @@
+id: example
+primary_domain: app.example.com
+scope:
+  include:
+    - app.example.com
+  exclude: []
+rate_limit:
+  requests_per_second: 1
+autonomy:
+  passive: true
+  safe_read: true
+  create_disposable_objects: true
+  modify_disposable_objects: true
+  delete_disposable_objects: true
+  cross_identity_owned_object_tests: true
+  permission_changes: require_approval
+  external_side_effects: require_approval
+  financial: deny
+  destructive: deny
+accounts:
+  org1_admin:
+    role: admin
+    tenant: org1
+    secret_ref: example_org1_admin
+  org1_member:
+    role: member
+    tenant: org1
+    secret_ref: example_org1_member
+  org2_admin:
+    role: admin
+    tenant: org2
+    secret_ref: example_org2_admin
