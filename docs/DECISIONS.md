@@ -66,3 +66,13 @@ integration decisions, not silent defaults.
 | D-026 | Default model serialization is redacted; complete private serialization requires an explicit opt-in. Store raw request/response content through Evidence later. | URLs, external IDs, and correlation labels may contain secrets and should not leak through ordinary logs or context packets. |
 | D-027 | Keep Phase 4 models unpersisted; add only pure Phase 2 recon DTO mapping with caller-supplied BugHunter IDs and creation times. | The roadmap asks for the logical model, and the blueprint warns against premature duplicate host/endpoint/JS tables. |
 | D-028 | Represent traffic with generic RequestRecord/ResponseRecord and a source enum; Burp is a possible provider, not a core type. | Future capture/interception can be inserted without changing reasoning or domain records. |
+
+## Phase 5
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-029 | Put program-authoritative scope in versioned local Target Packages; recon inventory is never an authorization source. | Phase 0 found recon domain membership insufficient for active testing, and Phase 2 recon is technical observation only. |
+| D-030 | Evaluate exact/wildcard host, origin, and optional path rules deterministically with exclusions first; ambiguous path/URL input is not affirmative scope. Wildcards cover descendants but not the apex. | This avoids hostname-suffix confusion, normalization ambiguity, and accidental widening from broad recon wildcards. |
+| D-031 | Model program rules, autonomy, and rate limits as pure typed policy data; active execution, throttling, approvals, and the final ScopeGuard remain deferred. | Phase 5 defines a safe contract without introducing traffic or workers. |
+| D-032 | Use strict, bounded PyYAML local package loading and reject obvious credential fields/values; account entries are alias/reference metadata only. | Human-edited packages need readable structure but must not become plaintext credential storage. This is the first non-stdlib core dependency after Phase 1. |
+| D-033 | Preserve source kind, configured timestamp, and private reference/operator in package memory while omitting private text and full markdown from default serialization. | Program provenance is needed for audit, but routine CLI/context output should remain compact and non-sensitive. |

@@ -1,0 +1,8 @@
+accounts:
+  org1_admin:
+    role: admin
+    tenant: org1
+    secret_ref: ref:fixture_admin
+  org1_member:
+    role: member
+    tenant: org1

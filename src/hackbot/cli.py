@@ -11,6 +11,7 @@ from typing import Mapping, Sequence, TextIO
 
 from . import __version__
 from .config import AppConfig, ConfigError, load_config
+from .target_loader import TargetPackageRepository, load_target_package
 
 
 def _nearest_existing(path: Path) -> Path:
@@ -50,9 +51,14 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 4,
-        "runtime": "local_cli_recon_adapter_evidence_fact_store_and_domain_models",
+        "phase": 5,
+        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_and_target_packages",
         "recon_integration": "adapter_available_not_connected",
+        "target_packages": {
+            "authority": "TARGET_PACKAGE",
+            "recon_inventory": "NOT_CONSULTED",
+            "root": str(config.targets.root) if config.targets else None,
+        },
         "evidence_store": {
             "path": str(paths.state / "bughunter.sqlite3"),
             "exists": (paths.state / "bughunter.sqlite3").is_file(),
@@ -87,6 +93,10 @@ def main(
     commands.add_parser("version", help="print installed version")
     commands.add_parser("health", help="check local configuration and prerequisites")
     commands.add_parser("status", help="show local BugHunter state")
+    target = commands.add_parser("target", help="inspect local authoritative target packages")
+    target_commands = target.add_subparsers(dest="target_command", required=True)
+    target_commands.add_parser("validate", help="validate one package directory").add_argument("path", type=Path)
+    target_commands.add_parser("show", help="show one configured package").add_argument("id")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -98,6 +108,22 @@ def main(
     except ConfigError as exc:
         print(f"hackbot: {exc}", file=err)
         return 2
+
+    if args.command == "target":
+        try:
+            if args.target_command == "validate":
+                package = load_target_package(args.path)
+            else:
+                assert config.targets is not None
+                package = TargetPackageRepository(config.targets.root).get_target_package(args.id)
+                if package is None:
+                    print("hackbot: target package not found", file=err)
+                    return 1
+        except (ValueError, OSError, TypeError):
+            print("hackbot: invalid target package or package configuration", file=err)
+            return 2
+        print(package.to_json(), file=out)
+        return 0
 
     result = _health(config) if args.command == "health" else _status(config)
     print(json.dumps(result, sort_keys=True), file=out)

@@ -46,6 +46,7 @@ class AppConfig:
     log_level: str = "INFO"
     recon: ReconSettings | None = None
     store: StoreSettings | None = None
+    targets: TargetSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,11 @@ class StoreSettings:
     artifact_root: Path
     max_inline_bytes: int = 2048
     max_page_size: int = 50
+
+
+@dataclass(frozen=True)
+class TargetSettings:
+    root: Path
 
 
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -111,7 +117,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -124,6 +130,7 @@ def load_config(
         frozenset({"artifact_root", "max_inline_bytes", "max_page_size"}),
         "store",
     )
+    targets_table = _table(top.get("targets", {}), frozenset({"root"}), "targets")
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -166,9 +173,18 @@ def load_config(
     if type(store_page_limit) is not int or not 1 <= store_page_limit <= 100:
         raise ConfigError("Store max_page_size must be between 1 and 100")
 
+    target_root_value = targets_table.get("root")
+    if target_root_value is None:
+        target_root = file_path.parent / "targets"
+    elif isinstance(target_root_value, str):
+        target_root = _path(target_root_value, base=file_path.parent)
+    else:
+        raise ConfigError("Target package root must be a path string")
+
     return AppConfig(
         paths=LocalPaths(config_file=file_path, root=root),
         log_level=level.upper(),
         recon=ReconSettings(dsn_env, max_page_size, timeout),
         store=StoreSettings(artifact_root, inline_limit, store_page_limit),
+        targets=TargetSettings(target_root),
     )

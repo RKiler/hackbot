@@ -1,7 +1,7 @@
 # BugHunter Agent
 
-Phase 4 adds vendor-neutral logical domain models to the standalone Python
-foundation. The source blueprint is preserved in
+Phase 5 adds local Target Packages and deterministic program scope to the
+standalone Python foundation. The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
 [`docs/RECON_INTEGRATION.md`](docs/RECON_INTEGRATION.md),
@@ -11,15 +11,16 @@ foundation. The source blueprint is preserved in
 Install and inspect locally:
 
 ```bash
-python3 -m venv --system-site-packages .venv
-.venv/bin/python -m pip install --no-build-isolation --no-deps -e .
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 .venv/bin/hackbot version
 .venv/bin/hackbot health
 .venv/bin/hackbot status
+.venv/bin/hackbot target validate tests/examples/targets/example
 ```
 
-The virtualenv command above uses the VPS's existing `setuptools` for an
-offline install. Run tests with
+The install includes PyYAML for strict local Target Package loading. In an
+offline environment, use preinstalled or locally supplied wheels. Run tests with
 `.venv/bin/python -m unittest discover -s tests -v`.
 
 Configuration is optional TOML. Use `hackbot --config /path/to/config.toml
@@ -32,6 +33,9 @@ root = "/path/to/local/bughunter-data"
 
 [logging]
 level = "INFO"
+
+[targets]
+root = "/path/to/local/targets"
 ```
 
 `HACKBOT_HOME` overrides the default state root when TOML does not specify
@@ -64,6 +68,13 @@ The typed attack-surface, identity-boundary, object, operation, and traffic
 records are documented in
 [`docs/PHASE4_CORE_DOMAIN_MODEL.md`](docs/PHASE4_CORE_DOMAIN_MODEL.md).
 They have no Phase 4 persistence or active traffic executor.
+
+Target Package layout, authoritative scope, pure autonomy/rate policy, and
+secret-safe account references are documented in
+[`docs/PHASE5_TARGET_PACKAGE_SCOPE.md`](docs/PHASE5_TARGET_PACKAGE_SCOPE.md).
+`hackbot target show <id>` reads only the configured local target root. A
+recon host's presence never authorizes testing. Phase 5 uses PyYAML for strict
+local package loading; it does not add target requests or services.
 
 `health` checks only configuration and local paths. `status` reports only
 BugHunter's local foundation and adapter availability. Neither contacts
