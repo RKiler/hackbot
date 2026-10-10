@@ -168,7 +168,7 @@ class TargetLoaderTests(unittest.TestCase):
         self.assertEqual(package.configured_at, datetime(2026, 10, 10, 12, tzinfo=timezone.utc))
         self.assertEqual(package.context.description, "Fictional application used only for local package tests.")
         self.assertIn("never included", package.read_document("researcher_notes"))
-        self.assertEqual(len(package.accounts), 2)
+        self.assertEqual(len(package.accounts), 3)
         self.assertEqual(package.accounts[0].secret_ref, "ref:fixture_admin")
         summary = package.to_json()
         for forbidden in ("fixture_admin", "fixture-operator", "local-fixture-policy", "No live target",

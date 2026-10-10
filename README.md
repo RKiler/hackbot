@@ -1,6 +1,6 @@
 # BugHunter Agent
 
-Phase 5 adds local Target Packages and deterministic program scope to the
+Phase 6 adds a local Identity Registry to the Target Packages and program scope in the
 standalone Python foundation. The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
@@ -17,6 +17,9 @@ python3 -m venv .venv
 .venv/bin/hackbot health
 .venv/bin/hackbot status
 .venv/bin/hackbot target validate tests/examples/targets/example
+.venv/bin/hackbot identity import example
+.venv/bin/hackbot identity list example
+.venv/bin/hackbot identity show example org1_admin
 ```
 
 The install includes PyYAML for strict local Target Package loading. In an
@@ -75,6 +78,13 @@ secret-safe account references are documented in
 `hackbot target show <id>` reads only the configured local target root. A
 recon host's presence never authorizes testing. Phase 5 uses PyYAML for strict
 local package loading; it does not add target requests or services.
+
+The local, secret-free Identity Registry is documented in
+[`docs/PHASE6_IDENTITY_REGISTRY.md`](docs/PHASE6_IDENTITY_REGISTRY.md).
+It reuses the BugHunter SQLite file through an explicit version-2 migration.
+Use `identity import` explicitly after configuring `[targets].root`; no account
+declaration is imported automatically. There is no
+credential provider, login, session health, browser profile, or traffic replay.
 
 `health` checks only configuration and local paths. `status` reports only
 BugHunter's local foundation and adapter availability. Neither contacts

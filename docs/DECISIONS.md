@@ -76,3 +76,13 @@ integration decisions, not silent defaults.
 | D-031 | Model program rules, autonomy, and rate limits as pure typed policy data; active execution, throttling, approvals, and the final ScopeGuard remain deferred. | Phase 5 defines a safe contract without introducing traffic or workers. |
 | D-032 | Use strict, bounded PyYAML local package loading and reject obvious credential fields/values; account entries are alias/reference metadata only. | Human-edited packages need readable structure but must not become plaintext credential storage. This is the first non-stdlib core dependency after Phase 1. |
 | D-033 | Preserve source kind, configured timestamp, and private reference/operator in package memory while omitting private text and full markdown from default serialization. | Program provenance is needed for audit, but routine CLI/context output should remain compact and non-sensitive. |
+
+## Phase 6
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-034 | Model Identity separately from Phase 4 Principal, with target-scoped aliases and append-only Principal links. | An owned test account can exist before its application user ID is known; conflicting later observations must not silently replace configuration. |
+| D-035 | Model tenant-scoped memberships with zero or more Phase 4 Role IDs; configured and observed/inferred records remain separate. | Multi-tenant accounts and role differences are first-class, while observed claims retain evidence and Fact links. |
+| D-036 | Extend the BugHunter-owned SQLite file to schema version 2 with a deterministic forward migration; store only opaque secret references, never credentials or session material. | Phase 6 needs durable local metadata without a second database or production recon writes. |
+| D-037 | Require existing target-matched Evidence and a non-manual Fact for observed/inferred relationship records; leave configured metadata as configuration, not confidence-1.0 observation. | This preserves the Phase 3 evidence boundary and avoids silent promotion of account hints into facts. |
+| D-038 | Import Phase 5 account aliases transactionally, creating provisional configured Tenant/Role records only from declared hints and rejecting conflicting re-imports. | The package remains the source of target context; the registry must not discover or authenticate accounts in Phase 6. |

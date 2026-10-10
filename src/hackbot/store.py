@@ -41,7 +41,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def _now() -> datetime:
@@ -139,20 +139,30 @@ class EvidenceFactStore:
             os.chmod(self.db_path, 0o600)
             connection.execute("PRAGMA foreign_keys=ON")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:
-                migration = files("hackbot").joinpath("migrations/001_evidence_facts.sql").read_text()
+            if version > _SCHEMA_VERSION or version < 0:
+                raise StoreSchemaError("Unsupported local store schema version")
+            for target_version, filename in (
+                (1, "001_evidence_facts.sql"),
+                (2, "002_identity_registry.sql"),
+            ):
+                if version >= target_version:
+                    continue
+                migration = files("hackbot").joinpath("migrations", filename).read_text()
                 try:
                     connection.executescript(
-                        "BEGIN IMMEDIATE;\n" + migration + "\nPRAGMA user_version=1;\nCOMMIT;"
+                        "BEGIN IMMEDIATE;\n" + migration
+                        + f"\nPRAGMA user_version={target_version};\nCOMMIT;"
                     )
                 except sqlite3.Error:
                     connection.rollback()
                     raise StoreSchemaError("Local store migration failed") from None
-            elif version != _SCHEMA_VERSION:
-                raise StoreSchemaError("Unsupported local store schema version")
+                version = target_version
             expected = {"evidence", "evidence_policy_events", "facts", "fact_evidence", "fact_status_events"}
+            expected.update({"registry_targets", "registry_principals", "registry_tenants", "registry_roles",
+                             "registry_identities", "registry_principal_links", "registry_memberships",
+                             "registry_membership_roles"})
             tables = {row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?,?)",
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 tuple(expected),
             )}
             if tables != expected:

@@ -107,8 +107,8 @@ an implemented throttle; a later TrafficExecutor will enforce them.
 ## Secret and recon boundaries
 
 `accounts.yaml` may list aliases with optional role/tenant hints and
-`secret_ref: ref:<alias>`. This is only a placeholder for the Phase 6 Identity
-Registry, not a secret provider. Raw credential-like keys/values in YAML and
+`secret_ref: ref:<alias>`. Phase 6 can import this metadata into the Identity
+Registry; it is not a secret provider. Raw credential-like keys/values in YAML and
 known credential patterns in markdown are rejected, using the Phase 1
 redactor. The check is defense in depth, not a guarantee against arbitrary
 unlabeled secret text. Do not put passwords, cookies, bearer tokens, API keys,
@@ -117,6 +117,6 @@ only when explicitly requested and never included wholesale in summaries.
 
 `resolve_recon_target(package, repository)` is an optional lookup through the
 Phase 2 read-only interface. It returns a recon record or `None`; neither
-outcome changes package scope. Phase 6 should implement only the Identity
-Registry with protected references to credentials, keeping these scope and
-policy checks authoritative and leaving login/session automation deferred.
+outcome changes package scope. Phase 6 implements only the Identity Registry
+with opaque references, keeping these scope and policy checks authoritative
+and leaving login/session automation deferred.

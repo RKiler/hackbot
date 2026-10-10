@@ -6,3 +6,6 @@ accounts:
   org1_member:
     role: member
     tenant: org1
+  org2_admin:
+    role: admin
+    tenant: org2

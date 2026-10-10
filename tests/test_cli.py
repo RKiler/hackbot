@@ -37,7 +37,7 @@ class CliTests(unittest.TestCase):
             code, output, errors = self._run(["status"], {"HOME": directory})
             body = json.loads(output)
             self.assertEqual((code, errors), (0, ""))
-            self.assertEqual(body["phase"], 5)
+            self.assertEqual(body["phase"], 6)
             self.assertEqual(body["recon_integration"], "adapter_available_not_connected")
             self.assertFalse(body["evidence_store"]["exists"])
             self.assertEqual(body["evidence_store"]["artifact_root"],

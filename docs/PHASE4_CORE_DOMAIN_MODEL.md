@@ -65,8 +65,8 @@ request/response bodies and headers belong in controlled Evidence.
 
 There are no password, cookie, token, Authorization header, MFA-secret,
 browser-profile, or AuthContext fields in Principal/Role/Tenant or traffic
-models. Identity registry, secret provider, and browser sessions remain later
-phases. Burp is only one `TrafficSource` value alongside BROWSER, HACKBOT,
+models. The later Phase 6 Identity Registry stores only metadata; secret
+provider and browser sessions remain deferred. Burp is only one `TrafficSource` value alongside BROWSER, HACKBOT,
 IMPORT, and FIXTURE; no Burp-specific request/response class exists.
 
 ## Recon mapping and persistence
