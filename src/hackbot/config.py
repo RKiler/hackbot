@@ -47,6 +47,7 @@ class AppConfig:
     recon: ReconSettings | None = None
     store: StoreSettings | None = None
     targets: TargetSettings | None = None
+    secrets: SecretSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,49 @@ class StoreSettings:
 @dataclass(frozen=True)
 class TargetSettings:
     root: Path
+
+
+@dataclass(frozen=True)
+class SecretBindingConfig:
+    ref: str
+    provider_ref: str
+    kind: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, str) or not re.fullmatch(
+            r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?", self.ref
+        ):
+            raise ConfigError("Invalid opaque secret reference")
+        if not isinstance(self.provider_ref, str) or not (
+            re.fullmatch(r"env:[A-Z][A-Z0-9_]*", self.provider_ref)
+            or re.fullmatch(r"manual:[a-z][a-z0-9_-]{0,63}", self.provider_ref)
+        ):
+            raise ConfigError("Invalid secret provider reference")
+        if not isinstance(self.kind, str) or self.kind not in {"PASSWORD", "COOKIE", "BEARER_TOKEN", "API_TOKEN",
+                             "LOGIN_DESCRIPTOR", "HEADER_SET", "SESSION_IMPORT_REFERENCE", "UNKNOWN"}:
+            raise ConfigError("Invalid secret kind")
+
+
+@dataclass(frozen=True)
+class SecretSettings:
+    allowed_env_prefixes: tuple[str, ...] = ("HACKBOT_SECRET_",)
+    bindings: tuple[SecretBindingConfig, ...] = ()
+
+    def __post_init__(self) -> None:
+        prefixes = self.allowed_env_prefixes
+        if (not isinstance(prefixes, tuple) or not prefixes or len(prefixes) > 16
+                or any(not isinstance(prefix, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*_", prefix)
+                       for prefix in prefixes) or len(set(prefixes)) != len(prefixes)):
+            raise ConfigError("Invalid allowed secret environment prefixes")
+        if (not isinstance(self.bindings, tuple) or len(self.bindings) > 256
+                or any(not isinstance(binding, SecretBindingConfig) for binding in self.bindings)
+                or len({binding.ref for binding in self.bindings}) != len(self.bindings)):
+            raise ConfigError("Invalid secret reference mapping")
+        for binding in self.bindings:
+            if binding.provider_ref.startswith("env:") and not any(
+                binding.provider_ref[4:].startswith(prefix) for prefix in prefixes
+            ):
+                raise ConfigError("Secret environment reference is outside allowed prefixes")
 
 
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -117,7 +161,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -131,6 +175,7 @@ def load_config(
         "store",
     )
     targets_table = _table(top.get("targets", {}), frozenset({"root"}), "targets")
+    secrets_table = _table(top.get("secrets", {}), frozenset({"allowed_env_prefixes", "references"}), "secrets")
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -181,10 +226,42 @@ def load_config(
     else:
         raise ConfigError("Target package root must be a path string")
 
+    prefixes = secrets_table.get("allowed_env_prefixes", ["HACKBOT_SECRET_"])
+    if (not isinstance(prefixes, list) or not prefixes or len(prefixes) > 16
+            or any(not isinstance(prefix, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*_", prefix)
+                   for prefix in prefixes) or len(set(prefixes)) != len(prefixes)):
+        raise ConfigError("Invalid allowed secret environment prefixes")
+    references = secrets_table.get("references", {})
+    if not isinstance(references, dict) or len(references) > 256:
+        raise ConfigError("Invalid secret reference mapping")
+    bindings = []
+    kinds = {"PASSWORD", "COOKIE", "BEARER_TOKEN", "API_TOKEN", "LOGIN_DESCRIPTOR",
+             "HEADER_SET", "SESSION_IMPORT_REFERENCE", "UNKNOWN"}
+    for ref, raw_binding in references.items():
+        if not isinstance(ref, str) or not re.fullmatch(
+            r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?", ref
+        ):
+            raise ConfigError("Invalid opaque secret reference")
+        binding = _table(raw_binding, frozenset({"provider_ref", "kind"}), "secret binding")
+        provider_ref = binding.get("provider_ref")
+        kind = binding.get("kind", "UNKNOWN")
+        if (not isinstance(provider_ref, str)
+                or not (re.fullmatch(r"env:[A-Z][A-Z0-9_]*", provider_ref)
+                        or re.fullmatch(r"manual:[a-z][a-z0-9_-]{0,63}", provider_ref))):
+            raise ConfigError("Invalid secret provider reference")
+        if provider_ref.startswith("env:") and not any(
+            provider_ref[4:].startswith(prefix) for prefix in prefixes
+        ):
+            raise ConfigError("Secret environment reference is outside allowed prefixes")
+        if not isinstance(kind, str) or kind not in kinds:
+            raise ConfigError("Invalid secret kind")
+        bindings.append(SecretBindingConfig(ref, provider_ref, kind))
+
     return AppConfig(
         paths=LocalPaths(config_file=file_path, root=root),
         log_level=level.upper(),
         recon=ReconSettings(dsn_env, max_page_size, timeout),
         store=StoreSettings(artifact_root, inline_limit, store_page_limit),
         targets=TargetSettings(target_root),
+        secrets=SecretSettings(tuple(prefixes), tuple(bindings)),
     )

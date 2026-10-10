@@ -11,9 +11,11 @@ import sys
 from typing import Mapping, Sequence, TextIO
 
 from . import __version__
+from .auth import AuthContextManager
 from .config import AppConfig, ConfigError, load_config
 from .identity_registry import IdentityRegistry
 from .logging import SecretRedactor
+from .secrets import RoutedSecretProvider, SecretError
 from .store import StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository, load_target_package
 
@@ -55,10 +57,11 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 6,
-        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_and_identity_registry",
+        "phase": 7,
+        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_and_auth_metadata",
         "recon_integration": "adapter_available_not_connected",
         "identity_registry": "local_metadata_only_not_checked",
+        "auth_contexts": "local_metadata_only_not_checked",
         "target_packages": {
             "authority": "TARGET_PACKAGE",
             "recon_inventory": "NOT_CONSULTED",
@@ -112,6 +115,14 @@ def main(
     show_command = identity_commands.add_parser("show", help="show an identity and its memberships")
     show_command.add_argument("target")
     show_command.add_argument("alias")
+    auth = commands.add_parser("auth", help="inspect local authentication metadata")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
+    auth_status = auth_commands.add_parser("status", help="show a local AuthContext without secrets")
+    auth_status.add_argument("target")
+    auth_status.add_argument("identity")
+    secret = commands.add_parser("secret", help="inspect configured secret availability")
+    secret_commands = secret.add_subparsers(dest="secret_command", required=True)
+    secret_commands.add_parser("check", help="check availability without showing a value").add_argument("secret_ref")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -138,6 +149,41 @@ def main(
             print("hackbot: invalid target package or package configuration", file=err)
             return 2
         print(package.to_json(), file=out)
+        return 0
+
+    if args.command == "secret":
+        try:
+            assert config.secrets is not None
+            metadata = RoutedSecretProvider(config.secrets, environ).metadata(args.secret_ref)
+            result = metadata.to_dict()
+        except (SecretError, ValueError):
+            result = {"available": False, "provider": None, "kind": "UNKNOWN"}
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0 if result["available"] else 1
+
+    if args.command == "auth":
+        try:
+            assert config.targets is not None and config.secrets is not None
+            package = TargetPackageRepository(config.targets.root).get_target_package(args.target)
+            if package is None:
+                print("hackbot: target package not found", file=err)
+                return 1
+            registry = IdentityRegistry.from_config(config)
+            identity_record = registry.get_identity(package.target.id, args.identity)
+            if identity_record is None:
+                print("hackbot: identity not found for target", file=err)
+                return 1
+            context = AuthContextManager(registry, RoutedSecretProvider(config.secrets, environ)).get(
+                package.target.id, identity_record.id
+            )
+            result = context.to_dict() if context else {
+                "target_id": package.target.id, "identity_id": identity_record.id,
+                "status": "UNINITIALIZED", "preparation": "UNKNOWN",
+            }
+        except (ValueError, OSError, TypeError, sqlite3.Error, StoreNotInitialized, StoreSchemaError):
+            print("hackbot: authentication metadata is unavailable or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
         return 0
 
     if args.command == "identity":

@@ -78,8 +78,8 @@ between 1 and 100; no API dumps entire artifacts or all target facts.
 ## Persistence and configuration
 
 The local SQLite file is `<paths.root>/state/bughunter.sqlite3`. Schema
-version 2 (including the later Identity Registry migration) is packaged with
-BugHunter and created only by an explicit
+version 3 (including later Identity Registry and AuthContext migrations) is
+packaged with BugHunter and created only by an explicit
 `EvidenceFactStore.initialize()` call. SQL triggers reject updates/deletes of
 evidence, facts, links, and history events. Reads do not initialize the store.
 The Phase 1 `version`, `health`, and `status` commands do not open it.

@@ -1,6 +1,6 @@
 # BugHunter Agent
 
-Phase 6 adds a local Identity Registry to the Target Packages and program scope in the
+Phase 7 adds protected secret references and local AuthContext metadata to the
 standalone Python foundation. The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
@@ -20,7 +20,13 @@ python3 -m venv .venv
 .venv/bin/hackbot identity import example
 .venv/bin/hackbot identity list example
 .venv/bin/hackbot identity show example org1_admin
+.venv/bin/hackbot secret check ref:fixture_admin
+.venv/bin/hackbot auth status example org1_admin
 ```
+
+The `example` commands require `[targets].root` to point at
+`tests/examples/targets`; `secret check` reports unavailable until an explicit
+provider binding is configured. No fixture credential is supplied.
 
 The install includes PyYAML for strict local Target Package loading. In an
 offline environment, use preinstalled or locally supplied wheels. Run tests with
@@ -39,6 +45,13 @@ level = "INFO"
 
 [targets]
 root = "/path/to/local/targets"
+
+[secrets]
+allowed_env_prefixes = ["HACKBOT_SECRET_"]
+
+[secrets.references."ref:fixture_admin"]
+provider_ref = "env:HACKBOT_SECRET_FIXTURE_ADMIN"
+kind = "COOKIE"
 ```
 
 `HACKBOT_HOME` overrides the default state root when TOML does not specify
@@ -91,3 +104,8 @@ BugHunter's local foundation and adapter availability. Neither contacts
 PostgreSQL, reads recon data, sends target requests, or starts services.
 There is no running agent, target executor, production database migration, or
 active traffic integration.
+
+Secret values belong only in the selected provider, never in TOML, SQLite,
+Target Packages, evidence, CLI output, or prompts. `secret check` reports only
+availability; it does not resolve or print values. `auth status` reads local
+metadata. See [`docs/PHASE7_SECRET_PROVIDER_AUTH_CONTEXT.md`](docs/PHASE7_SECRET_PROVIDER_AUTH_CONTEXT.md).

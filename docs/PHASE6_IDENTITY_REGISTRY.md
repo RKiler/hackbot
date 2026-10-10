@@ -78,7 +78,8 @@ Identity metadata, principal-link history, memberships, and role references.
 There are no columns for passwords, cookies, Authorization headers, tokens,
 MFA material, browser storage, or session state. `secret_ref` is only an opaque
 identifier (`ref:alias` or `program/alias`), not a value or provider lookup.
-No SecretProvider exists yet.
+The later Phase 7 SecretProvider resolves this alias outside the registry;
+this Phase 6 schema still stores no credential value.
 
 All registry reads are target-scoped and bounded by the configured local page
 limit. Default serialization omits the secret-reference value, free-form
@@ -100,7 +101,7 @@ hackbot identity show example org1_admin
 ```
 
 The fictional package in `tests/examples/targets/example/` contains two
-tenants and three aliases, but no credentials. A future SecretProvider and
-AuthContext may resolve `identity_id -> secret_ref -> isolated session`; this
-phase implements none of those steps. Browser/VNC/Burp/traffic integration and
-active authorization experiments are also deferred.
+tenants and three aliases, but no credentials. Phase 7 adds SecretProvider
+and AuthContext metadata for `identity_id -> secret_ref`; this registry does
+not resolve values or authenticate. Browser/VNC/Burp/traffic integration and
+active authorization experiments remain deferred.

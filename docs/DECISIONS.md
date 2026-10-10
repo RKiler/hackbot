@@ -86,3 +86,11 @@ integration decisions, not silent defaults.
 | D-036 | Extend the BugHunter-owned SQLite file to schema version 2 with a deterministic forward migration; store only opaque secret references, never credentials or session material. | Phase 6 needs durable local metadata without a second database or production recon writes. |
 | D-037 | Require existing target-matched Evidence and a non-manual Fact for observed/inferred relationship records; leave configured metadata as configuration, not confidence-1.0 observation. | This preserves the Phase 3 evidence boundary and avoids silent promotion of account hints into facts. |
 | D-038 | Import Phase 5 account aliases transactionally, creating provisional configured Tenant/Role records only from declared hints and rejecting conflicting re-imports. | The package remains the source of target context; the registry must not discover or authenticate accounts in Phase 6. |
+
+## Phase 7
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-039 | Resolve Phase 6 opaque `secret_ref` through an explicit local binding and typed `SecretProvider`; Phase 7 ships only allowlisted environment and metadata-only manual providers. Do not implement a file provider without an approved root and safe-open policy. | Keeps credentials out of registry/config values and prevents arbitrary VPS file reads while allowing later backends behind one protocol. |
+| D-040 | Return raw material only as `SecretValue` at a trusted execution boundary; LLMs, agents, ordinary domain serialization, CLI, SQLite, Evidence, and logs receive IDs/status/metadata only. | Authentication material is a capability, not general research context. |
+| D-041 | Persist one stable local AuthContext per target/Identity in SQLite schema version 3, with status events and opaque references but no credential values. `READY` means available material, never verified session; Phase 7 cannot assert `VALID`. | Prepares Phase 8 session management without pretending login, target validation, or traffic execution already exists. |
