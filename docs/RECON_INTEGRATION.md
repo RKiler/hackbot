@@ -1,7 +1,8 @@
 # Recon Integration: Read-Only Contract
 
-This describes the **observed** production schema and the smallest proposed
-adapter for a later Phase 2. Nothing here has been implemented. Catalog
+This describes the **observed** production schema and the Phase 0 adapter
+guidance. The Phase 2 implementation and verification are documented in
+[`PHASE2_RECON_REPOSITORY.md`](PHASE2_RECON_REPOSITORY.md). Catalog
 inspection used `BEGIN READ ONLY` with a five- or ten-second statement
 timeout; source references are under `/root/enhanced_recon_framework`.
 

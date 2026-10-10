@@ -29,7 +29,7 @@ class CliTests(unittest.TestCase):
             body = json.loads(output)
             self.assertEqual(body["status"], "ok")
             self.assertEqual(body["checks"]["local_root"], "not_initialized")
-            self.assertEqual(body["recon_integration"], "deferred_phase_2")
+            self.assertEqual(body["recon_integration"], "adapter_available_not_checked")
             self.assertFalse(root.exists())
 
     def test_status_only_reports_local_paths(self) -> None:
@@ -37,8 +37,8 @@ class CliTests(unittest.TestCase):
             code, output, errors = self._run(["status"], {"HOME": directory})
             body = json.loads(output)
             self.assertEqual((code, errors), (0, ""))
-            self.assertEqual(body["phase"], 1)
-            self.assertEqual(body["recon_integration"], "not_implemented_until_phase_2")
+            self.assertEqual(body["phase"], 2)
+            self.assertEqual(body["recon_integration"], "adapter_available_not_connected")
             self.assertFalse(body["local_paths"]["evidence"]["exists"])
             self.assertFalse((Path(directory) / ".local").exists())
 

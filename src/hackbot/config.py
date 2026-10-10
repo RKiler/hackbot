@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import tomllib
 from typing import Mapping
 
@@ -43,6 +44,14 @@ class LocalPaths:
 class AppConfig:
     paths: LocalPaths
     log_level: str = "INFO"
+    recon: ReconSettings | None = None
+
+
+@dataclass(frozen=True)
+class ReconSettings:
+    dsn_env: str = "HACKBOT_RECON_DSN"
+    max_page_size: int = 50
+    statement_timeout_ms: int = 3000
 
 
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -94,9 +103,14 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
+    recon_table = _table(
+        top.get("recon", {}),
+        frozenset({"dsn_env", "max_page_size", "statement_timeout_ms"}),
+        "recon",
+    )
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -115,4 +129,18 @@ def load_config(
     if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
         raise ConfigError("Unsupported logging level")
 
-    return AppConfig(paths=LocalPaths(config_file=file_path, root=root), log_level=level.upper())
+    dsn_env = recon_table.get("dsn_env", "HACKBOT_RECON_DSN")
+    max_page_size = recon_table.get("max_page_size", 50)
+    timeout = recon_table.get("statement_timeout_ms", 3000)
+    if not isinstance(dsn_env, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", dsn_env):
+        raise ConfigError("Invalid recon credential environment reference")
+    if type(max_page_size) is not int or not 1 <= max_page_size <= 100:
+        raise ConfigError("Recon max_page_size must be between 1 and 100")
+    if type(timeout) is not int or not 100 <= timeout <= 5000:
+        raise ConfigError("Recon statement_timeout_ms must be between 100 and 5000")
+
+    return AppConfig(
+        paths=LocalPaths(config_file=file_path, root=root),
+        log_level=level.upper(),
+        recon=ReconSettings(dsn_env, max_page_size, timeout),
+    )

@@ -35,3 +35,13 @@ explicitly requested; none authorizes production mutation now.
 No dedicated read-only DB role, target package scope authority, or BugHunter
 artifact retention policy was created or selected here. They remain later
 integration decisions, not silent defaults.
+
+## Phase 2
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-013 | Expose a typed, read-only `ReconRepository` protocol; put PostgreSQL SQL in a separate adapter. | Later consumers should not depend on production table names or SQL. |
+| D-014 | Resolve only exact root names or integer domain IDs, and resolve hosts by exact stored origin URL. Recon presence never authorizes testing. | Avoid accidental wildcard/hostname inference and scope confusion. |
+| D-015 | Require a host, endpoint, asset, or API-surface type for large related lists; use `(last_seen,id)` or `(subdomain,id)` keyset cursors and clamp pages to a configured maximum. | Live catalog indexes and bounded `EXPLAIN` plans support these shapes; domain-wide endpoint/JS scans are not a Phase 2 API. |
+| D-016 | Read with a fresh `BEGIN READ ONLY` transaction, transaction-local timeout, and rollback. Resolve DSN only from a named environment variable; recommend a dedicated SELECT-only role without creating one. | Production isolation and credential handling must hold even when current integration credentials are privileged. |
+| D-017 | Return compact extraction counts and provenance, never raw JS/source-map bodies, full extraction JSON, parameter examples, or endpoint-JS found values. | The live schema stores metadata/extracted signals, not immutable JS bodies or canonical traffic. |

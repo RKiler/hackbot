@@ -1,7 +1,7 @@
 # BugHunter Agent
 
-Phase 1 provides a standalone, local-only Python foundation. The source
-blueprint is preserved in
+Phase 2 adds a bounded read-only recon repository to the standalone Python
+foundation. The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
 [`docs/RECON_INTEGRATION.md`](docs/RECON_INTEGRATION.md),
@@ -47,8 +47,15 @@ evidence, `logs/` for future persisted logs, and `tmp/` for temporary files.
 This is a convention, not a final block-volume or retention decision. The
 Phase 1 logger writes redacted JSON to stderr; it does not persist logs.
 
+The optional PostgreSQL adapter is documented in
+[`docs/PHASE2_RECON_REPOSITORY.md`](docs/PHASE2_RECON_REPOSITORY.md). It is
+never initialized by `version`, `health`, or `status`. Its credential is read
+only from the environment variable named by `[recon].dsn_env`; no DSN or
+password belongs in TOML. Install the optional `recon` extra before using
+the adapter outside fixture tests.
+
 `health` checks only configuration and local paths. `status` reports only
-BugHunter's local foundation state. Neither contacts PostgreSQL, reads recon
-data, sends target requests, or starts services. Recon integration begins no
-earlier than Phase 2. This repository has no running agent, target executor,
-database migration, or production recon integration.
+BugHunter's local foundation and adapter availability. Neither contacts
+PostgreSQL, reads recon data, sends target requests, or starts services.
+There is no running agent, target executor, database migration, or active
+traffic integration.

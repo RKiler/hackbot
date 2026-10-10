@@ -42,7 +42,7 @@ def _health(config: AppConfig) -> dict[str, object]:
             "local_root": root_check,
             "python": "ok" if sys.version_info >= (3, 11) else "unsupported",
         },
-        "recon_integration": "deferred_phase_2",
+        "recon_integration": "adapter_available_not_checked",
     }
 
 
@@ -50,9 +50,9 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 1,
-        "runtime": "foundation_only",
-        "recon_integration": "not_implemented_until_phase_2",
+        "phase": 2,
+        "runtime": "local_cli_and_read_only_recon_adapter",
+        "recon_integration": "adapter_available_not_connected",
         "local_paths": {
             name: {"path": str(path), "exists": path.is_dir()}
             for name, path in (
