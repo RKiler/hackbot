@@ -232,12 +232,44 @@ class ApprovalRequest:
 
 @dataclass(frozen=True, slots=True)
 class PolicyPermit:
-    """Future executor contract; Phase 13 neither issues nor consumes permits."""
+    """Persisted one-use execution authorization, bound to an exact request."""
 
+    id: str
     decision_id: str
+    action_id: str
     action_fingerprint: str
+    request_fingerprint: str
     target_id: str
+    package_id: str
+    category: ActionCategory
     identity_id: str | None
+    policy_version: str
     scope_rule: str | None
+    approval_id: str | None
     expires_at: datetime
-    one_time: bool
+    one_time: bool = True
+
+    def __post_init__(self) -> None:
+        if (not re.fullmatch(r"PERMIT-[0-9a-f]{32}", self.id)
+                or not re.fullmatch(r"POLDEC-[0-9a-f]{32}", self.decision_id)
+                or not _ACTION_ID.fullmatch(self.action_id)
+                or not _HASH.fullmatch(self.action_fingerprint)
+                or not _HASH.fullmatch(self.request_fingerprint)):
+            raise ValueError("Invalid policy permit identifier")
+        validate_entity_id(self.target_id, "TARGET")
+        if self.identity_id is not None:
+            validate_entity_id(self.identity_id, "IDENTITY")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.package_id):
+            raise ValueError("Invalid policy permit package")
+        if not isinstance(self.category, ActionCategory):
+            raise ValueError("Invalid policy permit category")
+        if not isinstance(self.policy_version, str) or not re.fullmatch(r"phase13-v1:[0-9a-f]{64}", self.policy_version):
+            raise ValueError("Invalid policy permit version")
+        if self.scope_rule is not None and (not isinstance(self.scope_rule, str)
+                or not 1 <= len(self.scope_rule) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in self.scope_rule)):
+            raise ValueError("Invalid policy permit scope rule")
+        if self.approval_id is not None and not re.fullmatch(r"APPROVAL-[0-9a-f]{32}", self.approval_id):
+            raise ValueError("Invalid policy permit approval")
+        if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None or self.one_time is not True:
+            raise ValueError("Invalid policy permit expiration")

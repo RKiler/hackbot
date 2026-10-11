@@ -51,6 +51,7 @@ class AppConfig:
     secrets: SecretSettings | None = None
     browser: BrowserSettings | None = None
     burp: BurpSettings | None = None
+    executor: ExecutorSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,32 @@ class BurpSettings:
             raise ConfigError("Invalid third-party capture policy")
 
 
+@dataclass(frozen=True)
+class ExecutorSettings:
+    allow_direct: bool = False
+    capture_required: bool = False
+    connect_timeout_seconds: float = 3.0
+    read_timeout_seconds: float = 10.0
+    overall_timeout_seconds: float = 30.0
+    max_redirects: int = 3
+    max_request_bytes: int = 262144
+    max_response_bytes: int = 262144
+
+    def __post_init__(self) -> None:
+        if type(self.allow_direct) is not bool or type(self.capture_required) is not bool:
+            raise ConfigError("Invalid executor routing policy")
+        for value in (self.connect_timeout_seconds, self.read_timeout_seconds, self.overall_timeout_seconds):
+            if type(value) not in (int, float) or not 0.1 <= value <= 120:
+                raise ConfigError("Invalid executor timeout")
+        if self.overall_timeout_seconds < self.connect_timeout_seconds:
+            raise ConfigError("Executor overall timeout is too short")
+        if type(self.max_redirects) is not int or not 0 <= self.max_redirects <= 10:
+            raise ConfigError("Invalid executor redirect limit")
+        for value in (self.max_request_bytes, self.max_response_bytes):
+            if type(value) is not int or not 1024 <= value <= 1048576:
+                raise ConfigError("Invalid executor capture limit")
+
+
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -247,7 +274,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -270,6 +297,10 @@ def load_config(
                         frozenset({"enabled", "project_root", "installation_jar", "ca_certificate",
                                    "listener_start", "listener_end", "bridge_port", "bridge_secret_ref",
                                    "max_event_bytes", "max_inflight", "third_party_capture"}), "burp")
+    executor_table = _table(top.get("executor", {}),
+                            frozenset({"allow_direct", "capture_required", "connect_timeout_seconds",
+                                       "read_timeout_seconds", "overall_timeout_seconds", "max_redirects",
+                                       "max_request_bytes", "max_response_bytes"}), "executor")
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -409,4 +440,5 @@ def load_config(
         secrets=SecretSettings(tuple(prefixes), tuple(bindings)),
         browser=browser_settings,
         burp=burp_settings,
+        executor=ExecutorSettings(**executor_table),
     )

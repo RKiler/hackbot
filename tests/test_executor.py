@@ -1,0 +1,427 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import timedelta, datetime, timezone
+import gzip
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import threading
+import time
+import unittest
+
+from hackbot.artifacts import ArtifactStore
+from hackbot.auth import AuthContextManager, AuthMechanism, AuthStatus
+from hackbot.browser import BrowserSessionManager, IdentityObservation, IdentityVerificationRule
+from hackbot.config import (BrowserSettings, ExecutorSettings, SecretBindingConfig,
+                            SecretSettings, StoreSettings)
+from hackbot.executor import (ExecutionError, ProxyRoute, RequestTemplate, TrafficExecutor)
+from hackbot.identity import IdentityStatus
+from hackbot.identity_registry import IdentityRegistry
+from hackbot.permit_store import PermitError, PolicyPermitStore
+from hackbot.policy import PolicyEngine
+from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction
+from hackbot.policy_store import PolicyStore
+from hackbot.rate_limit import ExperimentBudget, RateLimiter
+from hackbot.secrets import RoutedSecretProvider
+from hackbot.store import EvidenceFactStore
+from hackbot.target_loader import load_target_package
+from hackbot.target_policy import RatePolicy
+from hackbot.target_policy import PolicyDecision
+from hackbot.target_scope import HostRule
+from hackbot.traffic import AuthState, ExchangeState, TrafficStore
+
+
+EXAMPLE = Path(__file__).parent / "examples/targets/example"
+SECRET = "fixture-cookie=very-private-test-value"
+
+
+class FixtureHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _answer(self, status, body=b"", headers=()):
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def do_GET(self):
+        self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path == "/redirect-out":
+            return self._answer(302, headers=(("Location", "http://localhost:9/foreign"),))
+        if self.path == "/redirect-in":
+            return self._answer(302, headers=(("Location", "/ok"),))
+        if self.path == "/large":
+            return self._answer(200, b"A" * 10000)
+        if self.path == "/gzip":
+            body = gzip.compress(b"B" * 10000)
+            return self._answer(200, body, (("Content-Encoding", "gzip"),))
+        if self.path == "/sleep":
+            time.sleep(0.4)
+        if self.path == "/cookie":
+            return self._answer(200 if self.headers.get("Cookie") == SECRET else 401, b"fixture")
+        return self._answer(200, b"fixture", (("Content-Type", "text/plain"),))
+
+    def do_POST(self):
+        self.server.received.append(("POST", self.path, self.headers.get("Cookie")))
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size)
+        if self.path == "/create":
+            self.server.created.append(body)
+        self._answer(201, b"created")
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.server.received.append(self.path)
+        target = self.server.target
+        connection = http.client.HTTPConnection("127.0.0.1", target.server_port, timeout=1)
+        try:
+            connection.request("GET", "/ok")
+            response = connection.getresponse()
+            body = response.read()
+        finally:
+            connection.close()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class FakeDriver:
+    name = "FIXTURE"
+
+    def __init__(self):
+        self.running = set()
+        self.observations = {}
+
+    def start(self, session_id, profile, *, display, proxy):
+        self.running.add(session_id)
+
+    def stop(self, session_id):
+        self.running.discard(session_id)
+
+    def is_running(self, session_id):
+        return session_id in self.running
+
+    def is_available(self):
+        return True
+
+    def observe_identity(self, session_id, rule):
+        return self.observations.get(session_id, IdentityObservation())
+
+
+class FakeTargets:
+    def __init__(self, package):
+        self.package = package
+
+    def get_target_package(self, package_id):
+        return self.package if self.package.id == package_id else None
+
+
+class ExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        self.server.received = []
+        self.server.created = []
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        base_package = load_target_package(EXAMPLE)
+        self.package = replace(
+            base_package,
+            scope=replace(base_package.scope, include_hosts=(HostRule("127.0.0.1"),),
+                          exclude_hosts=(), exclude_paths=(), default_schemes=("http",),
+                          default_ports=(self.server.server_port,)),
+            rate=RatePolicy(requests_per_second=100, requests_per_minute=100,
+                            max_concurrency=2, burst=100),
+        )
+        self.targets = FakeTargets(self.package)
+        blobs = self.root / "blobs"
+        self.store = EvidenceFactStore(self.root / "state/bughunter.sqlite3",
+                                       ArtifactStore(blobs), StoreSettings(blobs))
+        self.store.initialize()
+        self.registry = IdentityRegistry(self.store)
+        self.registry.register_target(self.package)
+        self.secret_env = {"HACKBOT_SECRET_COOKIE": SECRET}
+        self.provider = RoutedSecretProvider(
+            SecretSettings(bindings=(SecretBindingConfig(
+                "ref:fixture_cookie", "env:HACKBOT_SECRET_COOKIE", "COOKIE"),)),
+            self.secret_env,
+        )
+        self.auth = AuthContextManager(self.registry, self.provider)
+        self.driver = FakeDriver()
+        self.browser = BrowserSessionManager(
+            self.registry, self.auth, self.driver,
+            BrowserSettings(profile_root=self.root / "profiles"),
+        )
+        self.rate = RateLimiter()
+        self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
+                                   audit=PolicyStore(self.store), rate=self.rate)
+        self.permits = PolicyPermitStore(self.store)
+        self.traffic = TrafficStore(self.store, self.registry)
+        self.executor = TrafficExecutor(
+            targets=self.targets, policy=self.policy, permits=self.permits,
+            rate=self.rate, traffic=self.traffic, auth=self.auth, secrets=self.provider,
+            settings=ExecutorSettings(allow_direct=True, max_response_bytes=1024,
+                                      connect_timeout_seconds=0.2, read_timeout_seconds=0.2,
+                                      overall_timeout_seconds=2),
+            browser=self.browser,
+        )
+
+    def action(self, path="/ok", *, method="GET", actor=ActorMode.ANONYMOUS,
+               identity_id=None, session_id=None, category=ActionCategory.SAFE_READ):
+        return ProposedAction(
+            target_id=self.package.target.id, package_id=self.package.id,
+            category=category, actor=actor, source="unit_test", purpose="Local fixture check",
+            url=self.base + path, method=method, identity_id=identity_id, session_id=session_id,
+        )
+
+    def run_action(self, action, *, template=None, permit=None, **kwargs):
+        template = template or RequestTemplate(action.method, action.url)
+        permit = permit or self.executor.authorize(action, template)
+        return self.executor.execute(action, permit, template, **kwargs)
+
+    def owned_session(self, alias):
+        identity = self.registry.register_identity(
+            self.package.target.id, alias, status=IdentityStatus.ACTIVE,
+            secret_ref="ref:fixture_cookie",
+        )
+        self.auth.prepare(self.package.target.id, identity.id)
+        session = self.browser.create(self.package.target.id, identity.id)
+        self.browser.start(session.id)
+        self.browser.login_complete(session.id)
+        self.driver.observations[session.id] = IdentityObservation(user_id=alias, tenant_id=alias)
+        rule = IdentityVerificationRule(self.package.target.id, identity.id,
+                                        "[data-user]", None, "[data-tenant]", alias, None, alias)
+        self.browser.verify(session.id, rule)
+        return identity, session
+
+    def test_no_permit_wrong_binding_expiry_and_reuse_send_zero_extra(self):
+        action = self.action()
+        template = RequestTemplate("GET", action.url)
+        denied = self.executor.execute(action, None, template)
+        self.assertEqual(denied.error, ExecutionError.PERMIT_DENIED)
+        self.assertEqual(self.server.received, [])
+        with self.store._connection() as db:
+            rows = db.execute("SELECT event_type FROM executor_events WHERE action_id=? ORDER BY event_id",
+                              (action.id,)).fetchall()
+        self.assertEqual([row[0] for row in rows], ["EXECUTION_REQUESTED", "EXECUTION_FAILED"])
+        permit = self.executor.authorize(action, template)
+        wrong = replace(permit, target_id="TARGET-" + "9" * 32)
+        self.assertEqual(self.executor.execute(action, wrong, template).error, ExecutionError.PERMIT_DENIED)
+        wrong_identity = replace(permit, identity_id="IDENTITY-" + "8" * 32)
+        self.assertEqual(self.executor.execute(action, wrong_identity, template).error, ExecutionError.PERMIT_DENIED)
+        expired = replace(permit, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        self.assertEqual(self.executor.execute(action, expired, template).error, ExecutionError.PERMIT_DENIED)
+        changed = replace(template, headers=(("Accept", "application/json"),))
+        self.assertEqual(self.executor.execute(action, permit, changed).error, ExecutionError.PERMIT_DENIED)
+        self.assertEqual(self.server.received, [])
+        good = self.executor.execute(action, permit, template)
+        self.assertEqual((good.error, good.status_code), (None, 200))
+        self.assertEqual(self.executor.execute(action, permit, template).error, ExecutionError.PERMIT_DENIED)
+        self.assertEqual(len(self.server.received), 1)
+        self.assertEqual(self.traffic.get_exchange(good.exchange_ids[0]).state, ExchangeState.COMPLETE)
+
+    def test_scope_policy_change_and_redirects(self):
+        out = self.action("/redirect-out")
+        result = self.run_action(out)
+        self.assertEqual(result.error, ExecutionError.REDIRECT_DENIED)
+        self.assertEqual(len(self.server.received), 1)
+        self.assertEqual(len(result.redirects), 1)
+        self.assertFalse(result.redirects[0].followed)
+        inside = self.run_action(self.action("/redirect-in"))
+        self.assertIsNone(inside.error)
+        self.assertEqual([row[1] for row in self.server.received[-2:]], ["/redirect-in", "/ok"])
+        action = self.action()
+        template = RequestTemplate("GET", action.url)
+        permit = self.executor.authorize(action, template)
+        self.targets.package = replace(self.package, scope=replace(
+            self.package.scope, include_hosts=(HostRule("localhost"),)))
+        before = len(self.server.received)
+        denied = self.executor.execute(action, permit, template)
+        self.assertIn(denied.error, {ExecutionError.SCOPE_DENIED, ExecutionError.POLICY_DENIED})
+        self.assertEqual(len(self.server.received), before)
+
+    def test_anonymous_and_verified_cookie_isolation(self):
+        identity, session = self.owned_session("tenant_a_admin")
+        auth_action = self.action("/cookie", actor=ActorMode.AUTHENTICATED,
+                                  identity_id=identity.id, session_id=session.id)
+        authenticated = self.run_action(auth_action)
+        self.assertEqual((authenticated.error, authenticated.status_code), (None, 200))
+        self.assertEqual(self.traffic.get_exchange(authenticated.exchange_ids[0]).attribution.auth_state,
+                         AuthState.VERIFIED)
+        self.assertNotIn(SECRET.encode(), self.store.db_path.read_bytes())
+        anonymous = self.run_action(self.action("/cookie"))
+        self.assertEqual((anonymous.error, anonymous.status_code), (None, 401))
+        self.assertIsNone(self.server.received[-1][2])
+        self.assertNotIn(SECRET, repr(authenticated))
+        self.assertNotIn(SECRET, repr(self.traffic.get_exchange(authenticated.exchange_ids[0])))
+
+    def test_unverified_expired_missing_and_manual_auth_send_nothing(self):
+        identity, session = self.owned_session("tenant_a_member")
+        action = self.action("/cookie", actor=ActorMode.AUTHENTICATED,
+                             identity_id=identity.id, session_id=session.id)
+        template = RequestTemplate("GET", action.url)
+        permit = self.executor.authorize(action, template)
+        self.auth.set_status(self.package.target.id, identity.id, AuthStatus.EXPIRED)
+        self.assertIn(self.executor.execute(action, permit, template).error,
+                      {ExecutionError.POLICY_DENIED, ExecutionError.AUTH_UNAVAILABLE})
+        self.assertEqual(self.server.received, [])
+        self.driver.running.clear()
+        with self.assertRaises(PermitError):
+            self.executor.authorize(replace(action, id=action.id.replace("a", "b", 1)), template)
+
+    def test_missing_secret_and_manual_login_do_not_send(self):
+        identity, session = self.owned_session("tenant_b_admin")
+        action = self.action("/cookie", actor=ActorMode.AUTHENTICATED,
+                             identity_id=identity.id, session_id=session.id)
+        template = RequestTemplate("GET", action.url)
+        permit = self.executor.authorize(action, template)
+        self.secret_env.clear()
+        self.assertEqual(self.executor.execute(action, permit, template).error,
+                         ExecutionError.AUTH_UNAVAILABLE)
+        self.assertEqual(self.server.received, [])
+        self.assertEqual(self.executor.execute(action, permit, template).error,
+                         ExecutionError.PERMIT_DENIED)
+
+        manual = self.registry.register_identity(
+            self.package.target.id, "manual_user", status=IdentityStatus.ACTIVE)
+        self.auth.prepare(self.package.target.id, manual.id, mechanism=AuthMechanism.MANUAL_LOGIN)
+        browser_session = self.browser.create(self.package.target.id, manual.id)
+        self.browser.start(browser_session.id)
+        self.browser.login_complete(browser_session.id)
+        self.driver.observations[browser_session.id] = IdentityObservation(user_id="manual_user")
+        self.browser.verify(browser_session.id, IdentityVerificationRule(
+            self.package.target.id, manual.id, "[data-user]", None, None,
+            "manual_user", None, None))
+        manual_action = self.action(actor=ActorMode.AUTHENTICATED,
+                                    identity_id=manual.id, session_id=browser_session.id)
+        self.assertEqual(self.run_action(manual_action).error, ExecutionError.AUTH_UNAVAILABLE)
+        self.assertEqual(self.server.received, [])
+
+    def test_body_cap_gzip_and_timeout(self):
+        for path in ("/large", "/gzip"):
+            result = self.run_action(self.action(path))
+            self.assertIsNone(result.error)
+            self.assertTrue(result.truncated)
+            self.assertEqual(result.body_bytes_captured, 1024)
+        timeout = self.run_action(self.action("/sleep"))
+        self.assertEqual(timeout.error, ExecutionError.TIMEOUT)
+        self.assertEqual(self.traffic.get_exchange(timeout.exchange_ids[0]).state, ExchangeState.TIMEOUT)
+
+    def test_budget_rate_proxy_and_direct_mode(self):
+        first = self.run_action(self.action(), experiment_id="test_budget",
+                                budget=ExperimentBudget(max_requests=1))
+        self.assertIsNone(first.error)
+        second = self.run_action(self.action(), experiment_id="test_budget",
+                                 budget=ExperimentBudget(max_requests=1))
+        self.assertIn(second.error, {ExecutionError.POLICY_DENIED, ExecutionError.RATE_LIMITED})
+        before = len(self.server.received)
+        self.executor.settings = ExecutorSettings(allow_direct=False, capture_required=True)
+        blocked = self.run_action(self.action())
+        self.assertEqual(blocked.error, ExecutionError.PROXY_UNAVAILABLE)
+        self.assertEqual(len(self.server.received), before)
+
+    def test_proxy_route_and_approval_backed_post(self):
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        proxy.received = []
+        proxy.target = self.server
+        worker = threading.Thread(target=proxy.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+
+        class LocalProxy:
+            def route(self, action):
+                return ProxyRoute(f"http://127.0.0.1:{proxy.server_port}")
+
+        self.executor.proxy = LocalProxy()
+        self.executor.settings = ExecutorSettings(capture_required=True, max_response_bytes=1024)
+        result = self.run_action(self.action())
+        self.assertIsNone(result.error)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(proxy.received), 1)
+        self.assertEqual(self.server.received[-1][1], "/ok")
+
+        self.executor.proxy = None
+        self.executor.settings = ExecutorSettings(allow_direct=True, max_response_bytes=1024)
+        self.targets.package = replace(
+            self.package, autonomy=replace(self.package.autonomy,
+                                           state_changing=PolicyDecision.REQUIRE_APPROVAL,
+                                           create_disposable_objects=PolicyDecision.REQUIRE_APPROVAL),
+        )
+        action = self.action("/create", method="POST", category=ActionCategory.OBJECT_CREATE)
+        action = replace(action, disposable_intent=True, object_type="fixture")
+        template = RequestTemplate("POST", action.url, (("Content-Type", "application/json"),), b'{"name":"fixture"}')
+        decision = self.policy.evaluate(self.targets.package, action, record=True)
+        self.assertEqual(decision.result, PolicyDecision.REQUIRE_APPROVAL)
+        PolicyStore(self.store).decide(decision.approval_id, action.target_id, approve=True)
+        permit = self.executor.authorize(action, template)
+        executed = self.executor.execute(action, permit, template)
+        self.assertEqual((executed.error, executed.status_code, executed.approval_id),
+                         (None, 201, decision.approval_id))
+        self.assertEqual(PolicyStore(self.store).get(decision.approval_id, action.target_id).status.value,
+                         "CONSUMED")
+        self.assertEqual(self.server.received[-1][:2], ("POST", "/create"))
+        self.assertEqual(self.server.created, [b'{"name":"fixture"}'])
+
+    def test_shared_rate_concurrency_blocks_second_request(self):
+        self.targets.package = replace(self.package, rate=replace(self.package.rate, max_concurrency=1))
+        first_action = self.action("/sleep")
+        first_template = RequestTemplate("GET", first_action.url)
+        first_permit = self.executor.authorize(first_action, first_template)
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(
+            self.executor.execute(first_action, first_permit, first_template)), daemon=True)
+        worker.start()
+        for _ in range(100):
+            if self.server.received:
+                break
+            time.sleep(0.005)
+        self.assertEqual(len(self.server.received), 1)
+        second_action = self.action()
+        second_template = RequestTemplate("GET", second_action.url)
+        # The shared Phase 13 limiter denies issuance or execution while first is in flight.
+        try:
+            second_permit = self.executor.authorize(second_action, second_template)
+        except PermitError:
+            second_permit = None
+        if second_permit is not None:
+            self.assertIn(self.executor.execute(second_action, second_permit, second_template).error,
+                          {ExecutionError.POLICY_DENIED, ExecutionError.RATE_LIMITED})
+        self.assertEqual(len(self.server.received), 1)
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+
+    def test_template_header_validation(self):
+        for header in (("Host", "other.test"), ("Authorization", "Bearer hidden"),
+                       ("X-API-Key", "hidden"), ("X-HackBot-Correlation", "bad"),
+                       ("Accept", "ok\r\nInjected: yes")):
+            with self.assertRaises(ValueError):
+                RequestTemplate("GET", self.base + "/ok", (header,))
+
+
+if __name__ == "__main__":
+    unittest.main()

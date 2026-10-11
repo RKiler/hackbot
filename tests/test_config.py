@@ -40,6 +40,22 @@ class ConfigTests(unittest.TestCase):
             config = load_config(environ={"HOME": directory, "HACKBOT_HOME": "my-state"})
             self.assertEqual(config.paths.root, Path.cwd() / "my-state")
 
+    def test_executor_defaults_and_validation(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[executor]\nallow_direct = true\nmax_redirects = 2\n')
+            config = load_config(path, environ={"HOME": directory})
+            self.assertTrue(config.executor.allow_direct)
+            self.assertFalse(config.executor.capture_required)
+            self.assertEqual(config.executor.max_redirects, 2)
+            for body in ('[executor]\nallow_direct = "yes"\n',
+                         '[executor]\nread_timeout_seconds = 0\n',
+                         '[executor]\nmax_response_bytes = 99999999\n',
+                         '[executor]\nproxy_url = "http://foreign.test"\n'):
+                path.write_text(body)
+                with self.assertRaises(ConfigError):
+                    load_config(path, environ={"HOME": directory})
+
     def test_explicit_missing_file_is_invalid(self) -> None:
         with TemporaryDirectory() as directory:
             with self.assertRaises(ConfigError):

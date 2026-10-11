@@ -286,3 +286,23 @@ class BurpProxyProvider:
                 "reachable_listeners": reachable, "target_id": target_id,
                 "captured_exchanges": captured, "last_capture_at": last_capture_at,
                 "dropped_events": dropped_events, "last_heartbeat_at": last_heartbeat_at}
+
+
+class BurpExecutionProxyAdapter:
+    """Optional executor route backed by a ready Phase 10 session listener."""
+
+    def __init__(self, provider: BurpProxyProvider) -> None:
+        self.provider = provider
+
+    def route(self, action: object):
+        from .executor import ProxyRoute
+        session_id = getattr(action, "session_id", None)
+        target_id = getattr(action, "target_id", None)
+        if not isinstance(session_id, str) or not isinstance(target_id, str):
+            return None
+        binding = self.provider.binding_for_session(session_id)
+        if (binding is None or binding.target_id != target_id or binding.state != "ACTIVE"
+                or not self.provider.ready(session_id)):
+            return None
+        return ProxyRoute(f"http://127.0.0.1:{binding.proxy_port}",
+                          self.provider.settings.ca_certificate)

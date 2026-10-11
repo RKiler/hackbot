@@ -359,8 +359,11 @@ class BrowserSessionManager:
             context = self.auth.get(target_id, identity_id)
             if context is None or context.status in {AuthStatus.INVALID, AuthStatus.LOCKED, AuthStatus.EXPIRED}:
                 raise BrowserError("Usable prepared AuthContext is required")
-            if context.mechanism not in {AuthMechanism.MANUAL_LOGIN, AuthMechanism.IMPORTED_SESSION}:
-                raise BrowserError("Only manual or imported browser sessions are supported")
+            if context.mechanism not in {
+                AuthMechanism.MANUAL_LOGIN, AuthMechanism.IMPORTED_SESSION,
+                AuthMechanism.COOKIE, AuthMechanism.BEARER, AuthMechanism.HEADER,
+            }:
+                raise BrowserError("Browser authentication mechanism is unsupported")
         now = datetime.now(timezone.utc)
         session_id = new_entity_id("BSESSION")
         session = BrowserSession(
@@ -468,7 +471,10 @@ class BrowserSessionManager:
                               display=self.settings.display, proxy=proxy)
             if context is None:
                 return self._transition(session, BrowserStatus.RUNNING, "browser_started")
-            if context.mechanism is AuthMechanism.MANUAL_LOGIN:
+            if context.mechanism in {
+                AuthMechanism.MANUAL_LOGIN, AuthMechanism.COOKIE,
+                AuthMechanism.BEARER, AuthMechanism.HEADER,
+            }:
                 return self._transition(session, BrowserStatus.WAITING_LOGIN, "manual_login_requested")
             if context.mechanism is AuthMechanism.IMPORTED_SESSION:
                 if context.preparation is not AuthPreparation.IMPORTED_SESSION_REFERENCE_AVAILABLE or not context.secret_ref:

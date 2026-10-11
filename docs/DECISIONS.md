@@ -154,3 +154,13 @@ integration decisions, not silent defaults.
 | D-069 | Treat policy evaluation and dashboard checks as simulations; do not issue permits or consume rate tokens until a trusted Phase 14 executor exists. | A visible ALLOW decision is not itself an executable capability or proof of network enforcement. |
 | D-070 | Require trusted owned-object proof and verified target-matched session state for autonomous mutations and authenticated actions; anonymous actions carry no identity. | Client flags, registry metadata, and an unverified browser cannot establish ownership or authentication. |
 | D-071 | Make every future network executor re-evaluate redirects and current policy, atomically claim one-time approvals, and reserve target-scoped rate/budget capacity before traffic. | The destination, policy, identity, and rate state may change after a simulation; failure must close the active path. |
+
+## Phase 14
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-072 | Keep one service-owned, vendor-neutral `TrafficExecutor` behind persisted, 30-second, one-use permits bound to the exact action and request fingerprint. | An in-memory ALLOW simulation or copied permit object must not authorize a send; policy and scope are rechecked against the current target package. |
+| D-073 | Use `requests` with explicit no-redirect, no-environment-auth/proxy, TLS verification, finite timeouts, and bounded incremental gzip/deflate response capture. | One familiar transport suffices for controlled HTTP while protecting memory/artifact bounds and preventing implicit redirect or credential behavior. |
+| D-074 | Default direct HTTP execution off; require an available explicit proxy route when capture is required, with Burp only as an optional adapter. | Proxy outage cannot silently bypass interception, and core traffic/evidence remains vendor-neutral. |
+| D-075 | Allow prepared cookie, bearer, or header AuthContexts into the existing human browser verification path, but apply secrets only in the executor after a current verified session. | Phase 8 manual/imported-only creation otherwise made verified direct HTTP credentials unreachable; no login automation or browser-secret extraction is introduced. |
+| D-076 | Treat each GET/HEAD redirect as a new action requiring scope/policy/rate/permit checks; deny automatic state-changing and cross-origin authenticated redirects. | A first-hop permit must not confer authority on another destination or leak auth material across origins. |

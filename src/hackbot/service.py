@@ -19,14 +19,16 @@ from .auth import AuthContextManager, AuthMechanism
 from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
-from .burp import BurpProxyProvider
-from .config import AppConfig, ConfigError, load_config
+from .burp import BurpExecutionProxyAdapter, BurpProxyProvider
+from .config import AppConfig, ConfigError, ExecutorSettings, load_config
+from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
 from .logging import create_logger
 from .policy import PolicyEngine, policy_version
 from .policy_models import ActionCategory, ActorMode, ProposedAction, SideEffect
 from .policy_store import PolicyStore
+from .permit_store import PolicyPermitStore
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
@@ -84,6 +86,13 @@ class BugHunterRuntime:
         self.rate = RateLimiter()
         self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
                                    audit=self.policy_store, rate=self.rate)
+        self.permits = PolicyPermitStore(self.store)
+        self.executor = TrafficExecutor(
+            targets=self.targets, policy=self.policy, permits=self.permits,
+            rate=self.rate, traffic=self.traffic, auth=self.auth,
+            secrets=self.auth.secrets, settings=config.executor or ExecutorSettings(),
+            proxy=BurpExecutionProxyAdapter(self.burp), browser=self.browser,
+        )
         self.recon = None
         try:
             self.recon = PostgresReconRepository.from_config(config)
