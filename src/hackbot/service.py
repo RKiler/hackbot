@@ -16,6 +16,8 @@ from werkzeug.exceptions import HTTPException
 
 from . import __version__
 from .auth import AuthContextManager, AuthMechanism
+from .authorization import AuthorizationSpecialist
+from .authorization_store import AuthorizationMode, AuthorizationStore, HuntStatus
 from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
@@ -118,7 +120,7 @@ class BugHunterRuntime:
         except ConfigError:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
-                                                 self.browser, self.recon)
+                                                 self.browser, self.recon, self.objects)
         self.run_store = PlanRunStore(self.store)
         object_settings = config.objects or ObjectSettings(config.paths.root / "recipes")
         self.object_factory = ObjectFactory(
@@ -136,12 +138,22 @@ class BugHunterRuntime:
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
             traffic=self.traffic, evidence=self.store, objects=self.objects)
+        self.authorization_ledger = AuthorizationStore(self.store)
+        self.authorization = AuthorizationSpecialist(
+            identities=self.registry, browser=self.browser, objects=self.objects,
+            traffic=self.traffic, evidence=self.store, hypotheses=self.hypotheses,
+            ledger=self.authorization_ledger, recon=self.recon, context=self.skill_context,
+            router=self.skill_router, planner=self.skill_planner,
+            orchestrator=self.orchestrator, validator=self.validator,
+            factory=self.object_factory)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         while self.objects.reconcile():
             pass
         self.reconcile_on_startup()
         while self.run_store.reconcile():
+            pass
+        while self.authorization_ledger.reconcile_runs():
             pass
 
     def _probe_vnc(self) -> bool:
@@ -568,6 +580,102 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         profile = service.hypotheses.latest_profile(package.target.id)
         return jsonify({"profile": profile.to_dict() if profile else None,
                         "message": "Profile Target to generate a passive snapshot" if profile is None else None})
+
+    @app.get("/v1/authorization/<package_id>/profile")
+    def authorization_profile(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.authorization.profile(package).to_dict())
+
+    @app.get("/v1/authorization/<package_id>/hunts")
+    def authorization_hunts(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        return jsonify({"items": [item.to_dict() for item in
+                                  service.authorization_ledger.list_hunts(package.target.id,
+                                                                          limit=page.limit)]})
+
+    @app.post("/v1/authorization/<package_id>/hunts")
+    def start_authorization_hunt(package_id: str):
+        body = _body(frozenset({"mode", "candidate_limit", "request_budget"}))
+        package = service.package(package_id)
+        mode = AuthorizationMode(body.get("mode", "PLAN_ONLY"))
+        return jsonify(service.authorization.start_hunt(
+            package, mode=mode, candidate_limit=body.get("candidate_limit", 12),
+            request_budget=body.get("request_budget", 20))), 201
+
+    @app.get("/v1/authorization/<package_id>/candidates")
+    def authorization_candidates(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        hunt_id = request.args.get("hunt_id")
+        if hunt_id and service.authorization_ledger.get_hunt(hunt_id, package.target.id) is None:
+            raise LookupError("authorization hunt not found")
+        items = []
+        for item in service.authorization_ledger.list_candidates(
+                package.target.id, limit=page.limit, hunt_id=hunt_id):
+            row = item.to_dict()
+            exchange = service.traffic.get_exchange(item.owner_exchange_id)
+            row["evidence_ids"] = (list(exchange.evidence_ids[:4]) if exchange is not None and
+                                   exchange.target_id == package.target.id else [])
+            items.append(row)
+        return jsonify({"items": items})
+
+    @app.get("/v1/authorization/<package_id>/matrix")
+    def authorization_matrix(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse(maximum=100)
+        return jsonify({"items": list(service.authorization_ledger.matrix(
+            package.target.id, limit=page.limit))})
+
+    @app.get("/v1/authorization/<package_id>/metrics")
+    def authorization_metrics(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.authorization_ledger.stats(
+            package.target.id, hunt_id=request.args.get("hunt_id") or None))
+
+    @app.post("/v1/authorization/<package_id>/candidates/<candidate_id>/prepare")
+    def prepare_authorization_candidate(package_id: str, candidate_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        return jsonify(service.authorization.prepare(candidate_id, package).to_dict())
+
+    @app.post("/v1/authorization/<package_id>/candidates/<candidate_id>/start")
+    def run_authorization_candidate(package_id: str, candidate_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        return jsonify(service.authorization.start_candidate(candidate_id, package)), 201
+
+    @app.post("/v1/authorization/<package_id>/candidates/<candidate_id>/advance")
+    def advance_authorization_candidate(package_id: str, candidate_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        return jsonify(service.authorization.advance_candidate(candidate_id, package))
+
+    @app.post("/v1/authorization/<package_id>/hunts/<hunt_id>/pause")
+    @app.post("/v1/authorization/<package_id>/hunts/<hunt_id>/cancel")
+    def stop_authorization_hunt(package_id: str, hunt_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        hunt = service.authorization_ledger.get_hunt(hunt_id, package.target.id)
+        if hunt is None or hunt.status not in {HuntStatus.READY, HuntStatus.RUNNING,
+                                                HuntStatus.PAUSED}:
+            raise ValueError("authorization hunt is not active")
+        cancel = request.path.endswith("/cancel")
+        for candidate in service.authorization_ledger.list_candidates(package.target.id,
+                                                                        hunt_id=hunt_id, limit=50):
+            if candidate.hunt_id != hunt_id or not candidate.run_id:
+                continue
+            run = service.run_store.get(candidate.run_id, package.target.id)
+            if run and run.status in {RunStatus.CREATED, RunStatus.READY, RunStatus.RUNNING,
+                                      RunStatus.WAITING_APPROVAL, RunStatus.WAITING_HUMAN}:
+                (service.orchestrator.cancel if cancel else service.orchestrator.pause)(
+                    run.id, package.id)
+        target_status = HuntStatus.CANCELLED if cancel else HuntStatus.PAUSED
+        updated = service.authorization_ledger.transition(
+            hunt.id, hunt.target_id, hunt.status, target_status)
+        if cancel:
+            service.authorization.cleanup_created_objects(hunt.id, hunt.target_id)
+        return jsonify(updated.to_dict())
 
     @app.post("/v1/targets/<package_id>/profile")
     def profile_target(package_id: str):

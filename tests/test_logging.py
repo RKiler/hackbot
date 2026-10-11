@@ -64,6 +64,21 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn("explicitsecret123", output)
         self.assertIn("visible-id", output)
 
+    def test_common_short_credential_names_are_redacted(self) -> None:
+        stream = StringIO()
+        logger = create_logger(
+            stream=stream,
+            environ={"DB_PASS": "dbpass123", "GITHUB_PAT": "githubpat123"},
+        )
+        logger.info(
+            "dbpass123 githubpat123 key=plainkey123",
+            extra={"context": {"pass": "fieldpass123", "api_key": "fieldkey123"}},
+        )
+        output = stream.getvalue()
+        for secret in ("dbpass123", "githubpat123", "plainkey123", "fieldpass123", "fieldkey123"):
+            self.assertNotIn(secret, output)
+        self.assertEqual(json.loads(output)["context"]["pass"], REDACTED)
+
     def test_inline_authorization_with_basic_scheme(self) -> None:
         output = json.dumps(self._log("Authorization=Basic basicsecret123; status=denied"))
         self.assertNotIn("basicsecret123", output)

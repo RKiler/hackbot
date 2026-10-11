@@ -11,6 +11,7 @@ import uuid
 from urllib.parse import urlsplit
 from typing import Any
 
+from .authorization_binding import resolve_authorization_request
 from .auth import AuthMechanism, AuthStatus
 from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from .executor import ExecutionError, ExecutionResult, RequestTemplate, TrafficExecutor
@@ -199,8 +200,7 @@ class PlanOrchestrator:
         run, _ = self._load(run_id, package_id)
         return self.runs.details(run)
 
-    @staticmethod
-    def _bound(snapshot: PlanSnapshot, step: RuntimeStep, run: PlanRun) -> _BoundAction:
+    def _bound(self, snapshot: PlanSnapshot, step: RuntimeStep, run: PlanRun) -> _BoundAction:
         if step.action_slot is None or step.action_id is None:
             raise PlanRunError("request step lacks an explicit action binding")
         try:
@@ -208,15 +208,51 @@ class PlanOrchestrator:
             shape = snapshot.data["request_templates"][step.action_slot]
             if not isinstance(descriptor, dict) or not isinstance(shape, dict):
                 raise ValueError
-            if (set(shape) - {"method", "url", "fingerprint", "authentication"} or
-                    shape.get("authentication") != "EXECUTOR_SUPPLIED"):
-                raise ValueError
-            template = RequestTemplate(shape["method"], shape["url"])
-            if (template.fingerprint() != shape.get("fingerprint") or
-                    template.fingerprint() != descriptor.get("request_template_fingerprint") or
-                    template.method != descriptor.get("method") or
-                    descriptor.get("simulation_only") is not True):
-                raise ValueError
+            if shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
+                                        "AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                        "AUTHORIZATION_GRAPHQL_MUTATION_V1"}:
+                if self.objects is None or descriptor.get("simulation_only") is not True:
+                    raise ValueError
+                package = self.targets.get_target_package(run.package_id)
+                if package is None or package.target.id != run.target_id:
+                    raise ValueError
+                template, owned_hash = resolve_authorization_request(
+                    shape, package=package, run_id=run.id, objects=self.objects,
+                    traffic=self.traffic, evidence=self.evidence)
+                item = self.objects.get(shape["test_object_id"], run.target_id)
+                if item is None:
+                    raise ValueError
+                variant = shape["variant"]
+                if (descriptor.get("request_template_fingerprint") != shape["fingerprint"]
+                        or descriptor.get("object_ref_hash") != owned_hash
+                        or descriptor.get("object_type") != item.object_type
+                        or descriptor.get("method") != template.method
+                        or (variant in {"FOREIGN", "ANONYMOUS"}) != (step.role == "BOUNDARY")
+                        or (variant == "INVALID_OBJECT") !=
+                        (descriptor.get("control_kind") == "INVALID_OBJECT")
+                        or (variant == "POST_READBACK") !=
+                        (descriptor.get("control_kind") == "POST_READBACK")
+                        or (variant == "OWNER") != (step.role == "CONTROL")
+                        or (variant in {"INVALID_OBJECT", "POST_READBACK"}) !=
+                        (step.role == "OTHER")
+                        or bool(descriptor.get("cross_identity")) != (variant == "FOREIGN")
+                        or (variant == "ANONYMOUS" and
+                            (descriptor.get("identity_id") or descriptor.get("session_id")))
+                        or (variant == "FOREIGN" and
+                            descriptor.get("identity_id") == item.creator_identity_id)
+                        or (variant in {"OWNER", "INVALID_OBJECT", "POST_READBACK"} and
+                            descriptor.get("identity_id") != item.creator_identity_id)):
+                    raise ValueError
+            else:
+                if (set(shape) - {"method", "url", "fingerprint", "authentication"} or
+                        shape.get("authentication") != "EXECUTOR_SUPPLIED"):
+                    raise ValueError
+                template = RequestTemplate(shape["method"], shape["url"])
+                if (template.fingerprint() != shape.get("fingerprint") or
+                        template.fingerprint() != descriptor.get("request_template_fingerprint") or
+                        template.method != descriptor.get("method") or
+                        descriptor.get("simulation_only") is not True):
+                    raise ValueError
             url = urlsplit(template.url)
             if (url.scheme not in {"http", "https"} or not url.hostname or url.query or url.fragment
                     or url.username or url.password or "[REDACTED]" in template.url
@@ -226,6 +262,18 @@ class PlanOrchestrator:
             actor = ActorMode(descriptor["actor"])
             if category not in _ACTIVE or actor not in {ActorMode.ANONYMOUS, ActorMode.AUTHENTICATED}:
                 raise ValueError
+            if shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
+                                        "AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                        "AUTHORIZATION_GRAPHQL_MUTATION_V1"}:
+                expected_category = (ActionCategory.AUTHORIZATION_TEST if
+                                     shape["variant"] in {"FOREIGN", "ANONYMOUS"} or
+                                     shape["binding"] in {"AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                                           "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+                                     else ActionCategory.SAFE_READ)
+                if (category is not expected_category or
+                        actor is not (ActorMode.ANONYMOUS if shape["variant"] == "ANONYMOUS"
+                                      else ActorMode.AUTHENTICATED)):
+                    raise ValueError
             identity_id = descriptor.get("identity_id")
             session_id = descriptor.get("session_id")
             if (actor is ActorMode.AUTHENTICATED and (not identity_id or not session_id)

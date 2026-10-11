@@ -268,7 +268,8 @@ class ObjectRegistry:
 
     def add_requirement(self, *, plan_id: str, target_id: str, object_type: str,
                         recipe_id: str, identity_id: str, tenant_id: str,
-                        parent_id: str | None = None) -> str:
+                        parent_id: str | None = None,
+                        test_object_id: str | None = None) -> str:
         if not _RECIPE.fullmatch(object_type) or not _RECIPE.fullmatch(recipe_id):
             raise ValueError("invalid object prerequisite")
         requirement_id = "OBJREQ-" + uuid.uuid4().hex
@@ -293,18 +294,31 @@ class ObjectRegistry:
                         parent["target_id"] != target_id or not parent["verified_at"] or
                         not parent["disposable"]):
                     raise ValueError("BLOCKED_MISSING_PARENT")
+            if test_object_id:
+                exact = db.execute("SELECT target_id,object_type,recipe_id,creator_identity_id,"
+                                   "tenant_id,parent_test_object_id,disposable,verified_at,lifecycle "
+                                   "FROM test_objects WHERE test_object_id=?", (test_object_id,)).fetchone()
+                if (exact is None or exact["target_id"] != target_id or
+                        exact["object_type"] != object_type or exact["recipe_id"] != recipe_id or
+                        exact["creator_identity_id"] != identity_id or exact["tenant_id"] != tenant_id or
+                        exact["parent_test_object_id"] != parent_id or not exact["disposable"] or
+                        not exact["verified_at"] or exact["lifecycle"] != "READY"):
+                    raise ValueError("exact object prerequisite is unavailable")
             if db.execute("SELECT count(*) FROM plan_object_requirements WHERE plan_id=?",
                           (plan_id,)).fetchone()[0] >= 3:
                 raise ValueError("PLAN_REQUIREMENT_LIMIT")
-            db.execute("INSERT INTO plan_object_requirements VALUES (?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO plan_object_requirements "
+                       "(requirement_id,plan_id,target_id,object_type,recipe_id,creator_identity_id,"
+                       "tenant_id,parent_test_object_id,created_at,test_object_id) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?)",
                        (requirement_id, plan_id, target_id, object_type, recipe_id,
-                        identity_id, tenant_id, parent_id, _now()))
+                        identity_id, tenant_id, parent_id, _now(), test_object_id))
         return requirement_id
 
     def requirements(self, plan_id: str, target_id: str) -> tuple[dict[str, str | None], ...]:
         with self.store._connection() as db:
             rows = db.execute("SELECT requirement_id,object_type,recipe_id,creator_identity_id,tenant_id,"
-                              "parent_test_object_id FROM plan_object_requirements WHERE plan_id=? "
+                              "parent_test_object_id,test_object_id FROM plan_object_requirements WHERE plan_id=? "
                               "AND target_id=? ORDER BY requirement_id LIMIT 4",
                               (plan_id, target_id)).fetchall()
         return tuple(dict(row) for row in rows)
@@ -325,6 +339,7 @@ class ObjectRegistry:
                               "AND q.object_type=o.object_type AND q.recipe_id=o.recipe_id "
                               "AND q.creator_identity_id=o.creator_identity_id "
                               "AND q.tenant_id=o.tenant_id AND q.parent_test_object_id IS o.parent_test_object_id "
+                              "AND (q.test_object_id IS NULL OR q.test_object_id=o.test_object_id) "
                               "WHERE r.holder_run_id=? AND r.status='ACTIVE' AND r.expires_at>? "
                               "AND o.lifecycle='IN_USE'", (run["plan_id"], run_id, _now())).fetchone()[0]
         return held >= required
@@ -349,6 +364,7 @@ class ObjectRegistry:
                                   "AND q.creator_identity_id=o.creator_identity_id "
                                   "AND q.tenant_id=o.tenant_id "
                                   "AND q.parent_test_object_id IS o.parent_test_object_id "
+                                  "AND (q.test_object_id IS NULL OR q.test_object_id=o.test_object_id) "
                                   "WHERE r.holder_run_id=? AND r.status='ACTIVE' AND r.expires_at>? "
                                   "AND o.lifecycle='IN_USE'",
                                   (run["plan_id"], run_id, _now())).fetchone()[0]
@@ -359,13 +375,15 @@ class ObjectRegistry:
                 item = db.execute("SELECT o.test_object_id FROM test_objects o WHERE o.target_id=? "
                                   "AND o.object_type=? AND o.recipe_id=? AND o.creator_identity_id=? AND o.tenant_id=? "
                                   "AND o.parent_test_object_id IS ? AND o.lifecycle='READY' "
+                                  "AND (? IS NULL OR o.test_object_id=?) "
                                   "AND o.disposable=1 AND o.verified_at IS NOT NULL "
                                   "AND NOT EXISTS (SELECT 1 FROM test_object_reservations r WHERE "
                                   "r.test_object_id=o.test_object_id AND r.status='ACTIVE') "
                                   "ORDER BY o.created_at DESC LIMIT 1",
                                   (target_id, requirement["object_type"], requirement["recipe_id"],
                                    requirement["creator_identity_id"], requirement["tenant_id"],
-                                   requirement["parent_test_object_id"])).fetchone()
+                                   requirement["parent_test_object_id"], requirement["test_object_id"],
+                                   requirement["test_object_id"])).fetchone()
                 if item is None or item[0] in selected:
                     return False
                 selected.append(item[0])

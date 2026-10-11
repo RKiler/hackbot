@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 import uuid
 
+from .authorization_binding import reference_fingerprint
 from .executor import RequestTemplate
 from .hypotheses import Hypothesis
 from .identity_registry import IdentityRegistry
@@ -24,6 +25,7 @@ from .skills import SkillMetadata, SkillRegistry
 from .store import EvidenceFactStore
 from .target_package import PackageStatus, TargetPackage
 from .traffic import TrafficStore
+from .test_objects import ObjectRegistry, ObjectState
 
 
 class PrerequisiteState(StrEnum):
@@ -95,12 +97,14 @@ class SkillContextBuilder:
 
     def __init__(self, store: EvidenceFactStore, registry: IdentityRegistry,
                  traffic: TrafficStore, browser: Any | None = None,
-                 recon: ReconRepository | None = None) -> None:
+                 recon: ReconRepository | None = None,
+                 objects: ObjectRegistry | None = None) -> None:
         self.store = store
         self.registry = registry
         self.traffic = traffic
         self.browser = browser
         self.recon = recon
+        self.objects = objects
 
     def build(self, hypothesis: Hypothesis, profile: TargetProfile | None,
               package: TargetPackage | None = None,
@@ -116,13 +120,26 @@ class SkillContextBuilder:
                 evidence.append({"id": item.evidence_id, "type": item.evidence_type,
                                  "sensitivity": item.sensitivity.value})
         facts = []
-        for ref in hypothesis.fact_ids[:4]:
+        verified_object_identifier = False
+        for ref in hypothesis.fact_ids[:8]:
             item = self.store.get_fact(ref)
             if item and item.target_ref == hypothesis.target_id:
                 facts.append({"id": item.fact_id, "predicate": _safe(item.predicate),
                               "status": item.status.value, "sensitivity": item.sensitivity.value})
+                if (self.objects is not None and item.predicate == "created_by" and
+                        item.status.value == "ACTIVE" and item.source == "OBJECT_FACTORY" and
+                        item.confidence >= 0.9 and item.evidence_ids):
+                    owned = self.objects.get(item.subject, hypothesis.target_id)
+                    verified_object_identifier = bool(
+                        owned and owned.state in {ObjectState.READY, ObjectState.IN_USE}
+                        and owned.disposable and owned.verified_at and owned.external_id_hash
+                        and owned.external_id_evidence_id and owned.creator_identity_id == item.object)
         traffic = []
-        for exchange in self.traffic.find_recent(hypothesis.target_id, limit=12).items:
+        traffic_page = (self.traffic.find_by_operation(hypothesis.target_id,
+                                                      hypothesis.surface_key, limit=12)
+                        if hypothesis.surface_key.startswith(("GQL-", "OPERATION-")) else
+                        self.traffic.find_recent(hypothesis.target_id, limit=12))
+        for exchange in traffic_page.items:
             req = exchange.request
             if hypothesis.surface_key not in (req.display_path, req.origin + req.display_path,
                                               req.record.endpoint_id, req.record.operation_id):
@@ -187,6 +204,9 @@ class SkillContextBuilder:
             flags.add("anonymous_access")
         if "OBJECT_ID" in signals:
             flags.add("known_object_identifier")
+        if verified_object_identifier:
+            flags.add("known_object_identifier")
+            flags.add("known_ownership")
         if any(f["predicate"] in {"owns", "owned_by", "object_owner", "tenant_owner"}
                and f["status"] == "ACTIVE" for f in facts):
             flags.add("known_ownership")
@@ -206,6 +226,9 @@ class SkillContextBuilder:
             flags.add("attacker_controlled_source")
         if "FEATURE_DOWNLOAD" in signals or "FEATURE_PII_OBJECT" in signals:
             flags.add("sensitive_artifact")  # Candidate only, never secret bytes.
+        if any(f["predicate"] == "data_classification" and f["status"] == "ACTIVE"
+               for f in facts):
+            flags.add("sensitive_artifact")
         if "SURFACE_INTERNAL" in signals and "multiple_roles" in flags:
             flags.add("role_hidden_operation")
         recon_refs = []
@@ -315,6 +338,7 @@ class InvestigationPlan:
     token_budget: int
     status: str
     created_at: str
+    comparison_pairs: tuple[dict[str, int], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
@@ -333,7 +357,24 @@ class InvestigationPlan:
                 "rejection_conditions": list(self.rejection_conditions), "risk": self.risk,
                 "request_budget": self.request_budget, "token_budget": self.token_budget,
                 "expected_request_count": len(self.proposed_actions), "status": self.status,
-                "created_at": self.created_at, "execution_started": False, "finding_status": "UNVALIDATED"}
+                "created_at": self.created_at, "comparison_pairs": list(self.comparison_pairs),
+                "execution_started": False, "finding_status": "UNVALIDATED"}
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationPlanBinding:
+    source_exchange_id: str
+    test_object_id: str
+    object_type: str
+    object_ref_hash: str
+    method: str
+    identity_id: str | None
+    session_id: str | None
+    role: str
+    variant: str
+    operation: str | None = None
+    binding: str = "AUTHORIZATION_OBJECT_PATH_V1"
+    variable_name: str | None = None
 
 
 class SkillPlanStore:
@@ -479,3 +520,103 @@ class SkillPlanner:
             skill.rejection_conditions, skill.metadata.risk, skill.metadata.request_budget,
             skill.metadata.token_budget, status, datetime.now(timezone.utc).isoformat())
         return self.store.save(plan, regenerate=regenerate)
+
+    def bind_authorization(self, package: TargetPackage, hypothesis: Hypothesis,
+                           context: SkillContext, skill_id: str,
+                           bindings: tuple[AuthorizationPlanBinding, ...],
+                           *, request_cap: int) -> dict[str, object]:
+        """Freeze exact owner/object references; policy is re-evaluated at dispatch."""
+        if hypothesis.target_id != package.target.id or context.target_id != package.target.id:
+            raise ValueError("authorization plan target mismatch")
+        skill = self.registry.select(skill_id)
+        if skill.metadata.category not in {"authorization", "api"} and not (
+                skill_id == "unauthenticated-sensitive-download" and
+                skill.metadata.category == "exposure"):
+            raise ValueError("not an authorization skill")
+        prerequisite = self.checker.check(skill.metadata, context)
+        if prerequisite.state is not PrerequisiteState.READY:
+            raise ValueError("authorization prerequisites are not ready")
+        if (type(request_cap) is not int or not 1 <= request_cap <= 20 or
+                not 1 <= len(bindings) <= min(request_cap, skill.metadata.request_budget)
+                or not any(item.role == "BOUNDARY" for item in bindings)
+                or bindings[0].role != "CONTROL"):
+            raise ValueError("authorization plan exceeds skill or hunt budget")
+        if skill_id == "graphql-mutation-authorization" and (
+                len(bindings) != 5 or
+                tuple(item.variant for item in bindings) !=
+                ("OWNER", "OWNER", "INVALID_OBJECT", "FOREIGN", "POST_READBACK") or
+                tuple(item.binding for item in bindings) !=
+                ("AUTHORIZATION_OBJECT_PATH_V1", "AUTHORIZATION_OBJECT_PATH_V1",
+                 "AUTHORIZATION_GRAPHQL_MUTATION_V1", "AUTHORIZATION_GRAPHQL_MUTATION_V1",
+                 "AUTHORIZATION_OBJECT_PATH_V1") or
+                bindings[0].test_object_id != bindings[2].test_object_id or
+                bindings[0].test_object_id != bindings[3].test_object_id or
+                bindings[0].test_object_id != bindings[4].test_object_id or
+                bindings[0].identity_id != bindings[4].identity_id):
+            raise ValueError("mutation plan requires owned before/after read-back")
+        actions: list[dict[str, object]] = []
+        templates: list[dict[str, str]] = []
+        for item in bindings:
+            graphql_query = item.binding == "AUTHORIZATION_GRAPHQL_QUERY_V1"
+            graphql_mutation = item.binding == "AUTHORIZATION_GRAPHQL_MUTATION_V1"
+            graphql = graphql_query or graphql_mutation
+            if (item.binding not in {"AUTHORIZATION_OBJECT_PATH_V1", "AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                     "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+                    or (graphql and (item.method != "POST" or
+                                      skill_id != ("graphql-mutation-authorization" if graphql_mutation
+                                                   else "graphql-object-authorization")
+                                            or not item.variable_name or not item.variable_name.isidentifier()))
+                    or (not graphql and (item.method not in {"GET", "HEAD"} or item.variable_name))
+                    or item.role not in {"CONTROL", "BOUNDARY", "OTHER"}
+                    or item.variant not in {"OWNER", "FOREIGN", "INVALID_OBJECT", "ANONYMOUS",
+                                            "POST_READBACK"}
+                    or (item.variant == "OWNER") != (item.role == "CONTROL")
+                    or (item.variant in {"FOREIGN", "ANONYMOUS"}) != (item.role == "BOUNDARY")
+                    or (item.variant in {"INVALID_OBJECT", "POST_READBACK"}) != (item.role == "OTHER")
+                    or (item.variant == "POST_READBACK" and item.binding != "AUTHORIZATION_OBJECT_PATH_V1")
+                    or (graphql_mutation and item.variant not in {"FOREIGN", "INVALID_OBJECT"})
+                    or (item.variant == "ANONYMOUS" and (item.identity_id or item.session_id))
+                    or (item.variant != "ANONYMOUS" and
+                        (not item.identity_id or not item.session_id))
+                    or not re.fullmatch(r"[0-9a-f]{64}", item.object_ref_hash)):
+                raise ValueError("invalid authorization plan binding")
+            shape = {"binding": item.binding, "method": item.method,
+                     "source_exchange_id": item.source_exchange_id,
+                     "test_object_id": item.test_object_id, "variant": item.variant,
+                     "authentication": "EXECUTOR_SUPPLIED"}
+            if graphql:
+                shape["variable_name"] = item.variable_name
+            shape["fingerprint"] = reference_fingerprint(shape)
+            templates.append(shape)
+            actions.append({"category": ("AUTHORIZATION_TEST" if item.role == "BOUNDARY" or
+                                         graphql else "SAFE_READ"),
+                            "actor": "ANONYMOUS" if item.variant == "ANONYMOUS" else "AUTHENTICATED",
+                            "identity_id": item.identity_id,
+                            "session_id": item.session_id, "method": item.method,
+                            "operation": item.operation, "object_type": item.object_type,
+                            "object_ref_hash": item.object_ref_hash,
+                            "disposable_intent": True,
+                            "cross_identity": item.variant == "FOREIGN",
+                            "role": item.role,
+                            "control_kind": ("INVALID_OBJECT" if item.variant == "INVALID_OBJECT" else
+                                             "POST_READBACK" if item.variant == "POST_READBACK" else None),
+                            "vulnerability_class": skill.metadata.vulnerability_classes[0].lower(),
+                            "request_template_fingerprint": shape["fingerprint"],
+                            "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True})
+        steps = [(StepType.OBSERVE, "Review observed operation and ownership evidence.")]
+        steps.extend((StepType.EXECUTE_REQUEST, "Execute one bound authorization comparison.")
+                     for _ in bindings)
+        steps.append((StepType.COMPARE_RESPONSE, "Compare owner and boundary metadata."))
+        boundary_slot = next(index for index, item in enumerate(bindings) if item.role == "BOUNDARY")
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill_id, skill.metadata.version,
+            skill.content_hash, skill.metadata.category, skill.metadata.vulnerability_classes,
+            skill.metadata.prerequisites, skill.metadata.required_validators,
+            package.target.id, True, prerequisite, skill.controls, tuple(steps),
+            tuple(actions), tuple(templates), skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, len(bindings),
+            skill.metadata.token_budget, "READY_FOR_MANUAL_REVIEW",
+            datetime.now(timezone.utc).isoformat(),
+            ({"control_slot": 0, "boundary_slot": boundary_slot},))
+        return self.store.save(plan, regenerate=True)

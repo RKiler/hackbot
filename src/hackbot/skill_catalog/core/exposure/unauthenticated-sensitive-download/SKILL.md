@@ -4,7 +4,7 @@ description: Compare protected owner download metadata with anonymous retrieval 
 category: exposure
 vulnerability_classes: [EXPOSURE, DOWNLOAD]
 triggers: [EXPOSURE, DOWNLOAD]
-prerequisites: [in_scope_target, authenticated_endpoint, verified_sessions, anonymous_access, sensitive_artifact, baseline_traffic]
+prerequisites: [in_scope_target, authenticated_endpoint, verified_sessions, sensitive_artifact, baseline_traffic]
 risk: MEDIUM
 required_validators: [content_hash_match, authorization_control]
 token_budget: 1400

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -27,6 +27,7 @@ class ObjectFactoryResult:
     item: TestObject | None
     reason: str
     approval_id: str | None = None
+    created_new: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {"outcome": self.outcome, "object": self.item.to_dict() if self.item else None,
@@ -217,7 +218,8 @@ class ObjectFactory:
             parent_id=parent_id, plan_id=plan_id, run_id=run_id, hypothesis_id=hypothesis_id,
             max_objects_per_plan=self.settings.max_objects_per_plan,
             max_objects_per_target_hour=self.settings.max_objects_per_target_hour)
-        return self.create(item.id, recipe.target_id, session_id=session_id)
+        return replace(self.create(item.id, recipe.target_id, session_id=session_id),
+                       created_new=True)
 
     def create(self, object_id: str, target_id: str, *, session_id: str) -> ObjectFactoryResult:
         item = self.objects.get(object_id, target_id)

@@ -61,10 +61,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
         if self.path.startswith("/fixture/"):
             parts = self.path.split("/")
-            if len(parts) == 5 and parts[3] in {"projects", "dashboards"}:
+            if len(parts) == 5 and parts[3] in {"projects", "dashboards", "documents"}:
                 item = self.server.fixture_objects.get(parts[4])
                 if item is None or item["tenant"] != parts[2] or item["type"] != parts[3][:-1]:
                     return self._answer(404, b"{}", (("Content-Type", "application/json"),))
+                if getattr(self.server, "fixture_secure", False) and (
+                    self.headers.get("Cookie") != "fixture_actor=" + item["owner"]
+                ):
+                    return self._answer(403, b'{"error":"forbidden"}',
+                                        (("Content-Type", "application/json"),))
                 return self._answer(200, json.dumps(item).encode(), (("Content-Type", "application/json"),))
         if self.path in {"/validated/object-a", "/validated/object-a-alt"}:
             return self._answer(200, b'{"id":"object-a","tenantId":"tenant-a","payload":"owned-fixture"}',
@@ -115,16 +120,42 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.server.received.append(("POST", self.path, self.headers.get("Cookie")))
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size)
+        if self.path == "/fixture/graphql":
+            try:
+                payload = json.loads(body)
+                value = payload["variables"]["id"]
+            except (KeyError, TypeError, ValueError):
+                return self._answer(400, b'{}', (("Content-Type", "application/json"),))
+            item = self.server.fixture_objects.get(value)
+            if item is None:
+                result = {"data": {"node": None}, "errors": [{"message": "not found"}]}
+            elif (getattr(self.server, "fixture_secure", False) and
+                  self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                result = {"data": {"node": None}, "errors": [{"message": "forbidden"}]}
+            else:
+                if str(payload.get("query", "")).lstrip().startswith("mutation "):
+                    name = payload["variables"].get("name", payload["variables"].get("newName"))
+                    if not isinstance(name, str):
+                        return self._answer(400, b'{}', (("Content-Type", "application/json"),))
+                    if not getattr(self.server, "fixture_noop_mutation", False):
+                        item["name"] = name
+                result = {"data": {"node": item}}
+            return self._answer(200, json.dumps(result).encode(),
+                                (("Content-Type", "application/json"),))
         if self.path.startswith("/fixture/"):
             parts = self.path.split("/")
-            if len(parts) == 4 and parts[3] in {"projects", "dashboards", "projects-ambiguous"}:
+            if len(parts) == 4 and parts[3] in {"projects", "dashboards", "documents", "projects-ambiguous"}:
                 try:
                     data = json.loads(body)
                 except ValueError:
                     return self._answer(400)
                 if not isinstance(data, dict) or not isinstance(data.get("name"), str):
                     return self._answer(400)
-                identity = "tenant_a_admin" if parts[2] == "tenant-a" else "tenant_b_admin"
+                cookie = self.headers.get("Cookie") or ""
+                identity = ("tenant_a_admin" if parts[2] == "tenant-a" else "tenant_b_admin") \
+                    if cookie == SECRET else cookie.removeprefix("fixture_actor=")
+                if identity not in {"tenant_a_admin", "tenant_a_member", "tenant_b_admin"}:
+                    return self._answer(401)
                 value = f"fixture{len(self.server.fixture_objects) + 1}"
                 item = {"id": value, "name": data["name"], "owner": identity,
                         "tenant": parts[2], "type": "project" if parts[3] == "projects-ambiguous"
@@ -234,6 +265,8 @@ class ExecutorTests(unittest.TestCase):
         self.server.received = []
         self.server.created = []
         self.server.fixture_objects = {}
+        self.server.fixture_secure = False
+        self.server.fixture_noop_mutation = False
         self.server.drop_delete_response = False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -295,10 +328,10 @@ class ExecutorTests(unittest.TestCase):
         permit = permit or self.executor.authorize(action, template)
         return self.executor.execute(action, permit, template, **kwargs)
 
-    def owned_session(self, alias):
+    def owned_session(self, alias, *, secret_ref="ref:fixture_cookie"):
         identity = self.registry.register_identity(
             self.package.target.id, alias, status=IdentityStatus.ACTIVE,
-            secret_ref="ref:fixture_cookie",
+            secret_ref=secret_ref,
         )
         self.auth.prepare(self.package.target.id, identity.id)
         session = self.browser.create(self.package.target.id, identity.id)

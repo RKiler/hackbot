@@ -149,8 +149,9 @@ class SkillPlanningTests(unittest.TestCase):
         self.assertIn("graphql_mutation", checker.check(mutation, context(flags={"in_scope_target",
                                                                            "graphql_operation"})).missing)
         download = self.registry.metadata("unauthenticated-sensitive-download")
-        self.assertIn("anonymous_access", checker.check(download,
-                          context(flags=set(download.prerequisites) - {"anonymous_access"})).missing)
+        self.assertNotIn("anonymous_access", download.prerequisites)
+        self.assertEqual(checker.check(download, context(flags=set(download.prerequisites))).state,
+                         PrerequisiteState.READY)
         internal = self.registry.metadata("internal-surface-candidate")
         self.assertEqual(internal.request_budget, 0)
 

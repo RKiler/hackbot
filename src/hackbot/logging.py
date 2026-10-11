@@ -35,11 +35,12 @@ _SENSITIVE_PARTS = (
     "accesskey", "privatekey", "secret", "credential", "session", "token",
     "databaseurl", "dburl", "connectionstring", "dsn",
 )
+_SENSITIVE_WORD = re.compile(r"(?:^|[^a-z0-9])(?:pass|pat|key|auth)(?:$|[^a-z0-9])", re.I)
 
 
 def is_sensitive_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-    return any(part in normalized for part in _SENSITIVE_PARTS)
+    return any(part in normalized for part in _SENSITIVE_PARTS) or bool(_SENSITIVE_WORD.search(key))
 
 
 @dataclass(frozen=True)

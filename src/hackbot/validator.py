@@ -153,6 +153,30 @@ class DeterministicValidatorEngine:
         self.registry = registry or ValidatorRegistry()
         self.comparator = ResponseComparator(evidence)
 
+    def _semantic_object_hash(self, run: PlanRun, salted_hash: str | None,
+                              object_type: str | None) -> str | None:
+        """Bridge ObjectFactory's salted registry key to response/Facts object hashes."""
+        if not salted_hash or not object_type:
+            return salted_hash
+        with self.evidence._connection() as db:
+            row = db.execute(
+                "SELECT test_object_id,external_id_evidence_id,verified_at,disposable "
+                "FROM test_objects WHERE target_id=? AND package_id=? AND "
+                "external_id_hash=? AND object_type=? LIMIT 1",
+                (run.target_id, run.package_id, salted_hash, object_type)).fetchone()
+        if row is None:
+            return salted_hash
+        if not row["verified_at"] or not row["disposable"] or not row["external_id_evidence_id"]:
+            return None
+        try:
+            value = self.evidence.read_content(row["external_id_evidence_id"],
+                                               allow_sensitive=True, max_bytes=256).decode("ascii")
+        except (ValueError, UnicodeError, PermissionError):
+            return None
+        if _digest(row["test_object_id"] + ":" + value) != salted_hash:
+            return None
+        return _digest(value)
+
     def _trusted_fact(self, subject: str, predicate: str, target_id: str) -> tuple[Fact, ...]:
         page = self.evidence.find_facts(subject, predicate, limit=20)
         if page.next_cursor is not None:
@@ -291,7 +315,8 @@ class DeterministicValidatorEngine:
             observations.append(Observation(
                 step, exchange, self.comparator.features(exchange),
                 str(data.get("actor", "")), data.get("identity_id"),
-                data.get("object_ref_hash"), data.get("object_type"),
+                self._semantic_object_hash(run, data.get("object_ref_hash"),
+                                           data.get("object_type")), data.get("object_type"),
                 data.get("operation"), valid, reason, refs))
         validators = snapshot.data.get("required_validators", [])
         if not isinstance(validators, list) or any(not isinstance(item, str) for item in validators):
@@ -532,7 +557,141 @@ class GraphQLValidator:
     def __init__(self, mutation: bool) -> None:
         self.mutation = mutation
 
+    @staticmethod
+    def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("ambiguous duplicate JSON key")
+            value[key] = item
+        return value
+
+    @staticmethod
+    def _object_state(item: Observation, engine: DeterministicValidatorEngine,
+                      object_hash: str) -> tuple[str, str] | None:
+        response = item.exchange.response
+        evidence_id = response.body_evidence_id if response else None
+        record = engine.evidence.get_evidence(evidence_id) if evidence_id else None
+        if (record is None or record.target_ref != item.exchange.target_id or
+                record.redaction_status.value != "ORIGINAL" or record.content_size > 262144):
+            return None
+        try:
+            raw = engine.evidence.read_content(evidence_id, allow_sensitive=True,
+                                               max_bytes=262144)
+            if hashlib.sha256(raw).hexdigest() != response.body_hash:
+                return None
+            data = json.loads(raw, object_pairs_hook=GraphQLValidator._unique_pairs)
+            if (not isinstance(data, dict) or not isinstance(data.get("id"), str) or
+                    not isinstance(data.get("name"), str) or
+                    _digest(data["id"]) != object_hash):
+                return None
+            return data["id"], data["name"]
+        except (TypeError, ValueError, UnicodeError, PermissionError):
+            return None
+
+    def _evaluate_mutation(self, context: ValidationContext,
+                           engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        control, boundaries, negative = engine._controls(context)
+        checks = list(engine._base_checks(control, boundaries, negative))
+        readbacks = tuple(item for item in context.observations if item.step.role == "OTHER" and
+                          item.step.action_slot is not None and
+                          context.plan["proposed_actions"][item.step.action_slot].get("control_kind")
+                          == "POST_READBACK")
+        if (control is None or checks[0].outcome is CheckOutcome.FAIL or len(boundaries) != 1 or
+                len(negative) != 1 or len(readbacks) != 1):
+            return _decision(ValidationStatus.INVALID_TEST, "MUTATION_CONTROLS_MISSING",
+                             checks=tuple(checks))
+        boundary, invalid, after = boundaries[0], negative[0], readbacks[0]
+        if not all(item.audit_valid for item in (control, boundary, invalid, after)):
+            return _decision(ValidationStatus.INVALID_TEST, "MUTATION_AUDIT_INVALID",
+                             checks=tuple(checks))
+        if not (control.step.ordinal < invalid.step.ordinal < boundary.step.ordinal <
+                after.step.ordinal):
+            return _decision(ValidationStatus.INVALID_TEST, "MUTATION_SEQUENCE_INVALID",
+                             checks=tuple(checks))
+        semantic_negative = bool(invalid.features.graphql_errors_present and
+                                 not invalid.features.graphql_data_present)
+        checks[2] = _check("NEGATIVE_CONTROL", semantic_negative, invalid.evidence_ids[:2])
+        if not semantic_negative:
+            return _decision(ValidationStatus.INVALID_TEST, "NEGATIVE_CONTROL_FAILED",
+                             checks=tuple(checks))
+        if boundary.features.graphql_errors_present or not boundary.features.graphql_data_present:
+            return _decision(ValidationStatus.REJECTED, "GRAPHQL_BOUNDARY_DENIED",
+                             checks=tuple(checks), contradicting=boundary.evidence_ids[:3])
+        object_hash = control.object_ref_hash
+        if (not object_hash or any(item.object_ref_hash != object_hash
+                                   for item in (boundary, invalid, after)) or
+                control.features.request_method != "GET" or
+                after.features.request_method != "GET" or
+                boundary.features.request_method != "POST" or
+                control.identity_id != after.identity_id or
+                control.identity_id == boundary.identity_id or
+                any(item.features.status_code is None or
+                    not 200 <= item.features.status_code < 300
+                    for item in (control, boundary, after)) or
+                not engine.comparator.compare(control.features, after.features).same_request_path):
+            return _decision(ValidationStatus.INVALID_TEST, "MUTATION_BINDING_INVALID",
+                             checks=tuple(checks))
+        target = context.run.target_id
+        visibility, vis_refs = engine.fact_value(object_hash, "resource_visibility", target)
+        tenant, tenant_refs = engine.fact_value(object_hash, "resource_tenant", target)
+        policy, policy_refs = engine.fact_value(object_hash, "access_policy", target)
+        operation, op_refs = engine.fact_value(object_hash, "graphql_operation", target)
+        first = engine.membership(control.identity_id, target)
+        second = engine.membership(boundary.identity_id, target)
+        relation = bool(visibility == "PRIVATE" and tenant and first and second and
+                        first[0] == tenant and second[0] != tenant and
+                        policy in {"TENANT_ONLY", "OWNER_ONLY"} and
+                        operation and operation == boundary.operation)
+        checks.append(_check("MUTATION_BOUNDARY", relation,
+                             (*vis_refs, *tenant_refs, *policy_refs, *op_refs)[:8]))
+        if not relation:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "MUTATION_BOUNDARY_UNPROVEN",
+                             checks=tuple(checks))
+        before_state = self._object_state(control, engine, object_hash)
+        after_state = self._object_state(after, engine, object_hash)
+        request_ref = boundary.exchange.request.body_evidence_id
+        request_record = engine.evidence.get_evidence(request_ref) if request_ref else None
+        desired = None
+        if (request_record is not None and request_record.target_ref == target and
+                request_record.redaction_status.value == "ORIGINAL" and
+                request_record.content_size <= 8192):
+            try:
+                raw = engine.evidence.read_content(request_ref, allow_sensitive=True, max_bytes=8192)
+                if hashlib.sha256(raw).hexdigest() == boundary.exchange.request.body_hash:
+                    variables = json.loads(
+                        raw, object_pairs_hook=self._unique_pairs)["variables"]
+                    changes = {key: value for key, value in variables.items()
+                               if key in {"name", "newName"}}
+                    if len(changes) == 1:
+                        desired = next(iter(changes.values()))
+            except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+                pass
+        changed = bool(before_state and after_state and isinstance(desired, str) and
+                       before_state[1] != desired and after_state[1] == desired and
+                       before_state[0] == after_state[0] and
+                       object_hash in boundary.features.object_id_hashes)
+        checks.append(_check("SIDE_EFFECT_READBACK", changed,
+                             (*control.evidence_ids[:2], *boundary.evidence_ids[:2],
+                              *after.evidence_ids[:2])))
+        if not changed:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "NO_ATTESTED_SIDE_EFFECT_READBACK", checks=tuple(checks))
+        evidence = tuple(dict.fromkeys((*control.evidence_ids[:3],
+                                         *boundary.evidence_ids[:3], *after.evidence_ids[:3],
+                                         *invalid.evidence_ids[:2], *vis_refs, *tenant_refs,
+                                         *policy_refs, *op_refs, *first[2], *second[2])))[:64]
+        finding = engine._finding(context, control, boundary, "GRAPHQL_AUTHORIZATION",
+                                  "GRAPHQL_UNAUTHORIZED_STATE_CHANGE", operation)
+        return _decision(ValidationStatus.CONFIRMED, "GRAPHQL_MUTATION_DURABLE_EFFECT",
+                         checks=tuple(checks), controls=("OWNER_BEFORE", "INVALID_OBJECT",
+                                                        "OWNER_AFTER"), supporting=evidence,
+                         reproductions=1, impact="GRAPHQL_UNAUTHORIZED_STATE_CHANGE",
+                         finding=finding)
+
     def evaluate(self, context: ValidationContext, engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        if self.mutation:
+            return self._evaluate_mutation(context, engine)
         control, boundaries, negative = engine._controls(context)
         checks = list(engine._base_checks(control, boundaries, negative))
         if control is None or checks[0].outcome is CheckOutcome.FAIL:
@@ -581,11 +740,6 @@ class GraphQLValidator:
                         item.operation == operation and item.features.request_method == control.features.request_method)
         checks.append(_check("GRAPHQL_DATA_PROOF", len(matches) >= 2,
                              tuple(ref for item in matches for ref in item.evidence_ids[:2])[:8]))
-        if self.mutation:
-            checks.append(_check("SIDE_EFFECT_READBACK", None))
-            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW, "NO_ATTESTED_SIDE_EFFECT_READBACK",
-                             checks=tuple(checks), reproductions=len(matches),
-                             limitations=("A Fact alone cannot prove a durable mutation effect.",))
         if not matches:
             return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "GRAPHQL_DATA_UNPROVEN",
                              checks=tuple(checks))
@@ -598,13 +752,11 @@ class GraphQLValidator:
                                          *vis_refs, *op_refs, *tenant_refs, *policy_refs, *marker_refs,
                                          *first[2], *second[2])))[:64]
         finding = engine._finding(context, control, matches[0], "GRAPHQL_AUTHORIZATION",
-                                  "GRAPHQL_PROTECTED_OBJECT_READ" if not self.mutation else
-                                  "GRAPHQL_UNAUTHORIZED_STATE_CHANGE", operation)
+                                  "GRAPHQL_PROTECTED_OBJECT_READ", operation)
         return _decision(ValidationStatus.CONFIRMED, "GRAPHQL_PROTECTED_BOUNDARY",
                          checks=tuple(checks), controls=("OWNER_CONTROL", "INVALID_OBJECT"),
                          supporting=evidence, reproductions=len(matches),
-                         impact="GRAPHQL_PROTECTED_OBJECT_READ" if not self.mutation else
-                         "GRAPHQL_UNAUTHORIZED_STATE_CHANGE", finding=finding)
+                         impact="GRAPHQL_PROTECTED_OBJECT_READ", finding=finding)
 
 
 class ExposureValidator:

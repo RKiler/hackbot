@@ -424,7 +424,7 @@ class TrafficTests(unittest.TestCase):
 
     def test_schema_indexes_migration_and_no_production_dependency(self):
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
             indexes = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'traffic_%'")}
             for name in ("traffic_exchanges_target_recent_idx", "traffic_exchanges_identity_recent_idx",
@@ -438,6 +438,10 @@ class TrafficTests(unittest.TestCase):
         self.assertIn("traffic_exchanges_target_recent_idx", str(plan))
         self.traffic.initialize()
         with sqlite3.connect(self.db) as connection:
+            for table in ("authorization_hunt_objects", "authorization_observations",
+                          "authorization_hunt_candidates", "authorization_candidates",
+                          "authorization_hunts"):
+                connection.execute(f"DROP TABLE {table}")
             for table in ("finding_status_events", "finding_duplicates", "finding_locations",
                           "finding_evidence", "findings", "validation_checks", "validations"):
                 connection.execute(f"DROP TABLE {table}")
@@ -467,7 +471,7 @@ class TrafficTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=4")
         self.traffic.initialize()
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
             self.assertEqual(connection.execute("SELECT package_id FROM registry_targets WHERE target_id=?",
                                                 (self.target,)).fetchone()[0], self.package.id)
 

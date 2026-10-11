@@ -1,0 +1,193 @@
+"""Resolve an observed, owned object request at dispatch time.
+
+Plans retain opaque references, not captured URLs or application object IDs.
+This module has no transport and cannot send a request.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+import uuid
+
+from .evidence import FactStatus
+from .executor import RequestTemplate
+from .logging import SecretRedactor
+from .response_compare import ResponseComparator
+from .store import EvidenceFactStore
+from .target_package import TargetPackage
+from .target_scope import ScopeResult
+from .test_objects import ObjectRegistry, ObjectState
+from .traffic import AuthState, ExchangeState, TrafficStore
+
+
+_KEYS = frozenset({"binding", "method", "source_exchange_id", "test_object_id",
+                   "variant", "fingerprint", "authentication"})
+_GRAPHQL_KEYS = _KEYS | {"variable_name"}
+_VARIANTS = frozenset({"OWNER", "FOREIGN", "INVALID_OBJECT", "ANONYMOUS",
+                       "POST_READBACK"})
+
+
+def single_rename_operation(query: str, id_variable: str, name_variable: str) -> str | None:
+    """Accept one plain rename field; reject aliases, fragments and second operations."""
+    if name_variable not in {"name", "newName"}:
+        return None
+    identifier = r"[A-Za-z_][A-Za-z_0-9]*"
+    pattern = (
+        rf"\s*mutation\s+(?P<operation>{identifier})\s*"
+        rf"\(\s*\${re.escape(id_variable)}\s*:\s*ID!\s*,\s*"
+        rf"\${re.escape(name_variable)}\s*:\s*String!\s*\)\s*"
+        rf"\{{\s*rename{identifier}\s*\(\s*id\s*:\s*\${re.escape(id_variable)}\s*,\s*"
+        rf"{re.escape(name_variable)}\s*:\s*\${re.escape(name_variable)}\s*\)\s*"
+        rf"\{{\s*(?P<selection>(?:{identifier}\s*)+)\}}\s*\}}\s*"
+    )
+    match = re.fullmatch(pattern, query, flags=re.ASCII)
+    if match is None:
+        return None
+    fields = match.group("selection").split()
+    if len(fields) != len(set(fields)) or not {"id", "name"}.issubset(fields) or not set(fields) <= {
+            "id", "name", "owner", "tenant"}:
+        return None
+    return match.group("operation")
+
+
+def reference_fingerprint(shape: dict[str, str]) -> str:
+    keys = (_GRAPHQL_KEYS if shape.get("binding") in {
+        "AUTHORIZATION_GRAPHQL_QUERY_V1", "AUTHORIZATION_GRAPHQL_MUTATION_V1"} else _KEYS)
+    payload = {key: shape[key] for key in sorted(keys - {"fingerprint"})}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def resolve_authorization_request(shape: dict[str, str], *, package: TargetPackage,
+                                  run_id: str, objects: ObjectRegistry,
+                                  traffic: TrafficStore, evidence: EvidenceFactStore) -> tuple[RequestTemplate, str]:
+    """Return a single exact-path request and its salted owned-object hash."""
+    graphql = shape.get("binding") in {"AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                       "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+    mutation = shape.get("binding") == "AUTHORIZATION_GRAPHQL_MUTATION_V1"
+    if (set(shape) != (_GRAPHQL_KEYS if graphql else _KEYS) or
+            shape.get("binding") not in {"AUTHORIZATION_OBJECT_PATH_V1",
+                                          "AUTHORIZATION_GRAPHQL_QUERY_V1",
+                                          "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+            or shape.get("authentication") != "EXECUTOR_SUPPLIED"
+            or shape.get("variant") not in _VARIANTS
+            or (graphql and (shape.get("method") != "POST" or
+                             shape.get("variant") in {"ANONYMOUS", "POST_READBACK"} or
+                             not isinstance(shape.get("variable_name"), str) or
+                             not shape["variable_name"].isidentifier()))
+            or (mutation and shape.get("variant") not in {"FOREIGN", "INVALID_OBJECT"})
+            or (not graphql and shape.get("method") not in {"GET", "HEAD"})
+            or (shape.get("variant") == "POST_READBACK" and graphql)
+            or shape.get("fingerprint") != reference_fingerprint(shape)):
+        raise ValueError("invalid authorization request reference")
+    item = objects.get(shape["test_object_id"], package.target.id)
+    if (item is None or item.package_id != package.id or item.state is not ObjectState.IN_USE
+            or not item.disposable or item.verified_at is None or not item.external_id_hash
+            or not item.external_id_evidence_id or objects.active_reservation(item.id) != run_id):
+        raise ValueError("owned object reservation is missing")
+    for predicate, value in (("created_by", item.creator_identity_id),
+                             ("resource_tenant", item.tenant_id), ("disposable", "true")):
+        facts = evidence.find_facts(item.id, predicate, limit=8).items
+        if not any(fact.target_ref == package.target.id and fact.status is FactStatus.ACTIVE
+                   and fact.source != "MANUAL" and fact.confidence >= 0.9
+                   and fact.evidence_ids and fact.object == value for fact in facts):
+            raise ValueError("owned object facts are missing")
+    external = evidence.read_content(item.external_id_evidence_id,
+                                     allow_sensitive=True, max_bytes=256).decode("ascii")
+    if (not external or "/" in external or "\\" in external or
+            hashlib.sha256((item.id + ":" + external).encode()).hexdigest() != item.external_id_hash):
+        raise ValueError("owned object ID integrity failed")
+    exchange = traffic.get_exchange(shape["source_exchange_id"])
+    if (exchange is None or exchange.target_id != package.target.id or exchange.package_id != package.id
+            or exchange.state is not ExchangeState.COMPLETE or exchange.response is None
+            or exchange.attribution.auth_state is not AuthState.VERIFIED
+            or exchange.attribution.verified_identity_id != item.creator_identity_id
+            or exchange.scope_result is not ScopeResult.IN_SCOPE
+            or exchange.request.record.method != shape["method"]):
+        raise ValueError("owner request is not verified")
+    features = ResponseComparator(evidence).features(exchange)
+    if (features.status_code is None or not 200 <= features.status_code < 300
+            or features.graphql_errors_present
+            or (graphql and not features.graphql_data_present)
+            or hashlib.sha256(external.encode()).hexdigest() not in features.object_id_hashes):
+        raise ValueError("owner request lacks semantic object proof")
+    request_evidence = evidence.get_evidence(exchange.request.observation_evidence_id)
+    if request_evidence is None or request_evidence.target_ref != package.target.id:
+        raise ValueError("owner request evidence is unavailable")
+    try:
+        observed = json.loads(evidence.read_content(request_evidence.evidence_id,
+                                                    allow_sensitive=True, max_bytes=8192))
+        url = observed["url"]
+        parsed = urlsplit(url)
+    except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+        raise ValueError("owner request URL is unavailable") from None
+    if (not isinstance(url, str) or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname or parsed.username or parsed.password or parsed.query
+            or parsed.fragment or package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE):
+        raise ValueError("owner request URL is unsafe")
+    if graphql:
+        body_ref = exchange.request.body_evidence_id
+        body_item = evidence.get_evidence(body_ref) if body_ref else None
+        if (body_item is None or body_item.target_ref != package.target.id or
+                body_item.redaction_status.value != "ORIGINAL" or body_item.content_size > 8192):
+            raise ValueError("captured GraphQL body is unavailable")
+        try:
+            raw = evidence.read_content(body_ref, allow_sensitive=True, max_bytes=8192)
+            if exchange.request.body_hash != hashlib.sha256(raw).hexdigest():
+                raise ValueError
+            def unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                result: dict[str, object] = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate GraphQL JSON key")
+                    result[key] = value
+                return result
+            payload = json.loads(raw, object_pairs_hook=unique_pairs)
+            variables = payload["variables"]
+            query = payload["query"]
+            if (not isinstance(payload, dict) or set(payload) - {"query", "variables", "operationName"}
+                    or not isinstance(query, str) or not query.lstrip().startswith(
+                        "mutation " if mutation else "query ")
+                    or len(query) > 4096 or SecretRedactor.from_environment().text(query) != query
+                    or re.search(r"\b(?:query|subscription)\b" if mutation else
+                                 r"\b(?:mutation|subscription)\b", query, re.I)
+                    or not isinstance(variables, dict) or
+                    (set(variables) not in ({shape["variable_name"], "name"},
+                                            {shape["variable_name"], "newName"}) if mutation else
+                     set(variables) != {shape["variable_name"]}) or
+                    variables.get(shape["variable_name"]) != external):
+                raise ValueError
+            if mutation:
+                changes = {key: value for key, value in variables.items()
+                           if key != shape["variable_name"]}
+                if (len(changes) != 1 or not all(
+                        isinstance(value, str) and 4 <= len(value) <= 80 and
+                        value.replace("-", "").isalnum() and
+                        SecretRedactor.from_environment().text(value) == value
+                        for value in changes.values())):
+                    raise ValueError
+                name_variable = next(iter(changes))
+                operation_name = single_rename_operation(
+                    query, shape["variable_name"], name_variable)
+                if operation_name is None or payload.get("operationName") != operation_name:
+                    raise ValueError
+        except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+            raise ValueError("captured GraphQL query is not a single-ID template") from None
+        if shape["variant"] == "INVALID_OBJECT":
+            variables[shape["variable_name"]] = str(uuid.uuid5(
+                uuid.NAMESPACE_URL, run_id + ":" + item.id))
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return RequestTemplate("POST", url, (("Content-Type", "application/json"),), body), item.external_id_hash
+    segments = parsed.path.split("/")
+    positions = [index for index, segment in enumerate(segments) if unquote(segment) == external]
+    if len(positions) != 1:
+        raise ValueError("object ID path binding is ambiguous")
+    if shape["variant"] == "INVALID_OBJECT":
+        replacement = str(uuid.uuid5(uuid.NAMESPACE_URL, run_id + ":" + item.id))
+        segments[positions[0]] = quote(replacement, safe="")
+    resolved = urlunsplit((parsed.scheme, parsed.netloc, "/".join(segments), "", ""))
+    if package.scope.evaluate_url(resolved).result is not ScopeResult.IN_SCOPE:
+        raise ValueError("resolved request is outside scope")
+    return RequestTemplate(shape["method"], resolved), item.external_id_hash

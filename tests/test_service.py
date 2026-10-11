@@ -97,6 +97,28 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.get("/v1/traffic/stats?target=example"), before)
         self.assertEqual(self.get("/v1/health")["checks"]["object_factory"], "ready")
 
+    def test_authorization_api_is_target_scoped_bounded_and_local_only(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            profile = self.get("/v1/authorization/example/profile")
+            self.assertEqual(profile["target_id"], self.target)
+            self.assertEqual(self.get("/v1/authorization/example/hunts")["items"], [])
+            self.assertEqual(self.get("/v1/authorization/example/candidates")["items"], [])
+            self.assertEqual(self.get("/v1/authorization/example/matrix")["items"], [])
+            self.assertEqual(self.get("/v1/authorization/example/metrics")["requests_used"], 0)
+            created = self.client.post("/v1/authorization/example/hunts", json={
+                "mode": "PLAN_ONLY", "candidate_limit": 2, "request_budget": 5})
+            self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+            hunt_id = created.get_json()["hunt"]["id"]
+            self.assertEqual(created.get_json()["hunt"]["status"], "BLOCKED")
+            self.assertEqual(self.get("/v1/authorization/example/metrics?hunt_id=" +
+                                      hunt_id)["candidates"], 0)
+            self.assertEqual(self.client.get("/v1/authorization/example/metrics?hunt_id=missing").status_code,
+                             404)
+            self.assertEqual(self.client.get("/v1/authorization/not-here/profile").status_code, 404)
+            self.assertEqual(self.client.post("/v1/authorization/example/hunts", json={
+                "mode": "PLAN_ONLY", "candidate_limit": 500}).status_code, 400)
+
     def test_skill_routes_are_target_scoped_and_never_execute(self):
         catalog = self.get("/v1/skills")["items"]
         self.assertEqual(len(catalog), 11)
