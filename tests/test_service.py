@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 import unittest
+import uuid
+from unittest.mock import patch
 
 from hackbot.browser import IdentityObservation
 from hackbot.config import BrowserSettings, TargetSettings, load_config
@@ -110,6 +112,44 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/v1/plans/{plan['id']}?target=unknown").status_code, 404)
         self.assertEqual(self.client.post(f"/v1/hypotheses/{hypothesis_id}/plan", json={
             "target": "example", "skill_id": "not-a-skill", "selection": "MANUAL"}).status_code, 404)
+
+    def test_plan_run_api_is_target_scoped_and_advances_one_manual_step(self):
+        hypothesis = self.runtime.hypotheses.add_manual(
+            self.target, "EXPOSURE", "Fixture observation needs review",
+            "Link an existing target-owned evidence record")
+        plan_id = "PLAN-" + uuid.uuid4().hex
+        payload = {
+            "id": plan_id, "target_id": self.target, "hypothesis_id": hypothesis.id,
+            "skill_id": "fixture-review", "skill_version": "1.0.0", "skill_hash": "a" * 64,
+            "skill_category": "exposure", "vulnerability_classes": [],
+            "required_prerequisites": ["in_scope_target"],
+            "status": "READY_FOR_MANUAL_REVIEW", "steps": [{"type": "MANUAL_REVIEW"}],
+            "proposed_actions": [], "request_templates": [], "request_budget": 0,
+            "token_budget": 0,
+        }
+        with self.runtime.store._connection() as db:
+            db.execute("INSERT INTO skill_plans VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       (plan_id, self.target, hypothesis.id, payload["skill_id"],
+                        payload["skill_version"], payload["skill_hash"], 0, 0,
+                        payload["status"], datetime.now(timezone.utc).isoformat(),
+                        json.dumps(payload, sort_keys=True, separators=(",", ":"))))
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target request")):
+            created = self.client.post(f"/v1/plans/{plan_id}/runs", json={"target": "example"})
+            self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+            run_id = created.get_json()["run"]["id"]
+            self.assertEqual(self.get(f"/v1/plans/{plan_id}/runs?target=example")["items"][0]["id"], run_id)
+            self.assertEqual(self.get("/v1/runs?target=example")["items"][0]["id"], run_id)
+            first = self.client.post(f"/v1/runs/{run_id}/advance", json={"target": "example"})
+            self.assertEqual(first.get_json()["run"]["status"], "READY")
+            second = self.client.post(f"/v1/runs/{run_id}/advance", json={"target": "example"})
+            self.assertEqual(second.get_json()["run"]["status"], "WAITING_HUMAN")
+            self.assertEqual(second.get_json()["run"]["requests_consumed"], 0)
+            self.assertEqual(self.client.post(f"/v1/runs/{run_id}/pause",
+                                              json={"target": "example"}).status_code, 400)
+            self.assertEqual(self.client.get(f"/v1/runs/{run_id}?target=unknown").status_code, 404)
+            self.assertEqual(self.client.get(f"/v1/plans/{plan_id}/runs?target=unknown").status_code, 404)
+            cancelled = self.client.post(f"/v1/runs/{run_id}/cancel", json={"target": "example"})
+            self.assertEqual(cancelled.get_json()["run"]["status"], "CANCELLED")
 
     def test_manual_login_never_self_verifies_and_is_target_scoped(self):
         imported = self.client.post("/v1/targets/example/import-identities", json={})

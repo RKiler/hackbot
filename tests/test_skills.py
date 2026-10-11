@@ -255,6 +255,29 @@ class SkillPlanningTests(unittest.TestCase):
         with self.store._connection() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM executor_permits").fetchone()[0], 0)
 
+    def test_authenticated_action_snapshot_keeps_exact_session_binding(self):
+        class AllowPolicy:
+            def evaluate(self, package, action, *, record):
+                return NS(to_dict=lambda: {"result": "ALLOW", "reason_code": "TEST"})
+
+        selected = replace(self.registry.select("unauthenticated-sensitive-download"),
+                           action_intents=("AUTHORIZATION_TEST",))
+        registry = NS(select=lambda name: selected)
+        planner = SkillPlanner(registry, PrerequisiteChecker(), AllowPolicy(), self.plans)
+        identity_id = "IDENTITY-" + "a" * 32
+        session_id = "BSESSION-" + "b" * 32
+        ctx = replace(context(category="EXPOSURE", boundary="AUTHENTICATED",
+                              flags=selected.metadata.prerequisites,
+                              identities=({"id": identity_id, "verified_session_id": session_id},),
+                              traffic=({"method": "GET", "origin": "https://example.test",
+                                        "display_path": "/api/objects/owned"},)), target_id=self.target)
+        plan = planner.generate(self.package, NS(id=ctx.hypothesis_id, target_id=self.target), ctx,
+                                selected.metadata.name)
+        action = plan["proposed_actions"][0]
+        self.assertEqual(action["identity_id"], identity_id)
+        self.assertEqual(action["session_id"], session_id)
+        self.assertEqual(plan["request_templates"][0]["authentication"], "EXECUTOR_SUPPLIED")
+
     def test_query_and_high_entropy_path_do_not_become_templates(self):
         planner = SkillPlanner(self.registry, PrerequisiteChecker(), PolicyEngine(), self.plans)
         for path in ("/download?token=secret", "/download/abcdefghijklmnopqrstuvwxyz0123456789"):

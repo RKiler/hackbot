@@ -227,12 +227,16 @@ class SkillContextBuilder:
 
 class PrerequisiteChecker:
     def check(self, skill: SkillMetadata, context: SkillContext) -> PrerequisiteResult:
+        return self.check_requirements(skill.prerequisites, skill.category, context)
+
+    def check_requirements(self, required: tuple[str, ...], category: str,
+                           context: SkillContext) -> PrerequisiteResult:
         flags = set(context.flags)
-        if (skill.category in {"authorization", "api"}
+        if (category in {"authorization", "api"}
                 and sum(bool(identity["verified_session_id"]) for identity in context.identities) < 2):
             flags.discard("verified_sessions")
-        missing = tuple(item for item in skill.prerequisites if item not in flags)
-        satisfied = tuple(item for item in skill.prerequisites if item in flags)
+        missing = tuple(item for item in required if item not in flags)
+        satisfied = tuple(item for item in required if item in flags)
         if not missing:
             state = PrerequisiteState.READY
         elif "in_scope_target" in missing:
@@ -290,6 +294,9 @@ class InvestigationPlan:
     skill_id: str
     skill_version: str
     skill_hash: str
+    skill_category: str
+    vulnerability_classes: tuple[str, ...]
+    required_prerequisites: tuple[str, ...]
     target_id: str
     manual_selection: bool
     prerequisites: PrerequisiteResult
@@ -311,6 +318,9 @@ class InvestigationPlan:
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
                 "skill_version": self.skill_version, "skill_hash": self.skill_hash,
+                "skill_category": self.skill_category,
+                "vulnerability_classes": list(self.vulnerability_classes),
+                "required_prerequisites": list(self.required_prerequisites),
                 "target_id": self.target_id, "manual_selection": self.manual_selection,
                 "prerequisites": self.prerequisites.to_dict(), "controls": list(self.controls),
                 "steps": [{"type": kind.value, "description": description} for kind, description in self.steps],
@@ -436,7 +446,9 @@ class SkillPlanner:
                     cross_identity=authenticated and skill.metadata.category == "authorization")
                 decision = self.policy.evaluate(package, action, record=False)
                 actions.append({"action_id": action.id, "category": intent, "actor": actor.value,
-                                "identity_id": action.identity_id, "method": template.method,
+                                "identity_id": action.identity_id, "session_id": action.session_id,
+                                "method": template.method,
+                                "vulnerability_class": action.vulnerability_class,
                                 "request_template_fingerprint": template.fingerprint(),
                                 "policy": decision.to_dict(), "simulation_only": True})
                 templates.append({"method": template.method, "url": template.url,
@@ -456,7 +468,9 @@ class SkillPlanner:
             status = "READY_FOR_MANUAL_REVIEW"
         plan = InvestigationPlan(
             "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill_id, skill.metadata.version,
-            skill.content_hash, package.target.id, manual_selection, prereq, skill.controls,
+            skill.content_hash, skill.metadata.category, skill.metadata.vulnerability_classes,
+            skill.metadata.prerequisites,
+            package.target.id, manual_selection, prereq, skill.controls,
             tuple((StepType(kind), description) for kind, description in skill.workflow),
             tuple(actions), tuple(templates), skill.positive_signals, skill.negative_signals,
             skill.evidence_requirements, skill.confirmation_requirements,

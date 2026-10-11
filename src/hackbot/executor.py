@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import socket
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib.parse import urljoin, urlsplit
 import uuid
 import zlib
@@ -57,6 +57,8 @@ class ExecutionError(StrEnum):
     DIRECT_DISABLED = "DIRECT_DISABLED"
     INVALID_REQUEST = "INVALID_REQUEST"
     EXECUTION_ERROR = "EXECUTION_ERROR"
+    OPERATOR_STOPPED = "OPERATOR_STOPPED"
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,9 +295,13 @@ class TrafficExecutor:
 
     def execute(self, action: ProposedAction, permit: PolicyPermit | None,
                 template: RequestTemplate, *, experiment_id: str | None = None,
-                budget: ExperimentBudget = ExperimentBudget()) -> ExecutionResult:
+                budget: ExperimentBudget = ExperimentBudget(),
+                max_dispatches: int | None = None,
+                execution_id: str | None = None,
+                continue_dispatch: Callable[[], bool] | None = None,
+                on_dispatch: Callable[[str], bool] | None = None) -> ExecutionResult:
         start = datetime.now(timezone.utc)
-        execution_id = "EXEC-" + uuid.uuid4().hex
+        execution_id = execution_id or "EXEC-" + uuid.uuid4().hex
         exchange_ids: list[str] = []
         evidence_ids: list[str] = []
         redirects: list[RedirectHop] = []
@@ -319,8 +325,16 @@ class TrafficExecutor:
             if not isinstance(experiment_id, (str, type(None))) or (experiment_id is not None
                     and (not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", experiment_id))):
                 raise _Stop(ExecutionError.INVALID_REQUEST)
+            if max_dispatches is not None and (type(max_dispatches) is not int or
+                                               not 1 <= max_dispatches <= 10000):
+                raise _Stop(ExecutionError.INVALID_REQUEST)
+            if not isinstance(execution_id, str) or not re.fullmatch(r"EXEC-[0-9a-f]{32}", execution_id):
+                raise _Stop(ExecutionError.INVALID_REQUEST)
             current_action, current_template, current_permit = action, template, initial
-            for hop in range(self.settings.max_redirects + 1):
+            hop_limit = min(self.settings.max_redirects + 1, max_dispatches or self.settings.max_redirects + 1)
+            for hop in range(hop_limit):
+                if continue_dispatch is not None and not continue_dispatch():
+                    raise _Stop(ExecutionError.OPERATOR_STOPPED)
                 if time.monotonic() >= deadline:
                     raise _Stop(ExecutionError.TIMEOUT)
                 package = self.targets.get_target_package(current_action.package_id)
@@ -370,6 +384,10 @@ class TrafficExecutor:
                     )
                     exchange_ids.append(exchange.id)
                     evidence_ids.extend(exchange.request.record.evidence_ids)
+                    if on_dispatch is not None and not on_dispatch(exchange.id):
+                        self.traffic.mark_incomplete(exchange.id, ExchangeState.ABORTED)
+                        raise _Stop(ExecutionError.OPERATOR_STOPPED if continue_dispatch is not None
+                                    and not continue_dispatch() else ExecutionError.BUDGET_EXHAUSTED)
                     self.permits.record(current_permit, "REQUEST_DISPATCHED", "BOUND_REQUEST", exchange.id)
                     began = time.monotonic()
                     try:
@@ -431,10 +449,14 @@ class TrafficExecutor:
                     self.permits.record(current_permit, "REDIRECT_EVALUATED", "REDIRECT_DENIED", exchange.id)
                     raise _Stop(ExecutionError.REDIRECT_DENIED) from None
                 destination_hash = hashlib.sha256(destination.encode()).hexdigest()
-                if hop >= self.settings.max_redirects or current_template.method not in {"GET", "HEAD"}:
+                if hop >= hop_limit - 1 or current_template.method not in {"GET", "HEAD"}:
                     redirects.append(RedirectHop(status, destination_hash, False))
-                    self.permits.record(current_permit, "REDIRECT_EVALUATED", "REDIRECT_DENIED", exchange.id)
-                    raise _Stop(ExecutionError.REDIRECT_DENIED)
+                    budget_limited = (max_dispatches is not None and
+                                      max_dispatches < self.settings.max_redirects + 1 and
+                                      hop >= hop_limit - 1 and current_template.method in {"GET", "HEAD"})
+                    code = ExecutionError.BUDGET_EXHAUSTED if budget_limited else ExecutionError.REDIRECT_DENIED
+                    self.permits.record(current_permit, "REDIRECT_EVALUATED", code.value, exchange.id)
+                    raise _Stop(code)
                 if current_action.actor is ActorMode.AUTHENTICATED:
                     old, new = urlsplit(current_template.url), urlsplit(destination)
                     if (old.scheme, old.netloc) != (new.scheme, new.netloc):

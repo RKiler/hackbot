@@ -58,6 +58,12 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path == "/tenant-a/object-a":
+            allowed = self.headers.get("Cookie") == "fixture_actor=tenant_a_admin"
+            return self._answer(200 if allowed else 403, b"owned-object-a" if allowed else b"denied")
+        if self.path == "/tenant-b/object-b":
+            allowed = self.headers.get("Cookie") == "fixture_actor=tenant_b_admin"
+            return self._answer(200 if allowed else 403, b"owned-object-b" if allowed else b"denied")
         if self.path == "/redirect-out":
             return self._answer(302, headers=(("Location", "http://localhost:9/foreign"),))
         if self.path == "/redirect-in":

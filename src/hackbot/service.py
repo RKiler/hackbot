@@ -1,4 +1,4 @@
-"""Private, single-process BugHunter control plane. No target traffic is issued here."""
+"""Private, single-process BugHunter control plane and explicit plan-step owner."""
 
 from __future__ import annotations
 
@@ -26,9 +26,11 @@ from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisSto
 from .identity_registry import IdentityRegistry
 from .logging import create_logger
 from .policy import PolicyEngine, policy_version
-from .policy_models import ActionCategory, ActorMode, ProposedAction, SideEffect
+from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect
 from .policy_store import PolicyStore
 from .permit_store import PolicyPermitStore
+from .plan_runs import PlanRunStore
+from .orchestrator import PlanOrchestrator
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
@@ -107,9 +109,17 @@ class BugHunterRuntime:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon)
+        self.run_store = PlanRunStore(self.store)
+        self.orchestrator = PlanOrchestrator(
+            runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
+            context=self.skill_context, checker=self.skill_checker, registry=self.skills,
+            policy=self.policy, approvals=self.policy_store, executor=self.executor,
+            traffic=self.traffic, evidence=self.store)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         self.reconcile_on_startup()
+        while self.run_store.reconcile():
+            pass
 
     def _probe_vnc(self) -> bool:
         if not self.config.browser.vnc_url:
@@ -187,7 +197,7 @@ class BugHunterRuntime:
         return {"status": "ok", "version": __version__, "checks": {
             "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
-            "traffic_store": "ok", "burp": self.burp.availability().value,
+            "traffic_store": "ok", "orchestrator": "ready", "burp": self.burp.availability().value,
         }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
 
     def overview(self) -> dict[str, object]:
@@ -207,6 +217,7 @@ class BugHunterRuntime:
             if cursor is None:
                 break
         return {"targets": count, "targets_truncated": cursor is not None, **counts,
+                "plan_runs": self.run_store.stats(),
                 "burp": self.burp.availability().value, "activity": self.activity(PageRequest(8, None))["items"]}
 
     def target_summary(self, package: TargetPackage) -> dict[str, object]:
@@ -333,6 +344,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         return jsonify({"version": __version__, "runtime": "single_process",
                         "browser": service.health()["checks"]["browser_manager"],
                         "burp": service.burp.status(),
+                        "orchestrator": {"mode": "explicit_one_step", **service.run_store.stats()},
                         "recon_integration": "configured_read_only" if service.recon else "not_connected"})
 
     @app.get("/v1/overview")
@@ -409,8 +421,11 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def approvals():
         package = service.package(request.args.get("target", ""))
         page = PageRequest.parse()
-        return jsonify(service.policy_store.list(package.target.id, limit=page.limit,
-                                                 cursor=page.cursor))
+        result = service.policy_store.list(package.target.id, limit=page.limit,
+                                           cursor=page.cursor)
+        for item in result["items"]:
+            item["plan_run"] = service.run_store.approval_run(item["id"], package.target.id)
+        return jsonify(result)
 
     @app.post("/v1/approvals/<approval_id>/approve")
     def approve_once(approval_id: str):
@@ -422,6 +437,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if package.status is not PackageStatus.TRACKED or current.policy_version != policy_version(package):
             raise ValueError("approval policy is stale")
         approval = service.policy_store.decide(approval_id, package.target.id, approve=True)
+        if current.status != approval.status and approval.status is ApprovalStatus.APPROVED_ONCE:
+            service.run_store.approval_decision(approval_id, package.target.id, granted=True)
         return jsonify({"approval": approval.to_dict(), "execution_started": False}), (
             409 if approval.status.value == "EXPIRED" else 200)
 
@@ -429,7 +446,12 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def reject_approval(approval_id: str):
         body = _body(frozenset({"target"}))
         package = service.package(body.get("target", ""))
+        current = service.policy_store.get(approval_id, package.target.id)
+        if current is None:
+            raise LookupError("approval not found")
         approval = service.policy_store.decide(approval_id, package.target.id, approve=False)
+        if current.status != approval.status and approval.status is ApprovalStatus.REJECTED:
+            service.run_store.approval_decision(approval_id, package.target.id, granted=False)
         return jsonify({"approval": approval.to_dict(), "execution_started": False}), (
             409 if approval.status.value == "EXPIRED" else 200)
 
@@ -546,6 +568,72 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if plan is None:
             raise LookupError("plan not found")
         return jsonify(plan)
+
+    @app.post("/v1/plans/<plan_id>/runs")
+    def start_plan_run(plan_id: str):
+        body = _body(frozenset({"target", "rerun"}))
+        if type(body.get("rerun", False)) is not bool:
+            raise ValueError("invalid rerun option")
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.start(plan_id, package.id,
+                                                 rerun=body.get("rerun", False))), 201
+
+    @app.get("/v1/plans/<plan_id>/runs")
+    def list_plan_runs_for_plan(plan_id: str):
+        package = service.package(request.args.get("target", ""))
+        if service.skill_plans.get(plan_id, package.target.id) is None:
+            raise LookupError("plan not found")
+        page = PageRequest.parse()
+        return jsonify(service.run_store.list_for_plan(plan_id, package.target.id,
+                                                       limit=page.limit, cursor=page.cursor))
+
+    @app.get("/v1/runs")
+    def list_plan_runs():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        return jsonify(service.run_store.list(package.target.id, limit=page.limit,
+                                             cursor=page.cursor))
+
+    @app.get("/v1/runs/<run_id>")
+    def show_plan_run(run_id: str):
+        package = service.package(request.args.get("target", ""))
+        return jsonify(service.orchestrator.detail(run_id, package.id))
+
+    @app.post("/v1/runs/<run_id>/advance")
+    def advance_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.advance(run_id, package.id))
+
+    @app.post("/v1/runs/<run_id>/pause")
+    def pause_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.pause(run_id, package.id))
+
+    @app.post("/v1/runs/<run_id>/resume")
+    def resume_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.resume(run_id, package.id))
+
+    @app.post("/v1/runs/<run_id>/cancel")
+    def cancel_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.cancel(run_id, package.id))
+
+    @app.post("/v1/runs/<run_id>/steps/<step_id>/complete")
+    def complete_plan_run_step(run_id: str, step_id: str):
+        body = _body(frozenset({"target", "evidence_ids", "exchange_id"}))
+        if (not isinstance(body.get("evidence_ids", []), list) or
+                any(not isinstance(item, str) for item in body.get("evidence_ids", [])) or
+                body.get("exchange_id") is not None and not isinstance(body["exchange_id"], str)):
+            raise ValueError("invalid evidence references")
+        package = service.package(body.get("target", ""))
+        return jsonify(service.orchestrator.complete_human_step(
+            run_id, package.id, step_id, evidence_ids=tuple(body.get("evidence_ids", [])),
+            exchange_id=body.get("exchange_id")))
 
     @app.post("/v1/hypotheses/manual")
     def manual_hypothesis():

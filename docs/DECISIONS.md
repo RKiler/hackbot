@@ -173,3 +173,13 @@ integration decisions, not silent defaults.
 | D-078 | Persist immutable, deduplicated plans with skill version and full-content SHA-256 in BugHunter SQLite schema version 11; explicit regeneration creates a new generation. | A later skill revision must not silently rewrite the evidence and controls behind an existing plan. |
 | D-079 | Permit only Phase 13 simulation from the skill planner; a plan is never an approval, permit, TrafficExecutor invocation, or finding. | Scope, verified identity, current policy, and execution budgets must remain separate enforceable boundaries. |
 | D-080 | Reuse the private service and authenticated, CSRF-protected dashboard gateway for catalog, routing, and plan views. | Adds researcher control without exposing a public skill-upload surface or a second API security model. |
+
+## Phase 16
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-081 | Persist selected runs, ordered runtime steps, immutable results, and append-only audit/manual links in BugHunter SQLite schema 12; keep one open run per plan and one globally claimed step. | Explicit, durable state avoids competing dispatches without introducing a queue or external broker. |
+| D-082 | Reconstruct only exact typed action/template bindings from the immutable plan snapshot, and recheck current prerequisites, scope, identity, policy, and one-use permit at execution. | A Phase 15 simulation or revised skill is not authority for a live request; old authenticated plans lacking a session binding fail closed. |
+| D-083 | Atomically reserve a plan request slot for every recorded exchange before wire dispatch, including redirects; bound each executor call to the remaining budget and check pause/cancel before each hop. | Conservative pre-wire overcount is preferable to an unaccounted send; Phase 14 rate accounting remains in force. |
+| D-084 | Correlate dispatches with TrafficStore before sending and reconcile stale runs into human review without automatic replay; preserve the original result when manual evidence is linked. | A crash or lost response makes state-changing outcomes ambiguous, and silent retry could duplicate a mutation. |
+| D-085 | Keep orchestration service-owned and dashboard actions explicit, authenticated, CSRF-protected, target-scoped, and metadata-only; never infer a confirmed finding from a completed run. | The operator can inspect and control one plan without exposing arbitrary HTTP execution or protected artifact bodies. |
