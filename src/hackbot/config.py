@@ -52,6 +52,7 @@ class AppConfig:
     browser: BrowserSettings | None = None
     burp: BurpSettings | None = None
     executor: ExecutorSettings | None = None
+    skills: SkillSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,15 @@ class StoreSettings:
 @dataclass(frozen=True)
 class TargetSettings:
     root: Path
+
+
+@dataclass(frozen=True)
+class SkillSettings:
+    root: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path) or not self.root.is_absolute() or ".." in self.root.parts:
+            raise ConfigError("Skill catalog root must be absolute")
 
 
 @dataclass(frozen=True)
@@ -228,8 +238,8 @@ class ExecutorSettings:
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
-def _path(value: str, *, base: Path) -> Path:
-    if not value.strip() or "\x00" in value:
+def _path(value: object, *, base: Path) -> Path:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ConfigError("Invalid local path configuration")
     try:
         candidate = Path(value).expanduser()
@@ -274,7 +284,8 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills"}), "top-level")
+    skills_table = _table(top.get("skills", {}), frozenset({"root"}), "skills")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -441,4 +452,6 @@ def load_config(
         browser=browser_settings,
         burp=burp_settings,
         executor=ExecutorSettings(**executor_table),
+        skills=SkillSettings(_path(skills_table["root"], base=file_path.parent)
+                             if "root" in skills_table else Path(__file__).resolve().parent / "skill_catalog"),
     )

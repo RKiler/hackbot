@@ -164,3 +164,12 @@ integration decisions, not silent defaults.
 | D-074 | Default direct HTTP execution off; require an available explicit proxy route when capture is required, with Burp only as an optional adapter. | Proxy outage cannot silently bypass interception, and core traffic/evidence remains vendor-neutral. |
 | D-075 | Allow prepared cookie, bearer, or header AuthContexts into the existing human browser verification path, but apply secrets only in the executor after a current verified session. | Phase 8 manual/imported-only creation otherwise made verified direct HTTP credentials unreachable; no login automation or browser-secret extraction is introduced. |
 | D-076 | Treat each GET/HEAD redirect as a new action requiring scope/policy/rate/permit checks; deny automatic state-changing and cross-origin authenticated redirects. | A first-hop permit must not confer authority on another destination or leak auth material across origins. |
+
+## Phase 15
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-077 | Keep skills as bounded Markdown/YAML planning data with metadata-only discovery, strict validation, and full-body loading only on selection. | Preserves token efficiency and prevents imported or personal methodology text from becoming executable code. |
+| D-078 | Persist immutable, deduplicated plans with skill version and full-content SHA-256 in BugHunter SQLite schema version 11; explicit regeneration creates a new generation. | A later skill revision must not silently rewrite the evidence and controls behind an existing plan. |
+| D-079 | Permit only Phase 13 simulation from the skill planner; a plan is never an approval, permit, TrafficExecutor invocation, or finding. | Scope, verified identity, current policy, and execution budgets must remain separate enforceable boundaries. |
+| D-080 | Reuse the private service and authenticated, CSRF-protected dashboard gateway for catalog, routing, and plan views. | Adds researcher control without exposing a public skill-upload surface or a second API security model. |

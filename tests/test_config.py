@@ -23,6 +23,18 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.paths.root, Path(directory) / "data")
             self.assertEqual(config.log_level, "DEBUG")
 
+    def test_skill_catalog_root_is_explicit_and_validated(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            default = load_config(environ={"HOME": directory})
+            self.assertTrue((default.skills.root / "core").is_dir())
+            path.write_text('[skills]\nroot = "research-skills"\n')
+            configured = load_config(path, environ={"HOME": directory})
+            self.assertEqual(configured.skills.root, Path(directory) / "research-skills")
+            path.write_text('[skills]\nroot = 23\n')
+            with self.assertRaises(ConfigError):
+                load_config(path, environ={"HOME": directory})
+
     def test_store_path_and_limits(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.toml"

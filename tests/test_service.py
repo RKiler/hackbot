@@ -75,6 +75,42 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
 
+    def test_skill_routes_are_target_scoped_and_never_execute(self):
+        catalog = self.get("/v1/skills")["items"]
+        self.assertEqual(len(catalog), 11)
+        self.assertTrue(all(item["status"] == "PLAN_ONLY" for item in catalog))
+        detail = self.get("/v1/skills/check-before-transform-dom-xss")
+        self.assertEqual(detail["execution"], "PLAN_ONLY")
+        self.assertTrue(detail["workflow"])
+        self.assertEqual(self.client.get("/v1/skills/not-a-skill").status_code, 404)
+        manual = self.client.post("/v1/hypotheses/manual", json={
+            "target": "example", "category": "DOM_XSS", "statement": "Controlled source may reach a sink",
+            "future_experiment": "Trace a current bundle and test harmless browser controls",
+        })
+        self.assertEqual(manual.status_code, 201, manual.get_data(as_text=True))
+        hypothesis_id = manual.get_json()["id"]
+        route = self.client.post(f"/v1/hypotheses/{hypothesis_id}/skills/route", json={"target": "example"})
+        self.assertEqual(route.status_code, 200, route.get_data(as_text=True))
+        self.assertEqual(route.get_json()["candidates"][0]["skill"]["name"],
+                         "check-before-transform-dom-xss")
+        self.assertIn("recommended_skills", self.get(f"/v1/hypotheses/{hypothesis_id}?target=example"))
+        from unittest.mock import patch
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            created = self.client.post(f"/v1/hypotheses/{hypothesis_id}/plan", json={
+                "target": "example", "skill_id": "check-before-transform-dom-xss", "selection": "RECOMMENDED"})
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        plan = created.get_json()
+        self.assertEqual(plan["status"], "BLOCKED_PREREQUISITES")
+        self.assertFalse(plan["execution_started"])
+        self.assertEqual(plan["proposed_actions"], [])
+        self.assertEqual(self.get(f"/v1/plans/{plan['id']}?target=example")["id"], plan["id"])
+        again = self.client.post(f"/v1/hypotheses/{hypothesis_id}/plan", json={
+            "target": "example", "skill_id": "check-before-transform-dom-xss", "selection": "RECOMMENDED"})
+        self.assertEqual(again.get_json()["id"], plan["id"])
+        self.assertEqual(self.client.get(f"/v1/plans/{plan['id']}?target=unknown").status_code, 404)
+        self.assertEqual(self.client.post(f"/v1/hypotheses/{hypothesis_id}/plan", json={
+            "target": "example", "skill_id": "not-a-skill", "selection": "MANUAL"}).status_code, 404)
+
     def test_manual_login_never_self_verifies_and_is_target_scoped(self):
         imported = self.client.post("/v1/targets/example/import-identities", json={})
         self.assertEqual(imported.status_code, 201, imported.get_data(as_text=True))

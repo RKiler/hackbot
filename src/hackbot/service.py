@@ -33,6 +33,8 @@ from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
+from .skills import SkillRegistry
+from .skill_plans import PrerequisiteChecker, SkillContextBuilder, SkillPlanStore, SkillPlanner, SkillRouter
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
@@ -82,10 +84,15 @@ class BugHunterRuntime:
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
+        self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
+        self.skill_checker = PrerequisiteChecker()
+        self.skill_router = SkillRouter(self.skills, self.skill_checker)
+        self.skill_plans = SkillPlanStore(self.store)
         self.policy_store = PolicyStore(self.store)
         self.rate = RateLimiter()
         self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
                                    audit=self.policy_store, rate=self.rate)
+        self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy, self.skill_plans)
         self.permits = PolicyPermitStore(self.store)
         self.executor = TrafficExecutor(
             targets=self.targets, policy=self.policy, permits=self.permits,
@@ -98,6 +105,8 @@ class BugHunterRuntime:
             self.recon = PostgresReconRepository.from_config(config)
         except ConfigError:
             pass  # Local-only service stays usable; profile records the recon gap.
+        self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
+                                                 self.browser, self.recon)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         self.reconcile_on_startup()
@@ -463,11 +472,80 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         item = service.hypotheses.get(hypothesis_id, package.target.id)
         if item is None:
             raise LookupError("hypothesis not found")
+        profile = service.hypotheses.latest_profile(package.target.id)
+        context = service.skill_context.build(item, profile, package)
         return jsonify({"hypothesis": item.to_dict(),
                         "context": ContextPacketBuilder(service.hypotheses).build(
-                            item, service.hypotheses.latest_profile(package.target.id)),
+                            item, profile),
+                        "recommended_skills": service.skill_router.route(item, context),
                         "history": service.hypotheses.history(item.id, package.target.id),
                         "relationships": service.hypotheses.relationships(item.id, package.target.id)})
+
+    @app.get("/v1/skills")
+    def skills_list():
+        counts = service.skill_plans.usage_counts()
+        return jsonify({"items": [{**skill.to_dict(), "usage_count": counts.get(skill.name, 0),
+                                   "status": "PLAN_ONLY"} for skill in service.skills.discover()]})
+
+    @app.get("/v1/skills/<skill_id>")
+    def skill_detail(skill_id: str):
+        detail = service.skills.select(skill_id).detail()
+        detail["usage_count"] = service.skill_plans.usage_counts().get(skill_id, 0)
+        return jsonify(detail)
+
+    @app.post("/v1/hypotheses/<hypothesis_id>/skills/route")
+    def route_skill(hypothesis_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        item = service.hypotheses.get(hypothesis_id, package.target.id)
+        if item is None:
+            raise LookupError("hypothesis not found")
+        context = service.skill_context.build(item, service.hypotheses.latest_profile(package.target.id), package)
+        return jsonify({"hypothesis_id": item.id, "candidates": service.skill_router.route(item, context),
+                        "simulation_only": True})
+
+    @app.post("/v1/hypotheses/<hypothesis_id>/plan")
+    def create_skill_plan(hypothesis_id: str):
+        body = _body(frozenset({"target", "skill_id", "regenerate", "selection"}))
+        package = service.package(body.get("target", ""))
+        item = service.hypotheses.get(hypothesis_id, package.target.id)
+        if item is None:
+            raise LookupError("hypothesis not found")
+        profile = service.hypotheses.latest_profile(package.target.id)
+        context = service.skill_context.build(item, profile, package)
+        selected = body.get("skill_id")
+        selection = body.get("selection", "AUTO")
+        if selection not in {"AUTO", "RECOMMENDED", "MANUAL"}:
+            raise ValueError("invalid skill selection")
+        manual = selection == "MANUAL"
+        if selected is None:
+            if selection != "AUTO":
+                raise ValueError("skill selection requires an ID")
+            ranked = service.skill_router.route(item, context, limit=1)
+            if not ranked:
+                raise ValueError("no relevant skill")
+            selected = ranked[0]["skill"]["name"]
+        elif selection == "RECOMMENDED" and selected not in {
+            candidate["skill"]["name"] for candidate in service.skill_router.route(item, context)
+        }:
+            raise ValueError("skill is not a current recommendation")
+        elif selection == "AUTO":
+            raise ValueError("explicit skill requires a selection type")
+        if not isinstance(selected, str) or not isinstance(body.get("regenerate", False), bool):
+            raise ValueError("invalid plan request")
+        context = service.skill_context.build(item, profile, package, service.skills.metadata(selected))
+        plan = service.skill_planner.generate(package, item, context, selected,
+                                               manual_selection=manual,
+                                               regenerate=body.get("regenerate", False))
+        return jsonify(plan), 201
+
+    @app.get("/v1/plans/<plan_id>")
+    def skill_plan_detail(plan_id: str):
+        package = service.package(request.args.get("target", ""))
+        plan = service.skill_plans.get(plan_id, package.target.id)
+        if plan is None:
+            raise LookupError("plan not found")
+        return jsonify(plan)
 
     @app.post("/v1/hypotheses/manual")
     def manual_hypothesis():
