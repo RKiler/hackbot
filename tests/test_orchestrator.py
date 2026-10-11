@@ -110,6 +110,9 @@ class OrchestratorTests(unittest.TestCase):
                    "request_templates": [item[1] for item in rows],
                    "request_budget": budget if budget is not None else max(1, len(rows)),
                    "token_budget": 1000, "controls": ["Owned fixture control"],
+                   "required_validators": list(skill.metadata.required_validators) if skill else [],
+                   "confirmation_requirements": list(skill.confirmation_requirements) if skill else [],
+                   "rejection_conditions": list(skill.rejection_conditions) if skill else [],
                    "comparison_pairs": comparisons or []}
         self._generation += 1
         with fx.store._connection() as db:

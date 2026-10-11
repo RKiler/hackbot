@@ -29,7 +29,7 @@ from .policy import PolicyEngine, policy_version
 from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect
 from .policy_store import PolicyStore
 from .permit_store import PolicyPermitStore
-from .plan_runs import PlanRunStore
+from .plan_runs import PlanRunStore, RunStatus
 from .orchestrator import PlanOrchestrator
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
@@ -42,12 +42,17 @@ from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
 from .target_policy import RiskLevel
 from .traffic import TrafficStore
+from .validation_store import FindingStatus, ValidationStatus, ValidationStore
+from .validator import DeterministicValidatorEngine, ValidatorRegistry
 
 
 _AUDIT_EVENTS = frozenset({
     "target_registered", "identities_imported", "auth_prepared", "browser_created",
     "browser_start_requested", "browser_started", "manual_login_completed",
     "identity_verification_finished", "browser_stopped", "browser_reconciled",
+    "validation_started", "validation_confirmed", "validation_rejected",
+    "validation_review_required", "validation_insufficient", "validation_duplicate",
+    "finding_created",
 })
 
 
@@ -110,6 +115,12 @@ class BugHunterRuntime:
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon)
         self.run_store = PlanRunStore(self.store)
+        self.validations = ValidationStore(self.store)
+        self.validator_registry = ValidatorRegistry()
+        self.validator = DeterministicValidatorEngine(
+            runs=self.run_store, traffic=self.traffic, evidence=self.store,
+            identities=self.registry, hypotheses=self.hypotheses,
+            results=self.validations, registry=self.validator_registry)
         self.orchestrator = PlanOrchestrator(
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
@@ -197,7 +208,8 @@ class BugHunterRuntime:
         return {"status": "ok", "version": __version__, "checks": {
             "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
-            "traffic_store": "ok", "orchestrator": "ready", "burp": self.burp.availability().value,
+            "traffic_store": "ok", "orchestrator": "ready", "validator": "ready",
+            "burp": self.burp.availability().value,
         }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
 
     def overview(self) -> dict[str, object]:
@@ -217,7 +229,7 @@ class BugHunterRuntime:
             if cursor is None:
                 break
         return {"targets": count, "targets_truncated": cursor is not None, **counts,
-                "plan_runs": self.run_store.stats(),
+                "plan_runs": self.run_store.stats(), "validation": self.validations.stats(),
                 "burp": self.burp.availability().value, "activity": self.activity(PageRequest(8, None))["items"]}
 
     def target_summary(self, package: TargetPackage) -> dict[str, object]:
@@ -345,6 +357,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "browser": service.health()["checks"]["browser_manager"],
                         "burp": service.burp.status(),
                         "orchestrator": {"mode": "explicit_one_step", **service.run_store.stats()},
+                        "validator": {"mode": "deterministic_evidence_only", **service.validations.stats()},
                         "recon_integration": "configured_read_only" if service.recon else "not_connected"})
 
     @app.get("/v1/overview")
@@ -597,7 +610,77 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.get("/v1/runs/<run_id>")
     def show_plan_run(run_id: str):
         package = service.package(request.args.get("target", ""))
-        return jsonify(service.orchestrator.detail(run_id, package.id))
+        detail = service.orchestrator.detail(run_id, package.id)
+        latest = service.validations.latest_for_run(run_id, package.target.id)
+        detail["validation"] = latest.to_dict() if latest else None
+        detail["run"]["finding_status"] = (latest.status.value if latest else
+                                               "READY_FOR_VALIDATION" if detail["run"]["status"] == "COMPLETED"
+                                               else "UNVALIDATED")
+        return jsonify(detail)
+
+    @app.post("/v1/runs/<run_id>/validate")
+    def validate_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        run = service.run_store.get(run_id, package.target.id)
+        if run is None:
+            raise LookupError("run not found")
+        if run.status is not RunStatus.COMPLETED:
+            raise ValueError("only completed runs may be validated")
+        service.audit("validation_started", target_id=package.target.id)
+        result, finding = service.validator.validate_run(run_id, package.target.id)
+        event = {
+            ValidationStatus.CONFIRMED: "validation_confirmed",
+            ValidationStatus.REJECTED: "validation_rejected",
+            ValidationStatus.NEEDS_MANUAL_REVIEW: "validation_review_required",
+            ValidationStatus.INVALID_TEST: "validation_review_required",
+            ValidationStatus.INSUFFICIENT_EVIDENCE: "validation_insufficient",
+            ValidationStatus.DUPLICATE_CANDIDATE: "validation_duplicate",
+        }[result.status]
+        service.audit(event, target_id=package.target.id)
+        if result.status is ValidationStatus.CONFIRMED and finding is not None:
+            service.audit("finding_created", target_id=package.target.id)
+        return jsonify({"validation": result.to_dict(),
+                        "finding": finding.to_dict() if finding else None,
+                        "request_sent": False})
+
+    @app.get("/v1/validations")
+    def list_validations():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        raw = request.args.get("status")
+        status = ValidationStatus(raw) if raw else None
+        return jsonify(service.validations.list(package.target.id, limit=page.limit,
+                                                cursor=page.cursor, status=status))
+
+    @app.get("/v1/validations/<validation_id>")
+    def validation_detail(validation_id: str):
+        package = service.package(request.args.get("target", ""))
+        result = service.validations.get(validation_id, package.target.id)
+        if result is None:
+            raise LookupError("validation not found")
+        finding = service.validations.finding_for_validation(result.id, package.target.id)
+        return jsonify({"validation": result.to_dict(),
+                        "finding": finding.to_dict() if finding else None})
+
+    @app.get("/v1/findings")
+    def list_findings():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        raw = request.args.get("status")
+        status = FindingStatus(raw) if raw else None
+        return jsonify(service.validations.list_findings(package.target.id, limit=page.limit,
+                                                         cursor=page.cursor, status=status))
+
+    @app.get("/v1/findings/<finding_id>")
+    def finding_detail(finding_id: str):
+        package = service.package(request.args.get("target", ""))
+        finding = service.validations.get_finding(finding_id, package.target.id)
+        if finding is None:
+            raise LookupError("finding not found")
+        result = service.validations.get(finding.validation_id, package.target.id)
+        return jsonify({"finding": finding.to_dict(),
+                        "validation": result.to_dict() if result else None})
 
     @app.post("/v1/runs/<run_id>/advance")
     def advance_plan_run(run_id: str):

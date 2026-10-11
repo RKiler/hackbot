@@ -231,6 +231,7 @@ class PlanOrchestrator:
                 source="plan_orchestrator", purpose="Bound investigation plan step",
                 url=template.url, method=template.method, hypothesis_id=run.hypothesis_id,
                 identity_id=identity_id, session_id=session_id,
+                operation=descriptor.get("operation"),
                 object_type=descriptor.get("object_type"),
                 object_ref_hash=descriptor.get("object_ref_hash"),
                 disposable_intent=descriptor.get("disposable_intent", False),

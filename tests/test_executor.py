@@ -58,6 +58,30 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path in {"/validated/object-a", "/validated/object-a-alt"}:
+            return self._answer(200, b'{"id":"object-a","tenantId":"tenant-a","payload":"owned-fixture"}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/object-b":
+            return self._answer(200, b'{"id":"object-b","tenantId":"tenant-b","payload":"other-fixture"}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/object-c":
+            return self._answer(200, b'{"id":"object-c","tenantId":"tenant-a","payload":"role-fixture"}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/private-file":
+            return self._answer(200, b"disposable-fixture-file", (("Content-Type", "application/octet-stream"),))
+        if self.path == "/validated/example-key":
+            return self._answer(200, b'{"api_key":"example"}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/missing":
+            return self._answer(404, b"missing", (("Content-Type", "text/plain"),))
+        if self.path == "/validated/denied":
+            return self._answer(403, b"denied", (("Content-Type", "text/plain"),))
+        if self.path == "/validated/graphql":
+            return self._answer(200, b'{"data":{"node":{"id":"object-a","tenantId":"tenant-a"}}}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/graphql-invalid":
+            return self._answer(200, b'{"data":{"node":null},"errors":[{"message":"not found"}]}',
+                                (("Content-Type", "application/json"),))
         if self.path == "/tenant-a/object-a":
             allowed = self.headers.get("Cookie") == "fixture_actor=tenant_a_admin"
             return self._answer(200 if allowed else 403, b"owned-object-a" if allowed else b"denied")
@@ -83,6 +107,12 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.server.received.append(("POST", self.path, self.headers.get("Cookie")))
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size)
+        if self.path == "/validated/graphql":
+            return self._answer(200, b'{"data":{"node":{"id":"object-a","tenantId":"tenant-a"}}}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/validated/graphql-invalid":
+            return self._answer(200, b'{"data":{"node":null},"errors":[{"message":"not found"}]}',
+                                (("Content-Type", "application/json"),))
         if self.path == "/create":
             self.server.created.append(body)
         self._answer(201, b"created")

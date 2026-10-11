@@ -297,6 +297,7 @@ class InvestigationPlan:
     skill_category: str
     vulnerability_classes: tuple[str, ...]
     required_prerequisites: tuple[str, ...]
+    required_validators: tuple[str, ...]
     target_id: str
     manual_selection: bool
     prerequisites: PrerequisiteResult
@@ -321,6 +322,7 @@ class InvestigationPlan:
                 "skill_category": self.skill_category,
                 "vulnerability_classes": list(self.vulnerability_classes),
                 "required_prerequisites": list(self.required_prerequisites),
+                "required_validators": list(self.required_validators),
                 "target_id": self.target_id, "manual_selection": self.manual_selection,
                 "prerequisites": self.prerequisites.to_dict(), "controls": list(self.controls),
                 "steps": [{"type": kind.value, "description": description} for kind, description in self.steps],
@@ -469,7 +471,7 @@ class SkillPlanner:
         plan = InvestigationPlan(
             "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill_id, skill.metadata.version,
             skill.content_hash, skill.metadata.category, skill.metadata.vulnerability_classes,
-            skill.metadata.prerequisites,
+            skill.metadata.prerequisites, skill.metadata.required_validators,
             package.target.id, manual_selection, prereq, skill.controls,
             tuple((StepType(kind), description) for kind, description in skill.workflow),
             tuple(actions), tuple(templates), skill.positive_signals, skill.negative_signals,

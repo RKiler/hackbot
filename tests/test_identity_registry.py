@@ -373,7 +373,7 @@ class IdentityRegistryTests(unittest.TestCase):
             store = EvidenceFactStore(path, ArtifactStore(settings.artifact_root), settings)
             IdentityRegistry(store).initialize()
             with sqlite3.connect(path) as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0], 1)
 
     def test_sqlite_schema_has_no_credential_or_session_columns(self):

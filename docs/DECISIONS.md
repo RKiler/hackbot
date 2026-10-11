@@ -183,3 +183,12 @@ integration decisions, not silent defaults.
 | D-083 | Atomically reserve a plan request slot for every recorded exchange before wire dispatch, including redirects; bound each executor call to the remaining budget and check pause/cancel before each hop. | Conservative pre-wire overcount is preferable to an unaccounted send; Phase 14 rate accounting remains in force. |
 | D-084 | Correlate dispatches with TrafficStore before sending and reconcile stale runs into human review without automatic replay; preserve the original result when manual evidence is linked. | A crash or lost response makes state-changing outcomes ambiguous, and silent retry could duplicate a mutation. |
 | D-085 | Keep orchestration service-owned and dashboard actions explicit, authenticated, CSRF-protected, target-scoped, and metadata-only; never infer a confirmed finding from a completed run. | The operator can inspect and control one plan without exposing arbitrary HTTP execution or protected artifact bodies. |
+
+## Phase 17
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-086 | Judge only completed runs with frozen skill validator contracts and an independently audited policy/permit/Traffic/Evidence chain; keep validators read-only and model-free. | A completed plan, HTTP status, or skill assertion cannot prove a vulnerability or authorize fresh traffic. |
+| D-087 | Require valid owner and negative controls, Evidence-backed identity/object relationships, semantic protected-content comparison, and two safe reproductions for automatic read confirmations. | Fail-closed confirmation avoids promoting public objects, failed controls, GraphQL error-only HTTP 200s, and response-size coincidences into findings. |
+| D-088 | Store immutable, versioned validation decisions and root-cause-deduplicated findings in BugHunter SQLite schema 13, separate from recon findings; expose only target-scoped metadata through the authenticated dashboard. | Historical decisions remain auditable without duplicating production recon data or exposing protected response bodies. |
+| D-089 | Defer state-changing, DOM XSS, postMessage, and external-reachability confirmations until independently attested durable readback or browser/capability proof exists. | Phase 16 has no trustworthy proof record for these effects; a Fact, static sink, or local model is insufficient. |
