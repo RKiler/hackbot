@@ -506,6 +506,8 @@ class TrafficStore:
         anonymous: bool = False,
         provider_reference: str | None = None, browser_action_id: str | None = None,
         correlation_id: str | None = None, retention: Retention = Retention(),
+        scope_source_url: str | None = None,
+        auth_material_observed: bool = False,
     ) -> TrafficExchange:
         if not isinstance(request, CapturedRequest) or not isinstance(source, TrafficSource):
             raise TrafficError("Invalid traffic capture")
@@ -516,6 +518,8 @@ class TrafficStore:
             raise TrafficError("Pinned traffic must be retained")
         if retention.expires_at is not None:
             _utc(retention.expires_at)
+        if type(auth_material_observed) is not bool:
+            raise TrafficError("Invalid capture authentication signal")
         for value in (provider_reference, browser_action_id, correlation_id):
             if value is not None and (not isinstance(value, str) or not value or len(value) > 2048):
                 raise TrafficError("Invalid capture correlation metadata")
@@ -525,7 +529,8 @@ class TrafficStore:
         attribution = self._attribution(target.target.id, source, browser_manager=browser_manager,
                                         browser_session_id=browser_session_id,
                                         declared_identity_id=declared_identity_id, anonymous=anonymous,
-                                        auth_material_present=_auth_material_present(request.headers, parsed.query))
+                                        auth_material_present=(auth_material_observed
+                                                               or _auth_material_present(request.headers, parsed.query)))
         observed = _utc(request.observed_at)
         origin = parsed.scheme + "://" + parsed.netloc
         display_path = _path_shape(parsed.path)
@@ -536,6 +541,17 @@ class TrafficStore:
                                              content_type, request.operation_id)
         provider_hash = _digest(provider_reference)
         scope = target.scope.evaluate_url(request.url)
+        if scope_source_url is not None:
+            try:
+                source_parsed = urlsplit(normalize_url(scope_source_url, schemes={"http", "https"}))
+            except ValueError:
+                raise TrafficError("Invalid capture scope source") from None
+            if (source_parsed.scheme, source_parsed.netloc) != (parsed.scheme, parsed.netloc):
+                raise TrafficError("Capture scope source has a different origin")
+            original_scope = target.scope.evaluate_url(scope_source_url)
+            if original_scope.result is ScopeResult.IN_SCOPE:
+                raise TrafficError("Capture scope source cannot upgrade scope")
+            scope = original_scope
 
         body_evidence = None
         raw_body_hash = _digest(request.body)

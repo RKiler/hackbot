@@ -56,6 +56,8 @@ class BrowserProxyConfig:
     proxy_url: str | None = field(default=None, repr=False)
     ca_reference: str | None = field(default=None, repr=False)
     reference: str | None = None
+    capture_required: bool = False
+    ca_certificate: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -78,6 +80,12 @@ class BrowserProxyConfig:
             raise BrowserError("Invalid proxy reference")
         if self.ca_reference is not None and not re.fullmatch(r"ref:[a-z][a-z0-9_-]{0,63}", self.ca_reference):
             raise BrowserError("Invalid CA reference")
+        if type(self.capture_required) is not bool or (self.capture_required and not self.enabled):
+            raise BrowserError("Invalid capture-required proxy configuration")
+        if self.ca_certificate is not None and (not isinstance(self.ca_certificate, Path)
+                or not self.ca_certificate.is_absolute() or ".." in self.ca_certificate.parts
+                or not self.enabled):
+            raise BrowserError("Invalid profile CA certificate reference")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +100,7 @@ class BrowserSession:
     verification_status: VerificationStatus
     proxy_enabled: bool
     proxy_ref: str | None
+    proxy_capture_required: bool
     vnc_ref: str | None
     created_at: datetime
     updated_at: datetime
@@ -125,6 +134,8 @@ class BrowserSession:
                 raise BrowserError("Browser timestamps must be timezone-aware")
         if self.updated_at < self.created_at:
             raise BrowserError("Invalid browser chronology")
+        if type(self.proxy_capture_required) is not bool or (self.proxy_capture_required and not self.proxy_enabled):
+            raise BrowserError("Invalid browser capture requirement")
 
     @property
     def anonymous(self) -> bool:
@@ -137,6 +148,7 @@ class BrowserSession:
             "profile_ref": self.profile_ref, "anonymous": self.anonymous,
             "status": self.status.value, "verification_status": self.verification_status.value,
             "proxy_enabled": self.proxy_enabled, "proxy_ref": self.proxy_ref,
+            "proxy_capture_required": self.proxy_capture_required,
             "vnc_ref": self.vnc_ref, "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
@@ -269,6 +281,7 @@ class SessionContext:
     browser_available: bool
     authentication_status: str
     proxy_enabled: bool
+    proxy_capture_required: bool
     vnc_login_available: bool
     last_verified_at: datetime | None
     declared_tenant_ids: tuple[str, ...] = ()
@@ -283,6 +296,7 @@ class SessionContext:
                 "browser_available": self.browser_available,
                 "authentication_status": self.authentication_status,
                 "proxy_enabled": self.proxy_enabled,
+                "proxy_capture_required": self.proxy_capture_required,
                 "vnc_login_available": self.vnc_login_available,
                 "last_verified_at": self.last_verified_at.isoformat() if self.last_verified_at else None,
                 "declared_tenant_ids": list(self.declared_tenant_ids),
@@ -297,7 +311,8 @@ def _row(row: sqlite3.Row) -> BrowserSession:
         id=row["session_id"], target_id=row["target_id"], identity_id=row["identity_id"],
         auth_context_id=row["auth_context_id"], driver=row["driver"], profile_ref=row["profile_ref"],
         status=BrowserStatus(row["status"]), verification_status=VerificationStatus(row["verification_status"]),
-        proxy_enabled=bool(row["proxy_enabled"]), proxy_ref=row["proxy_ref"], vnc_ref=row["vnc_ref"],
+        proxy_enabled=bool(row["proxy_enabled"]), proxy_ref=row["proxy_ref"],
+        proxy_capture_required=bool(row["proxy_capture_required"]), vnc_ref=row["vnc_ref"],
         created_at=dt("created_at"), updated_at=dt("updated_at"), expires_at=dt("expires_at"),
         last_verified_at=dt("last_verified_at"), last_used_at=dt("last_used_at"),
     )
@@ -354,6 +369,7 @@ class BrowserSessionManager:
             profile_ref=f"{target_id}/{identity_id or 'anonymous'}/{session_id}",
             status=BrowserStatus.CREATED, verification_status=VerificationStatus.UNVERIFIED,
             proxy_enabled=proxy.enabled, proxy_ref=proxy.reference,
+            proxy_capture_required=proxy.capture_required,
             vnc_ref=self.settings.vnc_url if identity_id is not None else None,
             created_at=now, updated_at=now,
         )
@@ -377,11 +393,11 @@ class BrowserSessionManager:
                 raise BrowserError("Browser session limit reached")
             connection.execute("""INSERT INTO browser_sessions
                 (session_id,target_id,identity_id,auth_context_id,driver,profile_ref,status,
-                 verification_status,proxy_enabled,proxy_ref,vnc_ref,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 verification_status,proxy_enabled,proxy_ref,proxy_capture_required,vnc_ref,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (session.id, target_id, identity_id, session.auth_context_id, session.driver,
                  session.profile_ref, session.status.value, session.verification_status.value,
-                 int(session.proxy_enabled), session.proxy_ref, session.vnc_ref,
+                 int(session.proxy_enabled), session.proxy_ref, int(session.proxy_capture_required), session.vnc_ref,
                  now.isoformat(), now.isoformat()))
             self._event(connection, session.id, "browser_created", now)
         try:
@@ -416,15 +432,26 @@ class BrowserSessionManager:
         return result
 
     def start(self, session_id: str, *, proxy: BrowserProxyConfig = BrowserProxyConfig(),
-              package: TargetPackage | None = None) -> BrowserSession:
+              package: TargetPackage | None = None,
+              proxy_health_check: Callable[[BrowserProxyConfig], bool] | None = None) -> BrowserSession:
         session = self._required(session_id)
         if session.driver != self.driver.name:
             raise BrowserError("Browser driver does not match stored session")
         if session.status not in {BrowserStatus.CREATED, BrowserStatus.STOPPED, BrowserStatus.FAILED,
                                   BrowserStatus.REAUTH_REQUIRED, BrowserStatus.EXPIRED}:
             raise BrowserError("Browser session cannot start from this state")
-        if session.proxy_enabled != proxy.enabled or (session.proxy_ref and proxy.reference != session.proxy_ref):
+        if (session.proxy_enabled != proxy.enabled or session.proxy_capture_required != proxy.capture_required
+                or (session.proxy_ref and proxy.reference != session.proxy_ref)):
             raise BrowserError("Configured proxy does not match session")
+        if session.proxy_capture_required:
+            if proxy_health_check is None:
+                raise BrowserError("Capture-required proxy has no health check")
+            try:
+                healthy = proxy_health_check(proxy)
+            except Exception:
+                healthy = False
+            if healthy is not True:
+                raise BrowserError("Capture-required proxy is unavailable")
         context = self.auth.get(session.target_id, session.identity_id) if session.identity_id else None
         if session.identity_id is not None and (context is None or context.id != session.auth_context_id):
             raise BrowserError("Browser AuthContext is no longer current")
@@ -546,9 +573,10 @@ class BrowserSessionManager:
         return result
 
     def restart(self, session_id: str, *, proxy: BrowserProxyConfig = BrowserProxyConfig(),
-                package: TargetPackage | None = None) -> BrowserSession:
+                package: TargetPackage | None = None,
+                proxy_health_check: Callable[[BrowserProxyConfig], bool] | None = None) -> BrowserSession:
         self.stop(session_id)
-        return self.start(session_id, proxy=proxy, package=package)
+        return self.start(session_id, proxy=proxy, package=package, proxy_health_check=proxy_health_check)
 
     def expire(self, session_id: str) -> BrowserSession:
         session = self._required(session_id)
@@ -669,6 +697,7 @@ class BrowserSessionManager:
                                    else "REAUTH_REQUIRED" if session.status is BrowserStatus.REAUTH_REQUIRED
                                    else "UNVERIFIED"),
             proxy_enabled=session.proxy_enabled,
+            proxy_capture_required=session.proxy_capture_required,
             vnc_login_available=bool(session.vnc_ref and available and session.status is BrowserStatus.WAITING_LOGIN),
             last_verified_at=session.last_verified_at,
             declared_tenant_ids=tenant_ids, declared_role_ids=role_ids,

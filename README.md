@@ -1,7 +1,9 @@
 # BugHunter Agent
 
-Phase 9 adds a local, vendor-neutral Traffic Store with protected HTTP evidence
-and browser-session attribution. It does not capture live traffic or replay requests.
+Phase 10 adds a Burp capture adapter and identity-aware proxy routing on top of
+the local, vendor-neutral Traffic Store. Burp is not installed on this VPS, so
+real Burp/HTTPS interception remains unverified; local bridge fixtures pass.
+There is no replay or active scanning.
 The source blueprint is preserved in
 [`docs/blueprint/`](docs/blueprint/README.md). The discovery results are in
 [`docs/EXISTING_INFRASTRUCTURE.md`](docs/EXISTING_INFRASTRUCTURE.md),
@@ -27,6 +29,8 @@ python3 -m venv .venv
 .venv/bin/hackbot browser list example
 .venv/bin/hackbot traffic list example
 .venv/bin/hackbot traffic stats example
+.venv/bin/hackbot burp check
+.venv/bin/hackbot burp status
 ```
 
 The `example` commands require `[targets].root` to point at
@@ -119,7 +123,8 @@ changing the registry's secret-free data model.
 BugHunter's local foundation and adapter availability. Neither contacts
 PostgreSQL, reads recon data, sends target requests, or starts services.
 There is no running agent, target executor, production database migration, or
-active traffic integration.
+active traffic execution or replay. The optional Phase 10 Burp adapter captures
+traffic only when an operator separately configures and starts its components.
 
 Secret values belong only in the selected provider, never in TOML, SQLite,
 Target Packages, evidence, CLI output, or prompts. `secret check` reports only
@@ -136,3 +141,6 @@ helper is not started automatically.
 
 Traffic storage, redacted CLI views, bounded queries, and the later Burp handoff
 are documented in [`docs/PHASE9_TRAFFIC_STORE.md`](docs/PHASE9_TRAFFIC_STORE.md).
+Burp project/listener setup, the capture-only Montoya extension, authenticated
+loopback bridge, profile-only CA trust, and local verification are documented
+in [`docs/PHASE10_BURP_INTEGRATION.md`](docs/PHASE10_BURP_INTEGRATION.md).

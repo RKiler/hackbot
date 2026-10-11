@@ -50,6 +50,7 @@ class AppConfig:
     targets: TargetSettings | None = None
     secrets: SecretSettings | None = None
     browser: BrowserSettings | None = None
+    burp: BurpSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,46 @@ class BrowserSettings:
             raise ConfigError("Browser max_page_size must be between 1 and 100")
 
 
+@dataclass(frozen=True)
+class BurpSettings:
+    enabled: bool
+    project_root: Path
+    installation_jar: Path | None = None
+    ca_certificate: Path | None = None
+    listener_start: int = 38080
+    listener_end: int = 38179
+    bridge_port: int = 38777
+    bridge_secret_ref: str | None = None
+    max_event_bytes: int = 1_048_576
+    max_inflight: int = 8
+    third_party_capture: str = "DROP"
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("Invalid Burp enabled flag")
+        for path in (self.project_root, self.installation_jar, self.ca_certificate):
+            if path is not None and (not isinstance(path, Path) or not path.is_absolute()
+                                     or ".." in path.parts):
+                raise ConfigError("Burp paths must be absolute")
+        if (type(self.listener_start) is not int or type(self.listener_end) is not int
+                or not 1024 <= self.listener_start <= self.listener_end <= 65535
+                or self.listener_end - self.listener_start > 255):
+            raise ConfigError("Invalid Burp listener range")
+        if (type(self.bridge_port) is not int or not 1024 <= self.bridge_port <= 65535
+                or self.listener_start <= self.bridge_port <= self.listener_end):
+            raise ConfigError("Invalid Burp bridge port")
+        if self.bridge_secret_ref is not None and (not isinstance(self.bridge_secret_ref, str)
+                or not re.fullmatch(r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?",
+                                    self.bridge_secret_ref)):
+            raise ConfigError("Invalid Burp bridge secret reference")
+        if type(self.max_event_bytes) is not int or not 4096 <= self.max_event_bytes <= 8_388_608:
+            raise ConfigError("Invalid Burp event size limit")
+        if type(self.max_inflight) is not int or not 1 <= self.max_inflight <= 32:
+            raise ConfigError("Invalid Burp bridge concurrency limit")
+        if self.third_party_capture not in {"DROP", "METADATA_ONLY"}:
+            raise ConfigError("Invalid third-party capture policy")
+
+
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -206,7 +247,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp"}), "top-level")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -225,6 +266,10 @@ def load_config(
                            frozenset({"profile_root", "display", "vnc_url", "chromium_executable",
                                       "max_sessions", "max_page_size"}),
                            "browser")
+    burp_table = _table(top.get("burp", {}),
+                        frozenset({"enabled", "project_root", "installation_jar", "ca_certificate",
+                                   "listener_start", "listener_end", "bridge_port", "bridge_secret_ref",
+                                   "max_event_bytes", "max_inflight", "third_party_capture"}), "burp")
 
     if "root" in paths:
         configured_root = paths["root"]
@@ -331,6 +376,30 @@ def load_config(
         max_page_size=browser_table.get("max_page_size", 50),
     )
 
+    def burp_path(key: str, default: Path | None = None) -> Path | None:
+        value = burp_table.get(key)
+        if value is None:
+            return default
+        if not isinstance(value, str) or not value.startswith("/") or ".." in Path(value).parts:
+            raise ConfigError("Invalid Burp path")
+        return Path(value)
+
+    project_root = burp_path("project_root", root / "artifacts" / "burp-projects")
+    assert project_root is not None
+    burp_settings = BurpSettings(
+        enabled=burp_table.get("enabled", False),
+        project_root=project_root,
+        installation_jar=burp_path("installation_jar"),
+        ca_certificate=burp_path("ca_certificate"),
+        listener_start=burp_table.get("listener_start", 38080),
+        listener_end=burp_table.get("listener_end", 38179),
+        bridge_port=burp_table.get("bridge_port", 38777),
+        bridge_secret_ref=burp_table.get("bridge_secret_ref"),
+        max_event_bytes=burp_table.get("max_event_bytes", 1_048_576),
+        max_inflight=burp_table.get("max_inflight", 8),
+        third_party_capture=burp_table.get("third_party_capture", "DROP"),
+    )
+
     return AppConfig(
         paths=LocalPaths(config_file=file_path, root=root),
         log_level=level.upper(),
@@ -339,4 +408,5 @@ def load_config(
         targets=TargetSettings(target_root),
         secrets=SecretSettings(tuple(prefixes), tuple(bindings)),
         browser=browser_settings,
+        burp=burp_settings,
     )

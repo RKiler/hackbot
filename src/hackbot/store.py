@@ -41,7 +41,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 
 def _now() -> datetime:
@@ -147,6 +147,7 @@ class EvidenceFactStore:
                 (3, "003_auth_contexts.sql"),
                 (4, "004_browser_sessions.sql"),
                 (5, "005_traffic_store.sql"),
+                (6, "006_burp_capture.sql"),
             ):
                 if version >= target_version:
                     continue
@@ -166,6 +167,7 @@ class EvidenceFactStore:
                              "registry_membership_roles", "auth_contexts", "auth_context_events",
                              "browser_sessions", "browser_session_events"})
             expected.update({"traffic_requests", "traffic_responses", "traffic_exchanges"})
+            expected.update({"burp_projects", "burp_listener_bindings", "burp_capture_index", "burp_bridge_health"})
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),

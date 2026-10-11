@@ -14,6 +14,7 @@ from . import __version__
 from .auth import AuthContextManager
 from .browser import BrowserError, BrowserSessionManager
 from .browser_playwright import PlaywrightBrowserDriver
+from .burp import BurpError, BurpProxyProvider
 from .config import AppConfig, ConfigError, load_config
 from .identity_registry import IdentityRegistry
 from .logging import SecretRedactor
@@ -166,6 +167,18 @@ def main(
     traffic_stats = traffic_commands.add_parser("stats", help="bounded target traffic sample")
     traffic_stats.add_argument("target")
     traffic_stats.add_argument("--sample-limit", type=int, default=1000)
+    burp = commands.add_parser("burp", help="inspect local Burp capture metadata")
+    burp_commands = burp.add_subparsers(dest="burp_command", required=True)
+    burp_commands.add_parser("check", help="check configured local Burp availability")
+    burp_status = burp_commands.add_parser("status", help="show local Burp capture status")
+    burp_status.add_argument("target", nargs="?")
+    burp_listeners = burp_commands.add_parser("listeners", help="list target listener bindings")
+    burp_listeners.add_argument("target")
+    burp_listeners.add_argument("--limit", type=int, default=50)
+    burp_bridge = burp_commands.add_parser("bridge", help="inspect local bridge heartbeat")
+    burp_bridge_commands = burp_bridge.add_subparsers(dest="burp_bridge_command", required=True)
+    burp_bridge_status = burp_bridge_commands.add_parser("status", help="show target bridge status")
+    burp_bridge_status.add_argument("target")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -177,6 +190,42 @@ def main(
     except ConfigError as exc:
         print(f"hackbot: {exc}", file=err)
         return 2
+
+    if args.command == "burp":
+        assert config.burp is not None
+        if args.burp_command == "check":
+            provider = BurpProxyProvider(config.burp, TrafficStore.from_config(config))
+            print(json.dumps({"enabled": config.burp.enabled,
+                              "availability": provider.availability().value,
+                              "bridge_configured": config.burp.bridge_secret_ref is not None,
+                              "ca_configured": config.burp.ca_certificate is not None},
+                             sort_keys=True), file=out)
+            return 0
+        try:
+            assert config.targets is not None
+            target_name = getattr(args, "target", None)
+            package = TargetPackageRepository(config.targets.root).get_target_package(target_name) if target_name else None
+            if target_name and package is None:
+                print("hackbot: target package not found", file=err)
+                return 1
+            provider = BurpProxyProvider(config.burp, TrafficStore.from_config(config))
+            target_id = package.target.id if package else None
+            if args.burp_command == "listeners":
+                result = {"target": package.id,
+                          "items": [item.to_dict() for item in provider.list_bindings(target_id, limit=args.limit)]}
+            elif args.burp_command == "bridge":
+                state = provider.status(target_id)
+                result = {"target": package.id, "connected": state["bridge_connected"],
+                          "dropped_events": state["dropped_events"],
+                          "last_heartbeat_at": state["last_heartbeat_at"]}
+            else:
+                result = provider.status(target_id)
+        except (BurpError, ValueError, OSError, TypeError, sqlite3.Error,
+                StoreNotInitialized, StoreSchemaError):
+            print("hackbot: Burp metadata is unavailable or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
 
     if args.command == "target":
         try:

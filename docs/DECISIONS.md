@@ -114,3 +114,14 @@ integration decisions, not silent defaults.
 | D-049 | Trust an Identity for browser traffic only from a currently verified Phase 8 SessionContext. Preserve declared identity separately; treat tenant/role metadata as declared hints and principal as observed only when evidence-backed. | A wrong, stale, or unverified browser session must never become another account's traffic baseline. |
 | D-050 | Index only safe structural metadata, hash correlation labels, page all traffic queries by target and keyset, and cap statistics to a recent sample. | Future high traffic volume and sensitive URLs rule out unbounded scans and value indexing. |
 | D-051 | Defer Burp capture to Phase 10 behind `TrafficCaptureProvider`; no browser service, replay, active executor, or validator is introduced in Phase 9. | Burp is a source/proxy backend, not the canonical traffic or reasoning model. |
+
+## Phase 10
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-052 | Use one exact loopback Burp listener per active BrowserSession and one isolated Burp project per target; do not insert a target-visible correlation header. | Montoya supplies exact listener identity and a request/response message ID. Listener mapping is deterministic without modifying requests or trusting cookies. |
+| D-053 | Keep a capture-only Montoya extension and authenticated loopback bridge outside production recon; map observations into Phase 9 `TrafficStore` with a small local idempotency index. | Burp remains one vendor-neutral traffic source, not a second traffic database or reasoning engine. |
+| D-054 | Start capture-required browsers only after bridge heartbeat and listener reachability; trust the public Burp CA only in the isolated research profile's NSS store. | Failed capture must not silently become direct browsing or trigger global CA trust changes. |
+| D-055 | Default to dropping non-in-scope/unknown Burp observations; optional metadata-only retention discards third-party path, query, headers, and bodies. | Captured traffic is not authorization, and third-party content should not enter future agent context by default. |
+| D-056 | Keep Burp startup, browser ownership, and bridge lifecycle in one future long-running BugHunter service; Phase 10 exposes local provider/bridge/status APIs but starts no daemon. | Phase 8 browser driver availability is process-local; a short-lived CLI bridge would reject or misattribute sessions. |
+| D-057 | Treat Montoya as a bounded push capture provider into the existing TrafficStore, rather than forcing its callbacks through Phase 9's polling `read_batch` protocol. | Preserves request-only events, response completion, idempotent bridge retries, and the vendor-neutral core without adding an unnecessary worker or second traffic database. |

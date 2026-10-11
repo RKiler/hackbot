@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from .browser import (BrowserError, BrowserProxyConfig, IdentityObservation,
                       IdentityVerificationRule)
+from .browser_trust import ProfileTrustError, install_profile_ca
 from .secrets import SecretValue
 
 
@@ -30,8 +31,13 @@ class PlaywrightBrowserDriver:
               proxy: BrowserProxyConfig) -> None:
         if session_id in self._contexts:
             raise BrowserError("Browser session is already running")
-        if proxy.ca_reference is not None:
-            raise BrowserError("Custom proxy CA is deferred; no trust override was applied")
+        if proxy.ca_reference is not None and proxy.ca_certificate is None:
+            raise BrowserError("Profile CA certificate is required")
+        if proxy.ca_certificate is not None:
+            try:
+                install_profile_ca(profile, proxy.ca_certificate)
+            except ProfileTrustError:
+                raise BrowserError("Profile-only CA trust could not be configured") from None
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -50,6 +56,8 @@ class PlaywrightBrowserDriver:
         if proxy.enabled:
             assert proxy.proxy_url is not None
             options["proxy"] = {"server": proxy.proxy_url}
+            if proxy.capture_required:
+                options["args"] = ["--proxy-bypass-list=<-loopback>"]
         if self._executable_path is not None:
             if not self._executable_path.is_file():
                 raise BrowserError("Configured Chromium executable is unavailable")

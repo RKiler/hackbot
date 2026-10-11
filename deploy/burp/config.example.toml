@@ -1,0 +1,19 @@
+# Replace the absolute paths after selecting a BugHunter-owned storage location.
+# This template does not contain a bridge token, license, or target credentials.
+[paths]
+root = "/ABSOLUTE/BUGHUNTER_STATE_ROOT"
+
+[burp]
+enabled = false
+installation_jar = "/ABSOLUTE/PATH/TO/OPERATOR_INSTALLED_BURP.jar"
+project_root = "/ABSOLUTE/BUGHUNTER_BLOCK_STORAGE/burp-projects"
+ca_certificate = "/ABSOLUTE/PATH/TO/PUBLIC_BURP_CA.pem"
+listener_start = 38080
+listener_end = 38179
+bridge_port = 38777
+bridge_secret_ref = "ref:burp_bridge"
+third_party_capture = "DROP"
+
+[secrets.references."ref:burp_bridge"]
+provider_ref = "env:HACKBOT_SECRET_BURP_BRIDGE"
+kind = "API_TOKEN"
