@@ -294,6 +294,7 @@ class AuthManagerTests(unittest.TestCase):
     def test_schema_migrates_v2_and_has_only_opaque_references(self):
         identity = self._identity("preserved")
         with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE service_events")
             for table in ("burp_capture_index", "burp_listener_bindings", "burp_projects", "burp_bridge_health"):
                 connection.execute(f"DROP TABLE {table}")
             connection.execute("DROP TABLE traffic_exchanges")
@@ -306,7 +307,7 @@ class AuthManagerTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=2")
         self.store.initialize()
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
             names = {row[1] for row in connection.execute("PRAGMA table_info(auth_contexts)")}
         self.assertIn("secret_ref", names)
         self.assertEqual(self.registry.get_identity(self.target_id, identity.id), identity)

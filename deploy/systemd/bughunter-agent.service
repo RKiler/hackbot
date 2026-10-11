@@ -1,0 +1,25 @@
+[Unit]
+Description=BugHunter private control plane
+After=network.target bughunter-vnc.service
+Wants=bughunter-vnc.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/bughunter-agent
+Environment=HOME=/root
+Environment=HACKBOT_CONFIG=/root/.config/bughunter-agent/config.toml
+Environment=PLAYWRIGHT_BROWSERS_PATH=/root/codex_artifacts/bughunter-agent/playwright
+Environment=XAUTHORITY=/root/codex_artifacts/bughunter-agent/browser-vnc/Xauthority
+RuntimeDirectory=bughunter-agent
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/root/bughunter-agent/.venv/bin/gunicorn --workers 1 --threads 1 --worker-class sync --bind unix:/run/bughunter-agent/control.sock --umask 0077 --timeout 120 --graceful-timeout 15 --max-requests 0 hackbot.service:create_app()
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

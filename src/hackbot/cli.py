@@ -61,8 +61,9 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 9,
-        "runtime": "local_cli_recon_adapter_evidence_fact_store_domain_models_target_packages_identity_registry_auth_browser_sessions_and_traffic_store",
+        "phase": 11,
+        "runtime": "local_cli_metadata_only_private_service_separate",
+        "service": "not_checked_use_private_api_status",
         "recon_integration": "adapter_available_not_connected",
         "identity_registry": "local_metadata_only_not_checked",
         "auth_contexts": "local_metadata_only_not_checked",

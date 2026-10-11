@@ -125,3 +125,13 @@ integration decisions, not silent defaults.
 | D-055 | Default to dropping non-in-scope/unknown Burp observations; optional metadata-only retention discards third-party path, query, headers, and bodies. | Captured traffic is not authorization, and third-party content should not enter future agent context by default. |
 | D-056 | Keep Burp startup, browser ownership, and bridge lifecycle in one future long-running BugHunter service; Phase 10 exposes local provider/bridge/status APIs but starts no daemon. | Phase 8 browser driver availability is process-local; a short-lived CLI bridge would reject or misattribute sessions. |
 | D-057 | Treat Montoya as a bounded push capture provider into the existing TrafficStore, rather than forcing its callbacks through Phase 9's polling `read_batch` protocol. | Preserves request-only events, response completion, idempotent bridge retries, and the vendor-neutral core without adding an unnecessary worker or second traffic database. |
+
+## Phase 11
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-058 | Host HackBot UI and an authenticated, CSRF-protected JSON facade in the existing recon Flask dashboard; run BugHunter separately behind a private Unix socket. | Existing dashboard login, navigation, and whole-domain Caddy proxy can be reused without exposing a second public API or merging persistence. |
+| D-059 | Run BugHunter's Flask service with exactly one Gunicorn worker/thread and reconcile browser sessions on startup. | Phase 8 browser handles are process-local; multiple workers or stale persisted states could falsely claim session ownership or validity. |
+| D-060 | Keep the dedicated BugHunter VNC display loopback-only and separate from recon's browser; require a server-side exact identity rule before manual login can become verified. | Manual completion and shared recon profiles are not identity proof, and VNC is a privileged browser surface. |
+| D-061 | Keep dashboard traffic browsing metadata-only, target-scoped, bounded, and cursor-paginated; defer raw evidence viewing and optional recon summaries. | Captured bodies and authentication values are protected artifacts, while production recon inventory is large and not an authorization source. |
+| D-062 | Store only allowlisted safe service activity metadata in a local SQLite table; do not put BugHunter events or findings into production recon PostgreSQL. | Gives the control plane a small audit trail without conflating findings or creating a second event platform. |

@@ -855,6 +855,58 @@ class TrafficStore:
                                   cursor: str | None = None) -> Page[TrafficExchange]:
         return self._list(target_id, "target", None, limit=limit, cursor=cursor)
 
+    def list_filtered(self, target_id: str, *, limit: int = 20, cursor: str | None = None,
+                      identity: str | None = None, session: str | None = None,
+                      method: str | None = None, status: str | None = None,
+                      source: str | None = None, scope: str | None = None) -> Page[TrafficExchange]:
+        """Bounded target-scoped dashboard query; cursor is tied to every filter."""
+        validate_entity_id(target_id, "TARGET")
+        maximum = self._limit(limit)
+        if identity is not None:
+            validate_entity_id(identity, "IDENTITY")
+        if session is not None:
+            validate_entity_id(session, "BSESSION")
+        if method is not None and not re.fullmatch(r"[A-Z]{3,10}", method):
+            raise TrafficError("Invalid traffic method filter")
+        if status is not None and (not status.isdecimal() or not 100 <= int(status) <= 599):
+            raise TrafficError("Invalid traffic status filter")
+        if source is not None and source not in {item.value for item in TrafficSource}:
+            raise TrafficError("Invalid traffic source filter")
+        if scope is not None and scope not in {item.value for item in ScopeResult}:
+            raise TrafficError("Invalid traffic scope filter")
+        filters = [identity, session, method, status, source, scope]
+        signature = _digest(json.dumps(filters, separators=(",", ":")))
+        marker = _cursor_decode(cursor, target_id, "filtered", signature)
+        sql = ("SELECT e.exchange_id,e.observed_at FROM traffic_exchanges e "
+               "JOIN traffic_requests q ON q.request_id=e.request_id "
+               "LEFT JOIN traffic_responses r ON r.request_id=e.request_id "
+               "WHERE e.target_id=?")
+        params: list[object] = [target_id]
+        for column, value in (("e.declared_identity_id", identity), ("e.browser_session_id", session),
+                              ("q.method", method), ("r.status_code", int(status) if status else None),
+                              ("e.source", source), ("e.scope_result", scope)):
+            if value is not None:
+                sql += f" AND {column}=?"
+                params.append(value)
+        if marker is not None:
+            sql += " AND (e.observed_at<? OR (e.observed_at=? AND e.exchange_id<?))"
+            params.extend((marker[0], marker[0], marker[1]))
+        sql += " ORDER BY e.observed_at DESC,e.exchange_id DESC LIMIT ?"
+        params.append(maximum + 1)
+        with self.evidence._connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        kept = rows[:maximum]
+        items = []
+        for row in kept:
+            item = self.get_exchange(row["exchange_id"])
+            if item is None:
+                raise TrafficError("Traffic exchange disappeared during a bounded read")
+            items.append(item)
+        next_cursor = (_cursor_encode(target_id, "filtered", signature,
+                                      kept[-1]["observed_at"], kept[-1]["exchange_id"])
+                       if len(rows) > maximum else None)
+        return Page(tuple(items), next_cursor)
+
     def list_exchanges_for_identity(self, target_id: str, identity_id: str, *,
                                     limit: int = 20, cursor: str | None = None,
                                     verified_only: bool = True) -> Page[TrafficExchange]:

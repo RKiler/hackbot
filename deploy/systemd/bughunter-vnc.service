@@ -1,0 +1,22 @@
+[Unit]
+Description=BugHunter dedicated local VNC display
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/bughunter-agent
+Environment=HOME=/root
+Environment=HACKBOT_BROWSER_DISPLAY_NUMBER=901
+Environment=HACKBOT_BROWSER_VNC_PORT=6901
+Environment=HACKBOT_BROWSER_VNC_RUNTIME_DIR=/root/codex_artifacts/bughunter-agent/browser-vnc
+UMask=0077
+ExecStart=/root/bughunter-agent/scripts/start_browser_vnc.sh
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

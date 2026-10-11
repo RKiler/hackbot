@@ -184,7 +184,7 @@ class BurpTests(unittest.TestCase):
             exchange.response.body_evidence_id, allow_sensitive=True), b'{"ok":true}')
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM burp_capture_index").fetchone()[0], 1)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
 
     def test_four_sessions_wrong_identity_and_no_cross_attribution(self) -> None:
         cases = [
