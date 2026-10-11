@@ -20,9 +20,12 @@ from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
 from .burp import BurpProxyProvider
-from .config import AppConfig, load_config
+from .config import AppConfig, ConfigError, load_config
+from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
 from .logging import create_logger
+from .profile import AttackSurfaceProfiler
+from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository
@@ -71,6 +74,12 @@ class BugHunterRuntime:
         self.traffic = TrafficStore(self.store, self.registry)
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
         self.targets = TargetPackageRepository(config.targets.root)
+        self.hypotheses = HypothesisStore(self.store)
+        self.recon = None
+        try:
+            self.recon = PostgresReconRepository.from_config(config)
+        except ConfigError:
+            pass  # Local-only service stays usable; profile records the recon gap.
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         self.reconcile_on_startup()
@@ -152,7 +161,7 @@ class BugHunterRuntime:
             "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
             "traffic_store": "ok", "burp": self.burp.availability().value,
-        }, "recon_integration": "not_connected"}
+        }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
 
     def overview(self) -> dict[str, object]:
         with self.store._connection() as connection:
@@ -296,7 +305,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def status():
         return jsonify({"version": __version__, "runtime": "single_process",
                         "browser": service.health()["checks"]["browser_manager"],
-                        "burp": service.burp.status(), "recon_integration": "not_connected"})
+                        "burp": service.burp.status(),
+                        "recon_integration": "configured_read_only" if service.recon else "not_connected"})
 
     @app.get("/v1/overview")
     def overview():
@@ -324,6 +334,54 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "target_id": package.target.id, "package_status": package.status.value,
                         "scope": package.scope.to_dict(),
                         "program_rules": package.rules.to_dict()})
+
+    @app.get("/v1/targets/<package_id>/profile")
+    def target_profile(package_id: str):
+        package = service.package(package_id)
+        profile = service.hypotheses.latest_profile(package.target.id)
+        return jsonify({"profile": profile.to_dict() if profile else None,
+                        "message": "Profile Target to generate a passive snapshot" if profile is None else None})
+
+    @app.post("/v1/targets/<package_id>/profile")
+    def profile_target(package_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        profile = AttackSurfaceProfiler(service.registry, service.store, service.traffic,
+                                        service.recon).profile(package)
+        service.hypotheses.save_profile(profile)
+        generated = HypothesisGenerator(service.hypotheses).generate(profile)
+        service.logger.info("passive_profile_completed", extra={"context": {
+            "target_id": package.target.id, "signals": len(profile.signals),
+            "hypotheses": len(generated)}})
+        return jsonify({"profile": profile.to_dict(), "hypotheses_generated": len(generated)})
+
+    @app.get("/v1/hypotheses")
+    def hypotheses():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        return jsonify(service.hypotheses.list(package.target.id, limit=page.limit,
+                      cursor=page.cursor, status=request.args.get("status"),
+                      category=request.args.get("category")))
+
+    @app.get("/v1/hypotheses/<hypothesis_id>")
+    def hypothesis_detail(hypothesis_id: str):
+        package = service.package(request.args.get("target", ""))
+        item = service.hypotheses.get(hypothesis_id, package.target.id)
+        if item is None:
+            raise LookupError("hypothesis not found")
+        return jsonify({"hypothesis": item.to_dict(),
+                        "context": ContextPacketBuilder(service.hypotheses).build(
+                            item, service.hypotheses.latest_profile(package.target.id)),
+                        "history": service.hypotheses.history(item.id, package.target.id),
+                        "relationships": service.hypotheses.relationships(item.id, package.target.id)})
+
+    @app.post("/v1/hypotheses/manual")
+    def manual_hypothesis():
+        body = _body(frozenset({"target", "category", "statement", "future_experiment"}))
+        package = service.package(body.get("target", ""))
+        item = service.hypotheses.add_manual(package.target.id, body.get("category"),
+                                             body.get("statement"), body.get("future_experiment"))
+        return jsonify(item.to_dict()), 201
 
     @app.post("/v1/targets/<package_id>/import-identities")
     def import_identities(package_id: str):

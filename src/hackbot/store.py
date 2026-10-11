@@ -41,7 +41,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 
 def _now() -> datetime:
@@ -149,6 +149,7 @@ class EvidenceFactStore:
                 (5, "005_traffic_store.sql"),
                 (6, "006_burp_capture.sql"),
                 (7, "007_service_events.sql"),
+                (8, "008_target_profiles_hypotheses.sql"),
             ):
                 if version >= target_version:
                     continue
@@ -170,6 +171,9 @@ class EvidenceFactStore:
             expected.update({"traffic_requests", "traffic_responses", "traffic_exchanges"})
             expected.update({"burp_projects", "burp_listener_bindings", "burp_capture_index", "burp_bridge_health"})
             expected.add("service_events")
+            expected.update({"target_profiles", "profile_source_evidence", "hypotheses",
+                             "hypothesis_evidence", "hypothesis_facts", "hypothesis_events",
+                             "hypothesis_relationships"})
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),
@@ -546,8 +550,9 @@ class EvidenceFactStore:
         page_limit = self._limit(limit)
         scope = (field, value, predicate or "")
         position = _cursor_decode(cursor, "facts", scope, "FA")
-        # `field` is selected from two internal identifiers, never caller SQL.
-        column = "f.subject" if field == "subject" else "f.object_ref"
+        # `field` is selected from internal identifiers, never caller SQL.
+        column = {"subject": "f.subject", "object": "f.object_ref",
+                  "target": "f.target_ref"}[field]
         clauses = [column + "=?"]
         params: list[object] = [value]
         if predicate is not None:
@@ -576,6 +581,13 @@ class EvidenceFactStore:
         limit: int = 20, cursor: str | None = None,
     ) -> Page[Fact]:
         return self._list_facts("subject", subject, predicate=predicate, limit=limit, cursor=cursor)
+
+    def list_facts_for_target(
+        self, target_ref: str, *, predicate: str | None = None,
+        limit: int = 20, cursor: str | None = None,
+    ) -> Page[Fact]:
+        return self._list_facts("target", target_ref, predicate=predicate,
+                                limit=limit, cursor=cursor)
 
     def find_facts(
         self, subject: str, predicate: str, *, limit: int = 20, cursor: str | None = None

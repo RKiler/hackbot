@@ -135,3 +135,12 @@ integration decisions, not silent defaults.
 | D-060 | Keep the dedicated BugHunter VNC display loopback-only and separate from recon's browser; require a server-side exact identity rule before manual login can become verified. | Manual completion and shared recon profiles are not identity proof, and VNC is a privileged browser surface. |
 | D-061 | Keep dashboard traffic browsing metadata-only, target-scoped, bounded, and cursor-paginated; defer raw evidence viewing and optional recon summaries. | Captured bodies and authentication values are protected artifacts, while production recon inventory is large and not an authorization source. |
 | D-062 | Store only allowlisted safe service activity metadata in a local SQLite table; do not put BugHunter events or findings into production recon PostgreSQL. | Gives the control plane a small audit trail without conflating findings or creating a second event platform. |
+
+## Phase 12
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-063 | Store bounded, on-demand TargetProfile snapshots and evidence-linked hypotheses in BugHunter SQLite schema version 8; keep recon read-only and Target Package scope authoritative. | Passive reasoning must be reproducible without copying the recon corpus or treating inventory as authorization. |
+| D-064 | Use deterministic rules and stable target/concept/surface/boundary keys; prohibit `CONFIRMED` in the hypothesis type and database constraint. | A passive indicator is a research lead, not a validated vulnerability. |
+| D-065 | Materialize compact source-pointer Evidence for profile signals, maintain append-only hypothesis status/priority history, and pass only bounded metadata in context packets. | The research layer needs provenance and repeatability without raw JS, credentials, or unbounded model context. |
+| D-066 | Keep profiling explicit and use the existing authenticated dashboard/CSRF/Unix-socket boundary; defer scheduling, model calls, skills, and target traffic. | Phase 12 is passive-only; later phases own execution and validation. |
