@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import timedelta, datetime, timezone
 import gzip
 import http.client
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -58,6 +59,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path.startswith("/fixture/"):
+            parts = self.path.split("/")
+            if len(parts) == 5 and parts[3] in {"projects", "dashboards"}:
+                item = self.server.fixture_objects.get(parts[4])
+                if item is None or item["tenant"] != parts[2] or item["type"] != parts[3][:-1]:
+                    return self._answer(404, b"{}", (("Content-Type", "application/json"),))
+                return self._answer(200, json.dumps(item).encode(), (("Content-Type", "application/json"),))
         if self.path in {"/validated/object-a", "/validated/object-a-alt"}:
             return self._answer(200, b'{"id":"object-a","tenantId":"tenant-a","payload":"owned-fixture"}',
                                 (("Content-Type", "application/json"),))
@@ -107,6 +115,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.server.received.append(("POST", self.path, self.headers.get("Cookie")))
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size)
+        if self.path.startswith("/fixture/"):
+            parts = self.path.split("/")
+            if len(parts) == 4 and parts[3] in {"projects", "dashboards", "projects-ambiguous"}:
+                try:
+                    data = json.loads(body)
+                except ValueError:
+                    return self._answer(400)
+                if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+                    return self._answer(400)
+                identity = "tenant_a_admin" if parts[2] == "tenant-a" else "tenant_b_admin"
+                value = f"fixture{len(self.server.fixture_objects) + 1}"
+                item = {"id": value, "name": data["name"], "owner": identity,
+                        "tenant": parts[2], "type": "project" if parts[3] == "projects-ambiguous"
+                        else parts[3][:-1]}
+                self.server.fixture_objects[value] = item
+                if self.path.endswith("projects-ambiguous"):
+                    self.close_connection = True
+                    self.connection.shutdown(2)
+                    return
+                return self._answer(201, json.dumps(item).encode(), (("Content-Type", "application/json"),))
         if self.path == "/validated/graphql":
             return self._answer(200, b'{"data":{"node":{"id":"object-a","tenantId":"tenant-a"}}}',
                                 (("Content-Type", "application/json"),))
@@ -116,6 +144,32 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if self.path == "/create":
             self.server.created.append(body)
         self._answer(201, b"created")
+
+    def do_PATCH(self):
+        self.server.received.append(("PATCH", self.path, self.headers.get("Cookie")))
+        parts = self.path.split("/")
+        if len(parts) == 5 and parts[3] in {"projects", "dashboards"}:
+            item = self.server.fixture_objects.get(parts[4])
+            if item is not None and item["tenant"] == parts[2]:
+                data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                item["name"] = data.get("name", item["name"])
+                return self._answer(200, json.dumps(item).encode(), (("Content-Type", "application/json"),))
+        self._answer(404)
+
+    def do_DELETE(self):
+        self.server.received.append(("DELETE", self.path, self.headers.get("Cookie")))
+        parts = self.path.split("/")
+        if len(parts) == 5 and parts[3] in {"projects", "dashboards"}:
+            item = self.server.fixture_objects.get(parts[4])
+            if item is not None and item["tenant"] == parts[2]:
+                del self.server.fixture_objects[parts[4]]
+                if self.server.drop_delete_response:
+                    self.server.drop_delete_response = False
+                    self.close_connection = True
+                    self.connection.shutdown(2)
+                    return
+                return self._answer(204)
+        self._answer(404)
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -179,6 +233,8 @@ class ExecutorTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
         self.server.received = []
         self.server.created = []
+        self.server.fixture_objects = {}
+        self.server.drop_delete_response = False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.server.server_close)

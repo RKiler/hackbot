@@ -53,6 +53,7 @@ class AppConfig:
     burp: BurpSettings | None = None
     executor: ExecutorSettings | None = None
     skills: SkillSettings | None = None
+    objects: ObjectSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,29 @@ class SkillSettings:
     def __post_init__(self) -> None:
         if not isinstance(self.root, Path) or not self.root.is_absolute() or ".." in self.root.parts:
             raise ConfigError("Skill catalog root must be absolute")
+
+
+@dataclass(frozen=True)
+class ObjectSettings:
+    recipe_root: Path
+    name_prefix: str = "hackbot-test-"
+    max_creation_depth: int = 2
+    max_objects_per_plan: int = 3
+    max_objects_per_target_hour: int = 20
+    setup_request_budget: int = 4
+    cleanup_request_budget: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.recipe_root, Path) or not self.recipe_root.is_absolute() or ".." in self.recipe_root.parts:
+            raise ConfigError("Object recipe root must be absolute")
+        if not isinstance(self.name_prefix, str) or not re.fullmatch(r"[a-z][a-z0-9-]{2,31}-", self.name_prefix):
+            raise ConfigError("Invalid test object name prefix")
+        for name, upper in (("max_creation_depth", 4), ("max_objects_per_plan", 20),
+                            ("max_objects_per_target_hour", 100), ("setup_request_budget", 20),
+                            ("cleanup_request_budget", 20)):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= upper:
+                raise ConfigError("Invalid object factory budget")
 
 
 @dataclass(frozen=True)
@@ -284,8 +308,11 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects"}), "top-level")
     skills_table = _table(top.get("skills", {}), frozenset({"root"}), "skills")
+    objects_table = _table(top.get("objects", {}), frozenset({"recipe_root", "name_prefix",
+        "max_creation_depth", "max_objects_per_plan", "max_objects_per_target_hour",
+        "setup_request_budget", "cleanup_request_budget"}), "objects")
     paths = _table(top.get("paths", {}), frozenset({"root"}), "paths")
     logging = _table(top.get("logging", {}), frozenset({"level"}), "logging")
     recon_table = _table(
@@ -454,4 +481,14 @@ def load_config(
         executor=ExecutorSettings(**executor_table),
         skills=SkillSettings(_path(skills_table["root"], base=file_path.parent)
                              if "root" in skills_table else Path(__file__).resolve().parent / "skill_catalog"),
+        objects=ObjectSettings(
+            recipe_root=_path(objects_table["recipe_root"], base=file_path.parent)
+                        if "recipe_root" in objects_table else root / "recipes",
+            name_prefix=objects_table.get("name_prefix", "hackbot-test-"),
+            max_creation_depth=objects_table.get("max_creation_depth", 2),
+            max_objects_per_plan=objects_table.get("max_objects_per_plan", 3),
+            max_objects_per_target_hour=objects_table.get("max_objects_per_target_hour", 20),
+            setup_request_budget=objects_table.get("setup_request_budget", 4),
+            cleanup_request_budget=objects_table.get("cleanup_request_budget", 3),
+        ),
     )

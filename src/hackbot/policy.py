@@ -40,7 +40,15 @@ _EXTERNAL_OPERATIONS = frozenset({"invite", "send", "trigger", "execute", "webho
 _PERMISSION_OPERATIONS = frozenset({"change-role", "change_role", "change_permissions", "grant", "revoke", "assign_role"})
 _FINANCIAL_OPERATIONS = frozenset({"purchase", "checkout", "pay", "transfer", "payout", "refund", "charge", "upgrade_subscription"})
 _DESTRUCTIVE_OPERATIONS = frozenset({"destroy", "purge"})
+_KNOWN_OBJECT_VERBS = frozenset({"create", "add", "make", "save", "update", "edit",
+                                 "rename", "delete", "remove", "archive"})
 _NETWORK_CATEGORIES = frozenset(ActionCategory) - {ActionCategory.PASSIVE_ANALYSIS}
+
+
+def _operation_tokens(value: str) -> tuple[str, ...]:
+    """Normalize common RPC/camelCase spellings without interpreting request data."""
+    split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return tuple(part for part in re.split(r"[^a-z0-9]+", split.lower()) if part)
 
 
 class PolicyAudit(Protocol):
@@ -150,18 +158,41 @@ class SideEffectClassifier:
         except ValueError:
             path = ""
         if category is not ActionCategory.PASSIVE_ANALYSIS:
-            labels = {action.operation or "", *(segment.lower() for segment in path.split("/"))}
-            if labels & _DESTRUCTIVE_OPERATIONS:
+            tokens = _operation_tokens(action.operation or "")
+            path_tokens = tuple(token for segment in path.split("/")
+                                for token in _operation_tokens(segment))
+            words = set((*tokens, *path_tokens))
+            joined = "".join(tokens)
+            mutating = method not in {None, "GET", "HEAD", "OPTIONS"}
+            if (words & _DESTRUCTIVE_OPERATIONS or joined in {"deletetenant", "deleteaccount",
+                                                              "destroyworkspace", "purgedata"}):
                 effect = SideEffect.DESTRUCTIVE
-            elif labels & _FINANCIAL_OPERATIONS:
+            elif (words & _FINANCIAL_OPERATIONS or joined in {"upgradeplan", "addpaymentmethod",
+                                                                "issuefund", "transferbalance"}
+                  or mutating and words & {"billing", "subscription", "subscriptions", "payments"}):
                 effect = SideEffect.FINANCIAL
-            elif labels & _PERMISSION_OPERATIONS:
+            elif (words & {"grant", "revoke", "permissions", "acl", "share"}
+                  or joined in {"changerole", "grantadmin", "modifyacl", "shareresource",
+                                "assignrole", "changepermissions"}
+                  or mutating and words & {"role", "roles", "invitation_permissions"}):
                 effect = SideEffect.PERMISSION_CHANGE
-            elif labels & _EXTERNAL_OPERATIONS:
+            elif (words & {"invite", "invitation", "invitations", "send", "webhook", "webhooks",
+                            "sms", "email", "notification", "notifications", "publish",
+                            "integration", "integrations"}
+                  or joined in {"inviteuser", "sendemail", "sendsms", "sendwebhook",
+                                "triggerintegration", "publishcontent"}):
                 effect = SideEffect.EXTERNAL_SIDE_EFFECT
-            elif labels & _SENSITIVE_SEGMENTS:
+            elif words & _SENSITIVE_SEGMENTS and category not in {
+                    ActionCategory.OBJECT_CREATE, ActionCategory.OBJECT_UPDATE,
+                    ActionCategory.OBJECT_DELETE}:
+                effect = SideEffect.UNKNOWN
+            elif (category in {ActionCategory.OBJECT_CREATE, ActionCategory.OBJECT_UPDATE,
+                               ActionCategory.OBJECT_DELETE} and tokens and
+                  tokens[0] not in _KNOWN_OBJECT_VERBS):
                 effect = SideEffect.UNKNOWN
         hint = action.side_effect_hint
+        if hint is SideEffect.UNKNOWN and self._EFFECT_ORDER[effect] <= self._EFFECT_ORDER[SideEffect.SAFE_CREATE]:
+            effect = SideEffect.UNKNOWN
         if (hint in {SideEffect.EXTERNAL_SIDE_EFFECT, SideEffect.PERMISSION_CHANGE,
                      SideEffect.FINANCIAL, SideEffect.DESTRUCTIVE}
                 and self._EFFECT_ORDER[hint] > self._EFFECT_ORDER[effect]):

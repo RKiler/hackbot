@@ -297,6 +297,9 @@ class AuthManagerTests(unittest.TestCase):
             for table in ("finding_status_events", "finding_duplicates", "finding_locations",
                           "finding_evidence", "findings", "validation_checks", "validations"):
                 connection.execute(f"DROP TABLE {table}")
+            for table in ("plan_object_requirements", "test_object_operations",
+                          "test_object_reservations", "test_object_events", "test_objects"):
+                connection.execute(f"DROP TABLE {table}")
             for table in ("plan_run_events", "plan_step_manual_links", "plan_step_results",
                           "plan_run_steps", "plan_runs"):
                 connection.execute(f"DROP TABLE {table}")
@@ -323,7 +326,7 @@ class AuthManagerTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=2")
         self.store.initialize()
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
             names = {row[1] for row in connection.execute("PRAGMA table_info(auth_contexts)")}
         self.assertIn("secret_ref", names)
         self.assertEqual(self.registry.get_identity(self.target_id, identity.id), identity)

@@ -28,6 +28,7 @@ from .store import EvidenceFactStore
 from .target_loader import TargetPackageRepository
 from .target_policy import PolicyDecision
 from .traffic import TrafficStore
+from .test_objects import ObjectRegistry
 
 
 _MAP = {
@@ -62,11 +63,12 @@ class PlanOrchestrator:
                  checker: PrerequisiteChecker, registry: SkillRegistry,
                  policy: PolicyEngine, approvals: PolicyStore,
                  executor: TrafficExecutor, traffic: TrafficStore,
-                 evidence: EvidenceFactStore) -> None:
+                 evidence: EvidenceFactStore, objects: ObjectRegistry | None = None) -> None:
         self.runs, self.targets, self.hypotheses = runs, targets, hypotheses
         self.context, self.checker, self.registry = context, checker, registry
         self.policy, self.approvals, self.executor = policy, approvals, executor
         self.traffic, self.evidence = traffic, evidence
+        self.objects = objects
 
     @staticmethod
     def _requirements(snapshot: PlanSnapshot, registry: SkillRegistry) -> tuple[tuple[str, ...], str]:
@@ -168,6 +170,11 @@ class PlanOrchestrator:
         if prereq.state is not PrerequisiteState.READY:
             raise PlanRunError("current prerequisites are not ready")
         run = self.runs.create(snapshot, package_id, steps, rerun=rerun)
+        if self.objects and self.objects.requirements(plan_id, package.target.id):
+            if not self.objects.reserve_requirements(run.id, run.target_id):
+                run = self.runs.transition(run.id, run.target_id, RunStatus.CHECKING_PREREQUISITES,
+                                           "DISPOSABLE_OBJECT_REQUIRED",
+                                           expected=frozenset({RunStatus.CREATED}))
         return self.runs.details(run)
 
     def _load(self, run_id: str, package_id: str) -> tuple[PlanRun, PlanSnapshot]:
@@ -180,8 +187,11 @@ class PlanOrchestrator:
         snapshot = self.runs.snapshot(run.plan_id, run.target_id)
         if snapshot.content_hash != run.snapshot_hash:
             if run.status not in _TERMINAL and run.status is not RunStatus.RUNNING:
-                self.runs.transition(run.id, run.target_id, RunStatus.BLOCKED, "SNAPSHOT_CHANGED",
-                                     expected=frozenset({run.status}))
+                blocked = self.runs.transition(run.id, run.target_id, RunStatus.BLOCKED,
+                                               "SNAPSHOT_CHANGED",
+                                               expected=frozenset({run.status}))
+                if self.objects:
+                    self.objects.release_run(blocked.id, blocked.target_id)
             raise PlanRunError("plan snapshot changed")
         return run, snapshot
 
@@ -270,6 +280,8 @@ class PlanOrchestrator:
                                    consumed=consumed, approval_id=approval_id,
                                    prerequisite_state=prereq_state,
                                    advance=status is RuntimeStepStatus.COMPLETED)
+        if self.objects and updated.status in _TERMINAL:
+            self.objects.release_run(updated.id, updated.target_id)
         return self.runs.details(updated)
 
     def _record_execution_evidence(self, run: PlanRun, step: RuntimeStep,
@@ -289,8 +301,22 @@ class PlanOrchestrator:
 
     def advance(self, run_id: str, package_id: str) -> dict[str, object]:
         run, snapshot = self._load(run_id, package_id)
+        if self.objects and run.status is RunStatus.CHECKING_PREREQUISITES:
+            if not self.objects.reserve_requirements(run.id, run.target_id):
+                return self.runs.details(run)
+            ready = self.runs.transition(run.id, run.target_id, RunStatus.READY,
+                                         "OBJECT_PREREQUISITES_READY",
+                                         expected=frozenset({RunStatus.CHECKING_PREREQUISITES}))
+            return self.runs.details(ready)
         if run.status not in {RunStatus.CREATED, RunStatus.READY}:
             raise PlanRunError("run is not ready for a step")
+        if self.objects and self.objects.requirements(run.plan_id, run.target_id):
+            if not self.objects.reserved_for_run(run.id, run.target_id):
+                waiting = self.runs.transition(run.id, run.target_id,
+                                               RunStatus.CHECKING_PREREQUISITES,
+                                               "OBJECT_RESERVATION_MISSING",
+                                               expected=frozenset({run.status}))
+                return self.runs.details(waiting)
         step = self.runs.current_step(run)
         if step is None:
             raise PlanRunError("no pending step")
@@ -445,10 +471,14 @@ class PlanOrchestrator:
         except PlanRunError:
             updated = self.runs.transition(run.id, run.target_id, RunStatus.BLOCKED,
                                            "PREREQUISITES_STALE", expected=frozenset({run.status}))
+            if self.objects:
+                self.objects.release_run(updated.id, updated.target_id)
             return self.runs.details(updated)
         if prereq.state is not PrerequisiteState.READY:
             updated = self.runs.transition(run.id, run.target_id, RunStatus.BLOCKED,
                                            "PREREQUISITES_STALE", expected=frozenset({run.status}))
+            if self.objects:
+                self.objects.release_run(updated.id, updated.target_id)
             return self.runs.details(updated)
         step = self.runs.current_step(run)
         if step is None:
@@ -460,6 +490,8 @@ class PlanOrchestrator:
                 updated = self.runs.transition(run.id, run.target_id, status,
                                                "APPROVAL_REJECTED" if status is RunStatus.REJECTED else
                                                "APPROVAL_EXPIRED", expected=frozenset({run.status}))
+                if self.objects:
+                    self.objects.release_run(updated.id, updated.target_id)
                 return self.runs.details(updated)
             if approval.status is not ApprovalStatus.APPROVED_ONCE:
                 if run.status is RunStatus.PAUSED:
@@ -476,6 +508,8 @@ class PlanOrchestrator:
             if decision is None or decision.result is PolicyDecision.DENY:
                 updated = self.runs.transition(run.id, run.target_id, RunStatus.BLOCKED,
                                                "POLICY_CHANGED", expected=frozenset({run.status}))
+                if self.objects:
+                    self.objects.release_run(updated.id, updated.target_id)
                 return self.runs.details(updated)
             if decision.result is PolicyDecision.REQUIRE_APPROVAL:
                 if run.status is RunStatus.PAUSED:
@@ -493,7 +527,10 @@ class PlanOrchestrator:
 
     def cancel(self, run_id: str, package_id: str) -> dict[str, object]:
         run, _ = self._load(run_id, package_id)
-        return self.runs.details(self.runs.request_stop(run.id, run.target_id, cancel=True))
+        stopped = self.runs.request_stop(run.id, run.target_id, cancel=True)
+        if self.objects and stopped.status in _TERMINAL:
+            self.objects.release_run(stopped.id, stopped.target_id)
+        return self.runs.details(stopped)
 
     def complete_human_step(self, run_id: str, package_id: str, step_id: str,
                             *, evidence_ids: tuple[str, ...] = (),

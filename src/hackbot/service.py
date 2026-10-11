@@ -20,7 +20,7 @@ from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
 from .burp import BurpExecutionProxyAdapter, BurpProxyProvider
-from .config import AppConfig, ConfigError, ExecutorSettings, load_config
+from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
@@ -31,6 +31,9 @@ from .policy_store import PolicyStore
 from .permit_store import PolicyPermitStore
 from .plan_runs import PlanRunStore, RunStatus
 from .orchestrator import PlanOrchestrator
+from .object_factory import ObjectFactory
+from .object_recipes import RecipeCatalog
+from .test_objects import ObjectRegistry, ObjectState
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
@@ -99,6 +102,8 @@ class BugHunterRuntime:
         self.rate = RateLimiter()
         self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
                                    audit=self.policy_store, rate=self.rate)
+        self.objects = ObjectRegistry(self.store)
+        self.policy.owned_object = self.objects.owned_for_action
         self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy, self.skill_plans)
         self.permits = PolicyPermitStore(self.store)
         self.executor = TrafficExecutor(
@@ -115,6 +120,11 @@ class BugHunterRuntime:
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon)
         self.run_store = PlanRunStore(self.store)
+        object_settings = config.objects or ObjectSettings(config.paths.root / "recipes")
+        self.object_factory = ObjectFactory(
+            objects=self.objects, recipes=RecipeCatalog(object_settings), policy=self.policy,
+            executor=self.executor, targets=self.targets, traffic=self.traffic,
+            settings=object_settings)
         self.validations = ValidationStore(self.store)
         self.validator_registry = ValidatorRegistry()
         self.validator = DeterministicValidatorEngine(
@@ -125,9 +135,11 @@ class BugHunterRuntime:
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
-            traffic=self.traffic, evidence=self.store)
+            traffic=self.traffic, evidence=self.store, objects=self.objects)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
+        while self.objects.reconcile():
+            pass
         self.reconcile_on_startup()
         while self.run_store.reconcile():
             pass
@@ -209,6 +221,8 @@ class BugHunterRuntime:
             "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
             "traffic_store": "ok", "orchestrator": "ready", "validator": "ready",
+            "object_factory": "ready", "object_cleanup_pending": self.objects.stats()["cleanup_pending"],
+            "object_orphans": self.objects.stats()["orphaned"],
             "burp": self.burp.availability().value,
         }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
 
@@ -230,6 +244,7 @@ class BugHunterRuntime:
                 break
         return {"targets": count, "targets_truncated": cursor is not None, **counts,
                 "plan_runs": self.run_store.stats(), "validation": self.validations.stats(),
+                "objects": self.objects.stats(),
                 "burp": self.burp.availability().value, "activity": self.activity(PageRequest(8, None))["items"]}
 
     def target_summary(self, package: TargetPackage) -> dict[str, object]:
@@ -358,6 +373,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "burp": service.burp.status(),
                         "orchestrator": {"mode": "explicit_one_step", **service.run_store.stats()},
                         "validator": {"mode": "deterministic_evidence_only", **service.validations.stats()},
+                        "object_factory": {"mode": "known_recipes_only", **service.objects.stats()},
                         "recon_integration": "configured_read_only" if service.recon else "not_connected"})
 
     @app.get("/v1/overview")
@@ -394,6 +410,79 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "scope": package.scope.to_dict(), "program_rules": package.rules.to_dict(),
                         "autonomy": package.autonomy.to_dict(), "rate": package.rate.to_dict(),
                         "authority": "TARGET_PACKAGE", "recon_inventory": "NOT_AUTHORIZATION"})
+
+    @app.get("/v1/objects/recipes")
+    def object_recipes():
+        package = service.package(request.args.get("target", ""))
+        return jsonify({"items": service.object_factory.recipes.list_for_package(package.id)})
+
+    @app.get("/v1/objects")
+    def list_objects():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        raw_status = request.args.get("status")
+        status = ObjectState(raw_status) if raw_status else None
+        result = service.objects.list_for_target(
+            package.target.id, limit=page.limit, cursor=page.cursor, state=status,
+            object_type=request.args.get("type") or None,
+            tenant_id=request.args.get("tenant") or None,
+            identity_id=request.args.get("identity") or None,
+            cleanup_only=request.args.get("cleanup") == "pending")
+        return jsonify({"items": [item.to_dict() for item in result.items],
+                        "next_cursor": result.next_cursor,
+                        "stats": service.objects.stats(package.target.id)})
+
+    @app.get("/v1/objects/<object_id>")
+    def object_detail(object_id: str):
+        package = service.package(request.args.get("target", ""))
+        item = service.objects.get(object_id, package.target.id)
+        if item is None:
+            raise LookupError("object not found")
+        return jsonify({"object": item.to_dict(), "events": service.objects.events(item.id, item.target_id),
+                        "active_reservation_run": service.objects.active_reservation(item.id)})
+
+    @app.post("/v1/objects")
+    def create_object():
+        body = _body(frozenset({"target", "recipe_id", "identity_id", "tenant_id", "session_id",
+                                "purpose", "parent_id", "plan_id", "run_id", "hypothesis_id"}))
+        package = service.package(body.get("target", ""))
+        for field in ("recipe_id", "identity_id", "tenant_id", "session_id", "purpose"):
+            if not isinstance(body.get(field), str):
+                raise ValueError("missing object creation context")
+        result = service.object_factory.resolve(
+            package_id=package.id, recipe_id=body["recipe_id"], identity_id=body["identity_id"],
+            tenant_id=body["tenant_id"], session_id=body["session_id"], purpose=body["purpose"],
+            parent_id=body.get("parent_id"), plan_id=body.get("plan_id"),
+            run_id=body.get("run_id"), hypothesis_id=body.get("hypothesis_id"))
+        return jsonify(result.to_dict()), 201 if result.outcome == "READY" else 202
+
+    @app.post("/v1/objects/<object_id>/cleanup")
+    def cleanup_object(object_id: str):
+        body = _body(frozenset({"target", "session_id"}))
+        package = service.package(body.get("target", ""))
+        if not isinstance(body.get("session_id"), str):
+            raise ValueError("verified session required")
+        result = service.object_factory.cleanup(object_id, package.target.id,
+                                                session_id=body["session_id"])
+        return jsonify(result.to_dict()), 200 if result.outcome == "CLEANED" else 202
+
+    @app.post("/v1/objects/<object_id>/create")
+    def resume_object_creation(object_id: str):
+        body = _body(frozenset({"target", "session_id"}))
+        package = service.package(body.get("target", ""))
+        if not isinstance(body.get("session_id"), str):
+            raise ValueError("verified session required")
+        result = service.object_factory.create(object_id, package.target.id,
+                                               session_id=body["session_id"])
+        return jsonify(result.to_dict()), 200 if result.outcome == "READY" else 202
+
+    @app.post("/v1/objects/<object_id>/mark-cleaned")
+    def manually_cleaned_object(object_id: str):
+        body = _body(frozenset({"target", "reason"}))
+        package = service.package(body.get("target", ""))
+        item = service.objects.mark_manual_cleaned(object_id, package.target.id,
+                                                   reason=body.get("reason", "MANUAL_CONFIRMATION"))
+        return jsonify({"object": item.to_dict(), "source": "MANUAL"})
 
     @app.post("/v1/policy/evaluate")
     def evaluate_policy():
@@ -581,6 +670,26 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if plan is None:
             raise LookupError("plan not found")
         return jsonify(plan)
+
+    @app.get("/v1/plans/<plan_id>/objects")
+    def plan_objects(plan_id: str):
+        package = service.package(request.args.get("target", ""))
+        service.run_store.snapshot(plan_id, package.target.id)
+        return jsonify({"items": service.objects.requirements(plan_id, package.target.id)})
+
+    @app.post("/v1/plans/<plan_id>/objects")
+    def add_plan_object(plan_id: str):
+        body = _body(frozenset({"target", "recipe_id", "identity_id", "tenant_id", "parent_id"}))
+        package = service.package(body.get("target", ""))
+        service.run_store.snapshot(plan_id, package.target.id)
+        recipe = service.object_factory.recipes.get(package.id, body.get("recipe_id", ""))
+        if recipe is None or recipe.target_id != package.target.id:
+            raise ValueError("known object recipe required")
+        requirement_id = service.objects.add_requirement(
+            plan_id=plan_id, target_id=package.target.id, object_type=recipe.object_type,
+            recipe_id=recipe.id, identity_id=body.get("identity_id", ""),
+            tenant_id=body.get("tenant_id", ""), parent_id=body.get("parent_id"))
+        return jsonify({"requirement_id": requirement_id}), 201
 
     @app.post("/v1/plans/<plan_id>/runs")
     def start_plan_run(plan_id: str):

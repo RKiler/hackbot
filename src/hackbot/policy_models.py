@@ -126,7 +126,10 @@ class ProposedAction:
             raise ValueError("Non-authenticated action cannot carry a session or identity")
         if self.category is ActionCategory.PASSIVE_ANALYSIS and self.actor is not ActorMode.LOCAL:
             raise ValueError("Passive analysis is local")
-        for value in (self.operation, self.vulnerability_class, self.object_type):
+        if self.operation is not None and (not isinstance(self.operation, str) or
+            not re.fullmatch(r"[A-Za-z][A-Za-z0-9_:-]{0,127}", self.operation)):
+            raise ValueError("Invalid operation metadata")
+        for value in (self.vulnerability_class, self.object_type):
             if value is not None and (not isinstance(value, str) or not _LABEL.fullmatch(value)):
                 raise ValueError("Invalid operation metadata")
         if self.object_ref_hash is not None and not _HASH.fullmatch(self.object_ref_hash):

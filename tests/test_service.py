@@ -77,6 +77,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
 
+    def test_object_api_is_target_scoped_and_has_no_raw_request_surface(self):
+        self.assertEqual(self.get("/v1/objects?target=example")["items"], [])
+        self.assertEqual(self.get("/v1/objects/recipes?target=example")["items"], [])
+        self.assertEqual(self.client.get("/v1/objects?target=not-here").status_code, 404)
+        self.assertEqual(self.client.get("/v1/objects/TESTOBJ-" + "a" * 32 +
+                                         "?target=example").status_code, 404)
+        self.assertEqual(self.client.post("/v1/objects/TESTOBJ-" + "a" * 32 +
+                                          "/cleanup", json={"target": "example",
+                                                            "session_id": "BSESSION-" + "a" * 32}).status_code, 404)
+        before = self.get("/v1/traffic/stats?target=example")
+        response = self.client.post("/v1/objects", json={"target": "example", "recipe_id": "unknown",
+                                                     "identity_id": "IDENTITY-" + "a" * 32,
+                                                     "tenant_id": "TENANT-" + "a" * 32,
+                                                     "session_id": "BSESSION-" + "a" * 32,
+                                                     "purpose": "Fixture"})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["outcome"], "MISSING_CREATION_RECIPE")
+        self.assertEqual(self.get("/v1/traffic/stats?target=example"), before)
+        self.assertEqual(self.get("/v1/health")["checks"]["object_factory"], "ready")
+
     def test_skill_routes_are_target_scoped_and_never_execute(self):
         catalog = self.get("/v1/skills")["items"]
         self.assertEqual(len(catalog), 11)

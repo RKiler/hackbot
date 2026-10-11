@@ -68,6 +68,21 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     load_config(path, environ={"HOME": directory})
 
+    def test_object_factory_settings_are_bounded(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[objects]\nrecipe_root = "approved-recipes"\ncleanup_request_budget = 3\n')
+            config = load_config(path, environ={"HOME": directory})
+            self.assertEqual(config.objects.recipe_root, Path(directory) / "approved-recipes")
+            self.assertEqual(config.objects.cleanup_request_budget, 3)
+            for body in ('[objects]\nmax_creation_depth = 0\n',
+                         '[objects]\ncleanup_request_budget = 100\n',
+                         '[objects]\nname_prefix = "secret=private-value"\n'):
+                path.write_text(body)
+                with self.assertRaises(ConfigError) as captured:
+                    load_config(path, environ={"HOME": directory})
+                self.assertNotIn("private-value", str(captured.exception))
+
     def test_explicit_missing_file_is_invalid(self) -> None:
         with TemporaryDirectory() as directory:
             with self.assertRaises(ConfigError):

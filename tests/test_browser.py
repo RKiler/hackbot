@@ -327,6 +327,9 @@ class BrowserTests(unittest.TestCase):
             for table in ("finding_status_events", "finding_duplicates", "finding_locations",
                           "finding_evidence", "findings", "validation_checks", "validations"):
                 connection.execute(f"DROP TABLE {table}")
+            for table in ("plan_object_requirements", "test_object_operations",
+                          "test_object_reservations", "test_object_events", "test_objects"):
+                connection.execute(f"DROP TABLE {table}")
             for table in ("plan_run_events", "plan_step_manual_links", "plan_step_results",
                           "plan_run_steps", "plan_runs"):
                 connection.execute(f"DROP TABLE {table}")
@@ -351,7 +354,7 @@ class BrowserTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=3")
         self.store.initialize()
         with sqlite3.connect(self.store.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
         self.assertEqual(self.auth.get(self.target, identity.id).id, context.id)
 
     def test_playwright_import_adapter_rejects_foreign_or_malformed_before_cookies(self):
