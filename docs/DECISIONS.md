@@ -144,3 +144,13 @@ integration decisions, not silent defaults.
 | D-064 | Use deterministic rules and stable target/concept/surface/boundary keys; prohibit `CONFIRMED` in the hypothesis type and database constraint. | A passive indicator is a research lead, not a validated vulnerability. |
 | D-065 | Materialize compact source-pointer Evidence for profile signals, maintain append-only hypothesis status/priority history, and pass only bounded metadata in context packets. | The research layer needs provenance and repeatability without raw JS, credentials, or unbounded model context. |
 | D-066 | Keep profiling explicit and use the existing authenticated dashboard/CSRF/Unix-socket boundary; defer scheduling, model calls, skills, and target traffic. | Phase 12 is passive-only; later phases own execution and validation. |
+
+## Phase 13
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-067 | Reuse Phase 5 ProgramScope, AutonomyPolicy, RiskLevel, and RatePolicy as the only authority inputs for a deterministic Phase 13 PolicyEngine. | Recon presence and model/client risk claims cannot confer testing authorization. |
+| D-068 | Persist secret-free proposed-action fingerprints, immutable decisions/events, and exact-action 30-minute approval requests in BugHunter SQLite schema version 9. | Approval and audit must be target-scoped, explainable, and non-replayable for unrelated work without copying request bodies or credentials. |
+| D-069 | Treat policy evaluation and dashboard checks as simulations; do not issue permits or consume rate tokens until a trusted Phase 14 executor exists. | A visible ALLOW decision is not itself an executable capability or proof of network enforcement. |
+| D-070 | Require trusted owned-object proof and verified target-matched session state for autonomous mutations and authenticated actions; anonymous actions carry no identity. | Client flags, registry metadata, and an unverified browser cannot establish ownership or authentication. |
+| D-071 | Make every future network executor re-evaluate redirects and current policy, atomically claim one-time approvals, and reserve target-scoped rate/budget capacity before traffic. | The destination, policy, identity, and rate state may change after a simulation; failure must close the active path. |

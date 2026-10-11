@@ -58,7 +58,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-            self.assertEqual(version, 8)
+            self.assertEqual(version, 9)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)

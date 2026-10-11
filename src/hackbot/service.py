@@ -24,12 +24,17 @@ from .config import AppConfig, ConfigError, load_config
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
 from .logging import create_logger
+from .policy import PolicyEngine, policy_version
+from .policy_models import ActionCategory, ActorMode, ProposedAction, SideEffect
+from .policy_store import PolicyStore
 from .profile import AttackSurfaceProfiler
+from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
+from .target_policy import RiskLevel
 from .traffic import TrafficStore
 
 
@@ -75,6 +80,10 @@ class BugHunterRuntime:
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
+        self.policy_store = PolicyStore(self.store)
+        self.rate = RateLimiter()
+        self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
+                                   audit=self.policy_store, rate=self.rate)
         self.recon = None
         try:
             self.recon = PostgresReconRepository.from_config(config)
@@ -334,6 +343,82 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "target_id": package.target.id, "package_status": package.status.value,
                         "scope": package.scope.to_dict(),
                         "program_rules": package.rules.to_dict()})
+
+    @app.get("/v1/targets/<package_id>/policy")
+    def target_policy(package_id: str):
+        package = service.package(package_id)
+        return jsonify({"target_id": package.target.id, "package_status": package.status.value,
+                        "scope": package.scope.to_dict(), "program_rules": package.rules.to_dict(),
+                        "autonomy": package.autonomy.to_dict(), "rate": package.rate.to_dict(),
+                        "authority": "TARGET_PACKAGE", "recon_inventory": "NOT_AUTHORIZATION"})
+
+    @app.post("/v1/policy/evaluate")
+    def evaluate_policy():
+        body = _body(frozenset({"target", "category", "actor", "url", "method", "purpose",
+                                "hypothesis_id", "identity_id", "session_id", "operation",
+                                "vulnerability_class",
+                                "object_type", "object_ref_hash", "disposable_intent",
+                                "cross_identity", "side_effect_hint", "requested_risk",
+                                "action_id"}))
+        package = service.package(body.get("target", ""))
+        hypothesis_id = body.get("hypothesis_id")
+        if hypothesis_id is not None and service.hypotheses.get(hypothesis_id, package.target.id) is None:
+            raise ValueError("invalid hypothesis reference")
+        category = ActionCategory(body.get("category"))
+        actor = ActorMode(body.get("actor", "ANONYMOUS"))
+        action_values = {
+            "target_id": package.target.id, "package_id": package.id,
+            "category": category, "actor": actor, "source": "operator_ui",
+            "purpose": body.get("purpose", "Operator policy simulation"),
+            "url": body.get("url"), "method": body.get("method"),
+            "hypothesis_id": hypothesis_id, "identity_id": body.get("identity_id"),
+            "session_id": body.get("session_id"), "operation": body.get("operation"),
+            "vulnerability_class": body.get("vulnerability_class"),
+            "object_type": body.get("object_type"), "object_ref_hash": body.get("object_ref_hash"),
+            "disposable_intent": body.get("disposable_intent", False),
+            "cross_identity": body.get("cross_identity", False),
+            "side_effect_hint": SideEffect(body["side_effect_hint"]) if body.get("side_effect_hint") else None,
+            "requested_risk": RiskLevel(body["requested_risk"]) if body.get("requested_risk") else None,
+        }
+        if body.get("action_id") is not None:
+            action_values["id"] = body["action_id"]
+        action = ProposedAction(**action_values)
+        decision = service.policy.evaluate(package, action)
+        return jsonify({"action_id": action.id, "decision": decision.to_dict(),
+                        "simulation_only": True, "request_sent": False})
+
+    @app.get("/v1/approvals")
+    def approvals():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        return jsonify(service.policy_store.list(package.target.id, limit=page.limit,
+                                                 cursor=page.cursor))
+
+    @app.post("/v1/approvals/<approval_id>/approve")
+    def approve_once(approval_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        current = service.policy_store.get(approval_id, package.target.id)
+        if current is None:
+            raise LookupError("approval not found")
+        if package.status is not PackageStatus.TRACKED or current.policy_version != policy_version(package):
+            raise ValueError("approval policy is stale")
+        approval = service.policy_store.decide(approval_id, package.target.id, approve=True)
+        return jsonify({"approval": approval.to_dict(), "execution_started": False}), (
+            409 if approval.status.value == "EXPIRED" else 200)
+
+    @app.post("/v1/approvals/<approval_id>/reject")
+    def reject_approval(approval_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        approval = service.policy_store.decide(approval_id, package.target.id, approve=False)
+        return jsonify({"approval": approval.to_dict(), "execution_started": False}), (
+            409 if approval.status.value == "EXPIRED" else 200)
+
+    @app.get("/v1/policy/actions/<action_id>/history")
+    def policy_history(action_id: str):
+        package = service.package(request.args.get("target", ""))
+        return jsonify({"items": service.policy_store.history(package.target.id, action_id)})
 
     @app.get("/v1/targets/<package_id>/profile")
     def target_profile(package_id: str):

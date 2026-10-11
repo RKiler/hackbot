@@ -18,8 +18,11 @@ from .burp import BurpError, BurpProxyProvider
 from .config import AppConfig, ConfigError, load_config
 from .identity_registry import IdentityRegistry
 from .logging import SecretRedactor
+from .policy import PolicyEngine
+from .policy_models import ActionCategory, ActorMode, ProposedAction
+from .policy_store import PolicyStore
 from .secrets import RoutedSecretProvider, SecretError
-from .store import StoreNotInitialized, StoreSchemaError
+from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository, load_target_package
 from .traffic import TrafficError, TrafficExchange, TrafficStore
 
@@ -61,7 +64,7 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 11,
+        "phase": 13,
         "runtime": "local_cli_metadata_only_private_service_separate",
         "service": "not_checked_use_private_api_status",
         "recon_integration": "adapter_available_not_connected",
@@ -180,6 +183,21 @@ def main(
     burp_bridge_commands = burp_bridge.add_subparsers(dest="burp_bridge_command", required=True)
     burp_bridge_status = burp_bridge_commands.add_parser("status", help="show target bridge status")
     burp_bridge_status.add_argument("target")
+    policy = commands.add_parser("policy", help="simulate deterministic policy without sending traffic")
+    policy_commands = policy.add_subparsers(dest="policy_command", required=True)
+    policy_check = policy_commands.add_parser("check", help="check one hypothetical action")
+    policy_check.add_argument("target")
+    policy_check.add_argument("url")
+    policy_check.add_argument("--action", choices=("safe-read", "http-request", "browser-navigation"),
+                              default="safe-read")
+    policy_check.add_argument("--method", choices=("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"),
+                              default="GET")
+    approvals = commands.add_parser("approvals", help="inspect local target-scoped approvals")
+    approvals_commands = approvals.add_subparsers(dest="approvals_command", required=True)
+    approvals_list = approvals_commands.add_parser("list", help="list approval requests")
+    approvals_list.add_argument("target")
+    approvals_list.add_argument("--limit", type=int, default=20)
+    approvals_list.add_argument("--cursor")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -191,6 +209,39 @@ def main(
     except ConfigError as exc:
         print(f"hackbot: {exc}", file=err)
         return 2
+
+    if args.command in {"policy", "approvals"}:
+        try:
+            assert config.targets is not None
+            package = TargetPackageRepository(config.targets.root).get_target_package(args.target)
+            if package is None:
+                print("hackbot: target package not found", file=err)
+                return 1
+            store = EvidenceFactStore.from_config(config)
+            if args.command == "policy":
+                store.initialize()
+                category = {
+                    "safe-read": ActionCategory.SAFE_READ,
+                    "http-request": ActionCategory.HTTP_REQUEST,
+                    "browser-navigation": ActionCategory.BROWSER_NAVIGATION,
+                }[args.action]
+                action = ProposedAction(
+                    target_id=package.target.id, package_id=package.id, category=category,
+                    actor=ActorMode.ANONYMOUS, source="operator_cli",
+                    purpose="Operator policy simulation", url=args.url, method=args.method,
+                )
+                decision = PolicyEngine(audit=PolicyStore(store)).evaluate(package, action)
+                result = {"action_id": action.id, "decision": decision.to_dict(),
+                          "simulation_only": True, "request_sent": False}
+            else:
+                result = PolicyStore(store).list(package.target.id, limit=args.limit,
+                                                 cursor=args.cursor)
+        except (ValueError, TypeError, OSError, StoreNotInitialized, StoreSchemaError,
+                sqlite3.Error):
+            print("hackbot: policy metadata is unavailable or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
 
     if args.command == "burp":
         assert config.burp is not None
