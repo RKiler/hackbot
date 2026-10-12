@@ -8,8 +8,8 @@ prerequisites: [in_scope_target, current_js, message_listener]
 risk: LOW
 required_validators: [origin_control, capability_proof]
 token_budget: 2000
-request_budget: 5
-version: 1.0.0
+request_budget: 12
+version: 1.1.0
 source: CORE
 execution_mode: PLAN_ONLY
 when_to_use: Use for reachable message receivers or MessageChannel protocols crossing origins.
@@ -28,9 +28,9 @@ Model sender, receiver, event.origin, event.source, accepted data, channel creat
 workflow:
   - {type: OBSERVE, description: "Reconstruct message types and origin/source validation."}
   - {type: OBSERVE, description: Trace MessagePort possession and RPC capabilities if present.}
-  - {type: ESTABLISH_CONTROL, description: "Compare trusted sender, unrelated origin, wrong source, and wrong type."}
+  - {type: ESTABLISH_CONTROL, description: "Freeze no-message, wrong-type, trusted, unrelated-origin, wrong-source, and port controls."}
   - {type: VERIFY_BROWSER, description: Later demonstrate a harmless protected capability in an owned browser.}
-controls: [Trusted sender, Unrelated origin, Wrong message type, Wrong source window]
+controls: [No message, Wrong message type, Trusted sender, Unrelated origin, Wrong source window, No transferred port, Fresh context]
 positive_signals: [Foreign origin obtains privileged data or capability]
 negative_signals: [Untrusted sender cannot gain privileged effect]
 evidence_requirements: [Current handler location, Origin/source checks, Protocol sequence, Capability inventory]

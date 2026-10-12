@@ -476,6 +476,42 @@ class PlanRunStore:
                 SELECT count(*) FROM plan_dom_dispatches WHERE run_id=? AND step_id=?
             """, (run_id, step_id)).fetchone()[0]
 
+    def account_message_dispatch(self, run_id: str, step_id: str, variant: str) -> bool:
+        if variant not in {"NO_MESSAGE", "WRONG_TYPE", "TRUSTED", "UNRELATED",
+                           "WRONG_SOURCE", "NO_PORT", "ATTACKER_PORT", "FRESH_REPRODUCTION",
+                           "FRESH_WRONG_SOURCE", "LOOKALIKE_ORIGIN",
+                           "FRESH_LOOKALIKE_ORIGIN"}:
+            raise ValueError("Invalid messaging browser variant")
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("""SELECT status,current_step,requests_consumed,request_budget,
+                pause_requested,cancel_requested FROM plan_runs WHERE run_id=?""",
+                (run_id,)).fetchone()
+            step = db.execute("""SELECT ordinal,status,step_type FROM plan_run_steps
+                WHERE step_id=? AND run_id=?""", (step_id, run_id)).fetchone()
+            if (run is None or step is None or run["status"] != "RUNNING"
+                    or step["status"] != "EXECUTING" or step["step_type"] != "VERIFY_BROWSER"
+                    or step["ordinal"] != run["current_step"]
+                    or run["pause_requested"] or run["cancel_requested"]
+                    or run["requests_consumed"] >= run["request_budget"]
+                    or db.execute("""SELECT 1 FROM plan_message_dispatches
+                        WHERE run_id=? AND step_id=? AND variant=?""",
+                        (run_id, step_id, variant)).fetchone() is not None):
+                return False
+            now = _now()
+            db.execute("""INSERT INTO plan_message_dispatches
+                (run_id,step_id,variant,accounted_at) VALUES (?,?,?,?)""",
+                (run_id, step_id, variant, now))
+            db.execute("""UPDATE plan_runs SET requests_consumed=requests_consumed+1,
+                updated_at=? WHERE run_id=?""", (now, run_id))
+            self._event(db, run_id, step_id, "DISPATCH_ACCOUNTED", "MESSAGE_BROWSER_TRIAL")
+            return True
+
+    def message_dispatch_count(self, run_id: str, step_id: str) -> int:
+        with self.store._connection() as db:
+            return db.execute("""SELECT count(*) FROM plan_message_dispatches
+                WHERE run_id=? AND step_id=?""", (run_id, step_id)).fetchone()[0]
+
     def policy(self, run_id: str, step_id: str, decision_id: str,
                approval_id: str | None, reason: str) -> None:
         with self.store._connection() as db:

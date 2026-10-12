@@ -27,10 +27,13 @@ from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, lo
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
 from .domxss_store import DOMXSSStore
+from .postmessage import PostMessageSpecialist
+from .postmessage_browser import PostMessageBrowserExperimentExecutor
+from .postmessage_store import PostMessageStore
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
-from .logging import create_logger
+from .logging import SecretRedactor, create_logger
 from .policy import PolicyEngine, policy_version
 from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect
 from .policy_store import PolicyStore
@@ -48,7 +51,7 @@ from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
-from .skill_plans import (DOMPlanBinding, PrerequisiteChecker, SkillContextBuilder,
+from .skill_plans import (DOMPlanBinding, MessagePlanBinding, PrerequisiteChecker, SkillContextBuilder,
                           SkillPlanStore, SkillPlanner, SkillRouter)
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository
@@ -105,10 +108,12 @@ class BugHunterRuntime:
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(self.store)
+        self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
         self.skill_checker = PrerequisiteChecker()
-        self.skill_router = SkillRouter(self.skills, self.skill_checker)
         self.skill_plans = SkillPlanStore(self.store)
+        self.skill_router = SkillRouter(self.skills, self.skill_checker,
+                                        self.skill_plans.outcome_counts)
         self.policy_store = PolicyStore(self.store)
         self.rate = RateLimiter()
         self.policy = PolicyEngine(registry=self.registry, browser=self.browser,
@@ -116,7 +121,8 @@ class BugHunterRuntime:
         self.objects = ObjectRegistry(self.store)
         self.policy.owned_object = self.objects.owned_for_action
         self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy,
-                                         self.skill_plans, self.domxss_store)
+                                         self.skill_plans, self.domxss_store,
+                                         self.postmessage_store, self.objects)
         self.permits = PolicyPermitStore(self.store)
         self.executor = TrafficExecutor(
             targets=self.targets, policy=self.policy, permits=self.permits,
@@ -131,15 +137,22 @@ class BugHunterRuntime:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon, self.objects,
-                                                 self.domxss_store)
+                                                 self.domxss_store, self.postmessage_store)
         self.domxss = (DOMXSSSpecialist(recon=self.recon, targets=self.targets,
                                        executor=self.executor, store=self.domxss_store)
                        if self.recon is not None else None)
+        self.postmessage = (PostMessageSpecialist(dom=self.domxss, targets=self.targets,
+                                                  store=self.postmessage_store)
+                            if self.domxss is not None else None)
         self.run_store = PlanRunStore(self.store)
         self.domxss_browser = DOMBrowserExperimentExecutor(
             targets=self.targets, store=self.domxss_store, browser=self.browser,
             driver=self.driver, policy=self.policy, runs=self.run_store,
             evidence=self.store)
+        self.postmessage_browser = PostMessageBrowserExperimentExecutor(
+            targets=self.targets, store=self.postmessage_store, browser=self.browser,
+            driver=self.driver, policy=self.policy, runs=self.run_store,
+            evidence=self.store, objects=self.objects)
         object_settings = config.objects or ObjectSettings(config.paths.root / "recipes")
         self.object_factory = ObjectFactory(
             objects=self.objects, recipes=RecipeCatalog(object_settings), policy=self.policy,
@@ -152,14 +165,15 @@ class BugHunterRuntime:
             runs=self.run_store, traffic=self.traffic, evidence=self.store,
             identities=self.registry, hypotheses=self.hypotheses,
             results=self.validations, registry=self.validator_registry,
-            dom=self.domxss_store, targets=self.targets)
+            dom=self.domxss_store, messages=self.postmessage_store,
+            targets=self.targets)
         self.orchestrator = PlanOrchestrator(
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
             traffic=self.traffic, evidence=self.store, objects=self.objects,
             recipes=self.object_factory.recipes, mutations=self.mutation_results,
-            dom=self.domxss_browser)
+            dom=self.domxss_browser, messages=self.postmessage_browser)
         self.authorization_ledger = AuthorizationStore(self.store)
         self.authorization = AuthorizationSpecialist(
             identities=self.registry, browser=self.browser, objects=self.objects,
@@ -394,6 +408,45 @@ def _dom_candidate_view(candidate, links: dict[str, str | None] | None = None) -
         "source_map_sha256": candidate.source_map_sha256,
         "evidence_ids": list(candidate.evidence_ids[:16]),
         "links": links or {},
+    }
+
+
+def _message_candidate_view(candidate, links: dict[str, str | None] | None = None,
+                            related: tuple[str, ...] = ()) -> dict[str, object]:
+    redactor = SecretRedactor.from_environment()
+    return {
+        "id": candidate.candidate_id, "target_id": candidate.target_id,
+        "asset_hashes": list(candidate.asset_hashes[:16]),
+        "artifact_ids": list(candidate.artifact_ids[:16]),
+        "message_types": [redactor.text(value) for value in candidate.message_types[:16]],
+        "reply_types": [redactor.text(value) for value in candidate.reply_types[:16]],
+        "receiver": redactor.text(candidate.receiver),
+        "transport_kind": candidate.transport_kind,
+        "receiver_line": candidate.receiver_location.line,
+        "origin_checks": [{"kind": item.kind, "line": item.location.line}
+                          for item in candidate.origin_checks],
+        "source_checks": [{"kind": item.kind, "line": item.location.line}
+                          for item in candidate.source_checks],
+        "origin_validation": candidate.origin_validation,
+        "source_validation": candidate.source_validation,
+        "port_accepted": candidate.port_accepted, "port_created": candidate.port_created,
+        "port_bound": candidate.port_bound,
+        "rpc_methods": [redactor.text(value) for value in candidate.rpc_methods[:16]],
+        "rpc_details": [{"name": redactor.text(item.name),
+                         "argument_fields": [redactor.text(field) for field in item.argument_fields],
+                         "result_shape": item.result_shape, "capability": item.capability,
+                         "authorization_assumptions": list(item.authorization_assumptions)}
+                        for item in candidate.rpc_details[:16]],
+        "payload_fields": [redactor.text(value) for value in candidate.payload_fields[:16]],
+        "sensitive_operations": list(candidate.sensitive_operations[:16]),
+        "protocol_sequence": [redactor.text(value) for value in candidate.protocol_sequence[:24]],
+        "sender_contexts": [redactor.text(value) for value in candidate.sender_contexts[:8]],
+        "related_protocols": list(related), "priority": candidate.priority,
+        "status": candidate.status.value, "runtime_status": candidate.runtime_status,
+        "route": redactor.text(candidate.route) if candidate.route else None,
+        "source_map_sha256": candidate.source_map_sha256,
+        "mapped_source": redactor.text(candidate.mapped_source) if candidate.mapped_source else None,
+        "evidence_ids": list(candidate.evidence_ids[:16]), "links": links or {},
     }
 
 
@@ -689,6 +742,160 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             DOMPlanBinding(candidate_id, candidate.route, lead.asset.asset_url,
                            session.id, session.identity_id, body.get("input_kind"),
                            body.get("input_name")))
+        return jsonify({"plan_id": plan["id"], "status": plan["status"]}), 201
+
+    @app.get("/v1/postmessage/<package_id>/inventory")
+    def postmessage_inventory(package_id: str):
+        package = service.package(package_id)
+        if service.postmessage is None:
+            return jsonify(error="recon_unavailable"), 503
+        return jsonify({"target_id": package.target.id, "bounded": True,
+                        "items": [{"recon_asset_id": lead.asset.asset_id,
+                                   "host": urlsplit(lead.asset.asset_url).hostname,
+                                   "asset_url_sha256": hashlib.sha256(
+                                       lead.asset.asset_url.encode()).hexdigest(),
+                                   "latest_sha256": lead.asset.latest_sha256,
+                                   "score": lead.score, "reasons": list(lead.reasons)}
+                                  for lead in service.postmessage.inventory(package_id)]})
+
+    @app.get("/v1/postmessage/<package_id>/candidates")
+    def postmessage_candidates(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        result = service.postmessage_store.list_candidates(
+            package.target.id, limit=page.limit, cursor=page.cursor)
+        return jsonify({"target_id": package.target.id,
+                        "items": [_message_candidate_view(item) for item in result.items],
+                        "next_cursor": result.next_cursor})
+
+    @app.get("/v1/postmessage/<package_id>/metrics")
+    def postmessage_metrics(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.postmessage_store.metrics(package.target.id))
+
+    @app.get("/v1/postmessage/<package_id>/candidates/<candidate_id>")
+    def postmessage_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        item = service.postmessage_store.get_candidate(package.target.id, candidate_id)
+        if item is None:
+            raise LookupError("candidate not found")
+        view = _message_candidate_view(
+            item, service.postmessage_store.links(package.target.id, candidate_id),
+            service.postmessage_store.related_protocols(package.target.id, candidate_id))
+        view["dom_xss_handoffs"] = list(service.postmessage_store.dom_xss_handoffs(
+            package.target.id, candidate_id))
+        return jsonify(view)
+
+    @app.get("/v1/postmessage/<package_id>/candidates/<candidate_id>/runtime")
+    def postmessage_runtime(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        links = service.postmessage_store.links(package.target.id, candidate_id)
+        if links is None:
+            raise LookupError("candidate not found")
+        run = service.run_store.get(links["run_id"], package.target.id) if links["run_id"] else None
+        validation = (service.validations.get(links["validation_id"], package.target.id)
+                      if links["validation_id"] else None)
+        trials = []
+        if run is not None:
+            for step in service.run_store.steps(run.id):
+                if step.type != "VERIFY_BROWSER":
+                    continue
+                result = service.run_store.result(step.id)
+                for ref in result.evidence_ids[:8] if result else ():
+                    evidence = service.store.get_evidence(ref)
+                    if (evidence is None or evidence.target_ref != package.target.id
+                            or evidence.evidence_type != "MESSAGE_PROOF"):
+                        continue
+                    try:
+                        record = json.loads(service.store.read_content(ref, max_bytes=8192))
+                    except (ValueError, UnicodeError, PermissionError):
+                        continue
+                    trials.append({key: record.get(key) for key in (
+                        "variant", "context_id", "attacker_origin", "source_relationship",
+                        "message_type", "message_count", "port_count", "rpc_calls",
+                        "capability_observed", "effect_kind", "victim_bundle_sha256",
+                        "response_status", "frame_ancestors", "x_frame_options",
+                        "sandbox_flags", "request_count", "denial_count", "error_code")}
+                        | {"evidence_id": ref})
+        return jsonify({"target_id": package.target.id, "links": links,
+                        "run_status": run.status.value if run else None,
+                        "validation_status": validation.status.value if validation else None,
+                        "trials": trials})
+
+    @app.post("/v1/postmessage/<package_id>/analyze")
+    def postmessage_analyze(package_id: str):
+        body = _body(frozenset({"recon_asset_id"}))
+        package = service.package(package_id)
+        asset_id = body.get("recon_asset_id")
+        if type(asset_id) is not int or asset_id <= 0:
+            raise ValueError("invalid recon asset")
+        if service.postmessage is None:
+            return jsonify(error="recon_unavailable"), 503
+        status, analysis_id, analysis, reason = service.postmessage.analyze_asset(
+            package_id, asset_id)
+        return jsonify({"target_id": package.target.id, "status": status,
+                        "analysis_id": analysis_id, "reason_code": reason,
+                        "candidate_ids": [item.candidate_id for item in analysis.candidates]
+                        if analysis else []}), 201 if analysis else 202
+
+    @app.post("/v1/postmessage/<package_id>/candidates/<candidate_id>/route")
+    def postmessage_route(package_id: str, candidate_id: str):
+        body = _body(frozenset({"exchange_id"}))
+        if service.postmessage is None or not isinstance(body.get("exchange_id"), str):
+            raise ValueError("observed exchange required")
+        item = service.postmessage.bind_observed_route(
+            package_id, candidate_id, body["exchange_id"], service.traffic)
+        return jsonify(_message_candidate_view(item))
+
+    @app.post("/v1/postmessage/<package_id>/candidates/<candidate_id>/prepare")
+    def postmessage_prepare(package_id: str, candidate_id: str):
+        _body(frozenset())
+        if service.postmessage is None:
+            return jsonify(error="recon_unavailable"), 503
+        prepared = service.postmessage.prepare_candidate(
+            package_id, candidate_id, hypotheses=service.hypotheses,
+            contexts=service.skill_context, router=service.skill_router,
+            planner=service.skill_planner)
+        return jsonify({"hypothesis_id": prepared.hypothesis.id,
+                        "plan_id": prepared.plan["id"],
+                        "prerequisite_state": prepared.prerequisite_state}), 201
+
+    @app.post("/v1/postmessage/<package_id>/candidates/<candidate_id>/bind-plan")
+    def postmessage_bind_plan(package_id: str, candidate_id: str):
+        body = _body(frozenset({"browser_session_id", "activation_type",
+                                "port_type", "allowed_method", "owned_object_id"}))
+        package = service.package(package_id)
+        candidate = service.postmessage_store.get_candidate(package.target.id, candidate_id)
+        asset = service.postmessage_store.current_asset(package.target.id, candidate_id)
+        links = service.postmessage_store.links(package.target.id, candidate_id)
+        session_id = body.get("browser_session_id")
+        session = service.browser.get(session_id) if isinstance(session_id, str) else None
+        if (candidate is None or asset is None or links is None or not links["hypothesis_id"]
+                or not candidate.route or session is None or session.target_id != package.target.id
+                or service.postmessage is None):
+            raise ValueError("Current messaging candidate and browser session required")
+        lead = next((item for item in service.postmessage.inventory(package_id)
+                     if item.asset.asset_id == asset.recon_asset_id
+                     and hashlib.sha256(item.asset.asset_url.encode()).hexdigest()
+                     == asset.asset_url_sha256), None)
+        if lead is None:
+            raise ValueError("Current messaging bundle is not in bounded inventory")
+        hypothesis = service.hypotheses.get(links["hypothesis_id"], package.target.id)
+        if hypothesis is None:
+            raise ValueError("Messaging hypothesis unavailable")
+        context = service.skill_context.build(hypothesis, None, package=package)
+        dom_field = (service.postmessage_store.dom_xss_field(package.target.id,
+                                                              candidate_id)
+                     if body.get("allowed_method") is None and body.get("port_type") is None
+                     else None)
+        plan = service.skill_planner.bind_message(
+            package, hypothesis, context,
+            MessagePlanBinding(candidate_id, candidate.route, lead.asset.asset_url,
+                               session.id, session.identity_id, body.get("activation_type"),
+                               body.get("port_type"), body.get("allowed_method"),
+                               "POPUP" if "OPENER" in candidate.sender_contexts
+                               and "PARENT" not in candidate.sender_contexts else "IFRAME",
+                               dom_field, body.get("owned_object_id")))
         return jsonify({"plan_id": plan["id"], "status": plan["status"]}), 201
 
     @app.get("/v1/objects/recipes")
@@ -1035,12 +1242,14 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def skills_list():
         counts = service.skill_plans.usage_counts()
         return jsonify({"items": [{**skill.to_dict(), "usage_count": counts.get(skill.name, 0),
+                                   "validation_outcomes": service.skill_plans.outcome_counts(skill.name),
                                    "status": "PLAN_ONLY"} for skill in service.skills.discover()]})
 
     @app.get("/v1/skills/<skill_id>")
     def skill_detail(skill_id: str):
         detail = service.skills.select(skill_id).detail()
         detail["usage_count"] = service.skill_plans.usage_counts().get(skill_id, 0)
+        detail["validation_outcomes"] = service.skill_plans.outcome_counts(skill_id)
         return jsonify(detail)
 
     @app.post("/v1/hypotheses/<hypothesis_id>/skills/route")

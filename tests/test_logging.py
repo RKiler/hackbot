@@ -39,6 +39,23 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(record["context"]["password"], REDACTED)
         self.assertEqual(record["context"]["safe"], "visible")
 
+    def test_header_pair_and_named_value_redaction(self) -> None:
+        context = {
+            "headers": [
+                ("Authorization", "Basic pair-secret"),
+                ["Cookie", "sid=pair-cookie"],
+                {"name": "X-API-Key", "value": "object-key"},
+                {"key": "session_token", "values": ["object-session"]},
+                {"name": "header", "key": "Authorization", "value": "dual-label-secret"},
+                ("Accept", "application/json"),
+            ]
+        }
+        record = self._log("request", context=context)
+        output = json.dumps(record)
+        for secret in ("pair-secret", "pair-cookie", "object-key", "object-session", "dual-label-secret"):
+            self.assertNotIn(secret, output)
+        self.assertEqual(record["context"]["headers"][-1], ["Accept", "application/json"])
+
     def test_free_text_authorization_cookie_bearer_and_assignments(self) -> None:
         raw = (
             'Authorization: Bearer auth123\nCookie: sid=cookie123\n'

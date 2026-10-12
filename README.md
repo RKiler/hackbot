@@ -40,7 +40,10 @@ provider binding is configured. No fixture credential is supplied.
 The install includes PyYAML for strict local Target Package loading. Install
 `.[browser]` to use the optional Playwright browser driver. In an
 offline environment, use preinstalled or locally supplied wheels. Run tests with
-`.venv/bin/python -m unittest discover -s tests -v`.
+`.venv/bin/python -m unittest discover -s tests -t . -v`.
+If Playwright is installed but its default Chromium is not, set
+`HACKBOT_TEST_CHROMIUM` to an absolute Chromium executable path for browser
+fixture tests.
 
 Configuration is optional TOML. Use `hackbot --config /path/to/config.toml
 health` or set `HACKBOT_CONFIG`. An explicitly selected missing file is an

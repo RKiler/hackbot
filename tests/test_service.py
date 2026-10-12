@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -15,6 +16,7 @@ from hackbot.browser import IdentityObservation
 from hackbot.config import BrowserSettings, TargetSettings, load_config
 from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
+from hackbot.postmessage_static import PostMessageStaticAnalyzer
 from hackbot.service import BugHunterRuntime, create_app
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
 
@@ -128,6 +130,56 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(self.client.post("/v1/domxss/example/candidates/DOM-" + "a" * 32 +
                                               "/prepare", json={}).status_code, 503)
 
+    def test_postmessage_api_is_target_scoped_bounded_and_has_no_send_surface(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        candidate = "MSG-" + "a" * 32
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            self.assertEqual(self.get("/v1/postmessage/example/candidates")["items"], [])
+            metrics = self.get("/v1/postmessage/example/metrics")
+            self.assertEqual(metrics["runtime_tests"], 0)
+            self.assertEqual(metrics["messages_sent"], 0)
+            self.assertEqual(self.client.get("/v1/postmessage/example/inventory").status_code, 503)
+            self.assertEqual(self.client.get("/v1/postmessage/not-here/candidates").status_code, 404)
+            self.assertEqual(self.client.get("/v1/postmessage/example/candidates?limit=999").status_code, 400)
+            self.assertEqual(self.client.get("/v1/postmessage/example/candidates/" + candidate).status_code, 404)
+            self.assertEqual(self.client.post("/v1/postmessage/example/analyze",
+                                              json={"recon_asset_id": 1}).status_code, 503)
+            self.assertEqual(self.client.post("/v1/postmessage/example/analyze",
+                                              json={"message": {"type": "ACTIVATE"}}).status_code, 400)
+            self.assertEqual(self.client.post("/v1/postmessage/example/candidates/" + candidate +
+                                              "/prepare", json={}).status_code, 503)
+            self.assertEqual(self.client.post("/v1/postmessage/example/send",
+                                              json={"message": "ACTIVATE"}).status_code, 404)
+
+    def test_postmessage_candidate_survives_service_reinitialization(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        body = b"""window.addEventListener('message', event => {
+          if (event.data.type !== 'ACTIVATE') return;
+          const port = event.ports[0];
+          if (port) port.onmessage = packet => {
+            if (packet.data.method === 'readSynthetic')
+              port.postMessage({type:'RESULT', value:syntheticCanary});
+          };
+        });"""
+        asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://api.example.test/bridge.js",
+            body=body, recon_asset_id=1, recon_sha256=hashlib.sha256(body).hexdigest(),
+            source="FIXTURE")
+        _, analysis = self.runtime.postmessage_store.analyze_asset(
+            self.target, asset.artifact_id, PostMessageStaticAnalyzer())
+        candidate_id = analysis.candidates[0].candidate_id
+
+        restarted = BugHunterRuntime(self.config, driver=FakeDriver(), vnc_ready=lambda: True)
+        client = create_app(runtime=restarted).test_client()
+        listed = client.get("/v1/postmessage/example/candidates")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.get_json()["items"][0]["id"], candidate_id)
+        detail = client.get(f"/v1/postmessage/example/candidates/{candidate_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("ACTIVATE", detail.get_json()["message_types"])
+        self.assertEqual(client.get(f"/v1/postmessage/example/candidates/{candidate_id}/runtime")
+                         .get_json()["links"]["run_id"], None)
+
     def test_domxss_analyze_maps_only_high_priority_candidates(self):
         self.runtime.registry.register_target(self.runtime.package("example"))
         high = SimpleNamespace(candidate_id="DOM-" + "a" * 32, score=80)
@@ -195,6 +247,8 @@ class ServiceTests(unittest.TestCase):
         detail = self.get("/v1/skills/check-before-transform-dom-xss")
         self.assertEqual(detail["execution"], "PLAN_ONLY")
         self.assertTrue(detail["workflow"])
+        self.assertEqual(self.get("/v1/skills/postmessage-trust-analysis")
+                         ["validation_outcomes"], {})
         self.assertEqual(self.client.get("/v1/skills/not-a-skill").status_code, 404)
         manual = self.client.post("/v1/hypotheses/manual", json={
             "target": "example", "category": "DOM_XSS", "statement": "Controlled source may reach a sink",

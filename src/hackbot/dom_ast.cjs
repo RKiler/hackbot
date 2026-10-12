@@ -2,8 +2,7 @@
 
 // Isolated, bounded parser helper. It never evaluates target JavaScript.
 const fs = require("fs");
-const parser = require("@babel/parser");
-const traverse = require("@babel/traverse").default;
+const {parseSource, traverse, loc, member} = require("./js_ast_common.cjs");
 
 const source = fs.readFileSync(0, "utf8");
 const MAX_FLOWS = 32;
@@ -26,29 +25,13 @@ const callSinks = new Set([
   "location.replace", "window.open"
 ]);
 
-function loc(node) {
-  return node && node.loc ? { line: node.loc.start.line, column: node.loc.start.column + 1 } : null;
-}
-
-function member(node) {
-  if (!node) return "";
-  if (node.type === "Identifier") return node.name;
-  if (node.type === "ThisExpression") return "this";
-  if (node.type !== "MemberExpression" && node.type !== "OptionalMemberExpression") return "";
-  const base = member(node.object);
-  const property = node.computed
-    ? (node.property.type === "StringLiteral" ? node.property.value : "")
-    : (node.property.name || "");
-  return base && property ? `${base}.${property}` : "";
-}
-
 function sourceKind(node) {
   const name = member(node);
   if (/^(?:window\.)?location\.(?:search|hash|href|pathname)$/.test(name) ||
       /^(?:window\.)?location$/.test(name) ||
       /^document\.(?:URL|documentURI|referrer)$/.test(name) ||
       name === "window.name") return name;
-  if (/^(?:event|e|messageEvent)\.data$/.test(name)) return name;
+  if (/^(?:event|e|messageEvent)\.data(?:\.[A-Za-z_$][\w$]*)?$/.test(name)) return name;
   if (/^(?:router|route)\.(?:query|params|state)$/.test(name)) return name;
   return "";
 }
@@ -65,7 +48,7 @@ function sourceFlow(node) {
   const kind = sourceKind(node);
   return kind ? { source: kind, source_loc: loc(node), validations: [],
     transformations: [], post_checks: [], sanitizers: [], unresolved_helper: false,
-    attacker_controlled: !/\.data$/.test(kind) } : null;
+    attacker_controlled: !/^(?:event|e|messageEvent)\.data(?:\.|$)/.test(kind) } : null;
 }
 
 function expressionFlow(node, env) {
@@ -148,8 +131,7 @@ function sinkOf(left) {
 }
 
 function analyze() {
-  const ast = parser.parse(source, { sourceType: "unambiguous", errorRecovery: true,
-    plugins: ["jsx", "typescript", "decorators-legacy", "classProperties", "dynamicImport"] });
+  const ast = parseSource(source);
   const flows = [];
   function record(flow, sink, node) {
     if (!flow || !sink || flows.length >= MAX_FLOWS) return;

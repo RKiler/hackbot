@@ -9,13 +9,15 @@ from itertools import combinations
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 import uuid
 
 from .authorization_binding import reference_fingerprint
 from .domxss_static import DOMCandidateStatus
 from .domxss_store import DOMXSSStore
+from .postmessage_static import MessageCandidateStatus
+from .postmessage_store import PostMessageStore
 from .mutation_binding import MutationStage, STAGES, mutation_fingerprint
 from .executor import RequestTemplate
 from .hypotheses import Hypothesis
@@ -80,6 +82,7 @@ class SkillContext:
     flags: frozenset[str]
     missing_hypothesis: tuple[str, ...]
     recon_refs: tuple[dict[str, object], ...] = ()
+    message_protocol: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"target_id": self.target_id, "hypothesis_id": self.hypothesis_id,
@@ -89,12 +92,18 @@ class SkillContext:
                 "evidence": list(self.evidence), "facts": list(self.facts),
                 "traffic": list(self.traffic), "identities": list(self.identities),
                 "flags": sorted(self.flags), "missing_hypothesis": list(self.missing_hypothesis),
-                "recon_refs": list(self.recon_refs)}
+                "recon_refs": list(self.recon_refs),
+                "message_protocol": self.message_protocol}
 
 
 def _safe(value: str, maximum: int = 160) -> str:
     text = SecretRedactor.from_environment().text(str(value))
     return text[:maximum]
+
+
+def _protocol_labels(values: tuple[str, ...], limit: int) -> list[str]:
+    return [_safe(value, 48) for value in values[:limit]
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:/-]{0,47}", value)]
 
 
 class SkillContextBuilder:
@@ -104,7 +113,8 @@ class SkillContextBuilder:
                  traffic: TrafficStore, browser: Any | None = None,
                  recon: ReconRepository | None = None,
                  objects: ObjectRegistry | None = None,
-                 dom: DOMXSSStore | None = None) -> None:
+                 dom: DOMXSSStore | None = None,
+                 messages: PostMessageStore | None = None) -> None:
         self.store = store
         self.registry = registry
         self.traffic = traffic
@@ -112,6 +122,7 @@ class SkillContextBuilder:
         self.recon = recon
         self.objects = objects
         self.dom = dom
+        self.messages = messages
 
     def build(self, hypothesis: Hypothesis, profile: TargetProfile | None,
               package: TargetPackage | None = None,
@@ -231,6 +242,7 @@ class SkillContextBuilder:
             flags.add("transformation_trace")
         if hypothesis.category != "DOM_XSS" and "JS_SOURCE" in signals:
             flags.add("attacker_controlled_source")
+        message_protocol = None
         if (self.dom is not None and hypothesis.category == "DOM_XSS"
                 and re.fullmatch(r"js:DOM-[0-9a-f]{32}", hypothesis.surface_key)):
             candidate_id = hypothesis.surface_key[3:]
@@ -250,6 +262,34 @@ class SkillContextBuilder:
                     flags.add("transformation_trace")
                 if candidate.sink_kind in {"HTML_EXECUTION", "URL_RESOURCE", "NAVIGATION_URL"}:
                     flags.add("dangerous_dom_sink")
+        if (self.messages is not None and hypothesis.category == "POSTMESSAGE"
+                and re.fullmatch(r"js:MSG-[0-9a-f]{32}", hypothesis.surface_key)):
+            candidate = self.messages.get_candidate(hypothesis.target_id,
+                                                    hypothesis.surface_key[3:])
+            artifact = self.messages.current_asset(hypothesis.target_id,
+                                                   hypothesis.surface_key[3:])
+            if (candidate is not None and artifact is not None
+                    and candidate.status not in {MessageCandidateStatus.STALE,
+                                                 MessageCandidateStatus.REJECTED}):
+                flags.update({"current_js", "message_listener"})
+                message_protocol = {
+                    "candidate_id": candidate.candidate_id,
+                    "asset_sha256": artifact.artifact_sha256,
+                    "receiver": _safe(candidate.receiver, 80),
+                    "handler_location": {"line": candidate.receiver_location.line,
+                                         "column": candidate.receiver_location.column},
+                    "sender_slice": _protocol_labels(candidate.sender_contexts, 4),
+                    "handler_slice": {
+                        "receives": _protocol_labels(candidate.message_types, 4),
+                        "replies": _protocol_labels(candidate.reply_types, 4),
+                        "origin_checks": [check.kind for check in candidate.origin_checks[:4]],
+                        "source_checks": [check.kind for check in candidate.source_checks[:4]],
+                    },
+                    "protocol_sequence": _protocol_labels(candidate.protocol_sequence, 8),
+                    "accepts_port": candidate.port_accepted,
+                    "binds_port": candidate.port_bound,
+                    "rpc_methods": _protocol_labels(candidate.rpc_methods, 4),
+                }
         if "FEATURE_DOWNLOAD" in signals or "FEATURE_PII_OBJECT" in signals:
             flags.add("sensitive_artifact")  # Candidate only, never secret bytes.
         if any(f["predicate"] == "data_classification" and f["status"] == "ACTIVE"
@@ -271,7 +311,7 @@ class SkillContextBuilder:
                             tuple(_safe(x) for x in (profile.features if profile else ())[:8]),
                             signals, tuple(evidence), tuple(facts), tuple(traffic), tuple(identities),
                             frozenset(flags), tuple(_safe(x) for x in hypothesis.missing[:8]),
-                            tuple(recon_refs))
+                            tuple(recon_refs), message_protocol)
 
 
 class PrerequisiteChecker:
@@ -306,9 +346,11 @@ class PrerequisiteChecker:
 
 
 class SkillRouter:
-    def __init__(self, registry: SkillRegistry, checker: PrerequisiteChecker | None = None) -> None:
+    def __init__(self, registry: SkillRegistry, checker: PrerequisiteChecker | None = None,
+                 outcome_provider: Callable[[str], dict[str, int]] | None = None) -> None:
         self.registry = registry
         self.checker = checker or PrerequisiteChecker()
+        self.outcome_provider = outcome_provider
 
     def route(self, hypothesis: Hypothesis, context: SkillContext, *, limit: int = 3) -> tuple[dict[str, object], ...]:
         if type(limit) is not int or not 1 <= limit <= 5:
@@ -330,8 +372,10 @@ class SkillRouter:
             score -= meta.request_budget // 4 + meta.token_budget // 2048
             if "graphql_mutation" in meta.prerequisites and "graphql_mutation" not in context.flags:
                 score -= 20
+            outcomes = self.outcome_provider(meta.name) if self.outcome_provider else None
             ranked.append({"skill": meta.to_dict(), "score": score, "prerequisites": prereq.to_dict(),
-                           "usage_count": 0, "metrics_available": False})
+                           "usage_count": 0, "metrics_available": outcomes is not None,
+                           "validation_outcomes": outcomes})
         ranked.sort(key=lambda item: (-item["score"], item["skill"]["name"]))
         return tuple(ranked[:limit])
 
@@ -366,6 +410,7 @@ class InvestigationPlan:
     created_at: str
     comparison_pairs: tuple[dict[str, int], ...] = ()
     dom_binding: dict[str, str] | None = None
+    message_binding: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
@@ -386,6 +431,7 @@ class InvestigationPlan:
                 "expected_request_count": len(self.proposed_actions), "status": self.status,
                 "created_at": self.created_at, "comparison_pairs": list(self.comparison_pairs),
                 "dom_binding": self.dom_binding,
+                "message_binding": self.message_binding,
                 "execution_started": False, "finding_status": "UNVALIDATED"}
 
 
@@ -438,6 +484,21 @@ class DOMPlanBinding:
     input_name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MessagePlanBinding:
+    candidate_id: str
+    route_url: str
+    asset_url: str
+    browser_session_id: str
+    identity_id: str | None
+    activation_type: str
+    port_type: str | None
+    allowed_method: str | None
+    window_mode: str = "IFRAME"
+    dom_field: str | None = None
+    owned_object_id: str | None = None
+
+
 class SkillPlanStore:
     def __init__(self, store: EvidenceFactStore) -> None:
         self.store = store
@@ -460,6 +521,14 @@ class SkillPlanStore:
     def usage_counts(self) -> dict[str, int]:
         with self.store._connection() as db:
             rows = db.execute("SELECT skill_id,count(*) FROM skill_plans GROUP BY skill_id").fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def outcome_counts(self, skill_id: str) -> dict[str, int]:
+        if not isinstance(skill_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,63}", skill_id):
+            raise ValueError("Invalid skill ID")
+        with self.store._connection() as db:
+            rows = db.execute("""SELECT status,count(*) FROM validations
+                WHERE skill_id=? GROUP BY status""", (skill_id,)).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def save(self, plan: InvestigationPlan, *, regenerate: bool = False) -> dict[str, object]:
@@ -499,9 +568,115 @@ def _safe_plan_values(value: object) -> bool:
 class SkillPlanner:
     def __init__(self, registry: SkillRegistry, checker: PrerequisiteChecker,
                  policy: PolicyEngine, store: SkillPlanStore,
-                 dom: DOMXSSStore | None = None) -> None:
+                 dom: DOMXSSStore | None = None,
+                 messages: PostMessageStore | None = None,
+                 objects: ObjectRegistry | None = None) -> None:
         self.registry, self.checker, self.policy, self.store = registry, checker, policy, store
         self.dom = dom
+        self.messages = messages
+        self.objects = objects
+
+    def bind_message(self, package: TargetPackage, hypothesis: Hypothesis,
+                     context: SkillContext, binding: MessagePlanBinding) -> dict[str, object]:
+        if (self.messages is None or hypothesis.target_id != package.target.id
+                or context.target_id != package.target.id or hypothesis.category != "POSTMESSAGE"
+                or hypothesis.surface_key != "js:" + binding.candidate_id):
+            raise ValueError("Messaging plan binding is invalid")
+        candidate = self.messages.get_candidate(package.target.id, binding.candidate_id)
+        asset = self.messages.current_asset(package.target.id, binding.candidate_id)
+        safe_methods = {"ping", "getVersion", "getStatus", "readSynthetic", "readCanary"}
+        if (candidate is None or asset is None or candidate.route != binding.route_url
+                or candidate.transport_kind != "WINDOW"
+                or binding.activation_type not in candidate.message_types
+                or binding.port_type not in (None, *candidate.message_types)
+                or binding.allowed_method not in (None, *candidate.rpc_methods)
+                or binding.allowed_method not in (None, *safe_methods)
+                or binding.allowed_method is not None and not any(
+                    method.name == binding.allowed_method and method.capability == "READ"
+                    for method in candidate.rpc_details)
+                or hashlib.sha256(binding.asset_url.encode()).hexdigest() != asset.asset_url_sha256
+                or candidate.status not in {MessageCandidateStatus.STATIC_CANDIDATE,
+                                             MessageCandidateStatus.RUNTIME_READY}):
+            raise ValueError("Messaging candidate is stale or proof method is not allowlisted")
+        if binding.dom_field is not None:
+            if (binding.dom_field != self.messages.dom_xss_field(package.target.id,
+                                                                  binding.candidate_id) or
+                    binding.allowed_method is not None or binding.port_type is not None):
+                raise ValueError("Messaging DOM field is not backed by a Phase 21 flow")
+        owned = None
+        if binding.owned_object_id is not None:
+            if (self.objects is None or binding.identity_id is None
+                    or binding.allowed_method != "readCanary" or binding.dom_field is not None):
+                raise ValueError("Owned messaging canary requires a verified read-only RPC")
+            owned = self.objects.get(binding.owned_object_id, package.target.id)
+            if (owned is None or owned.package_id != package.id
+                    or owned.creator_identity_id != binding.identity_id
+                    or owned.state is not ObjectState.READY or not owned.disposable
+                    or not owned.verified_at or not owned.verification_evidence_ids
+                    or not owned.external_id_hash or not owned.external_id_evidence_id):
+                raise ValueError("Owned messaging canary is not verified and available")
+        if (binding.window_mode not in {"IFRAME", "POPUP"}
+                or binding.window_mode == "POPUP" and "OPENER" not in candidate.sender_contexts):
+            raise ValueError("Messaging window mode is unsupported by the current protocol")
+        skill = self.registry.select("postmessage-trust-analysis")
+        prereq = self.checker.check(skill.metadata, context)
+        if prereq.state is not PrerequisiteState.READY:
+            raise ValueError("Messaging prerequisites are not current")
+        route, js_url = urlsplit(binding.route_url), urlsplit(binding.asset_url)
+        if (route.scheme not in {"http", "https"} or not route.hostname
+                or route.username or route.password or route.query or route.fragment
+                or js_url.username or js_url.password or js_url.query or js_url.fragment
+                or package.scope.evaluate_url(binding.route_url).result is not ScopeResult.IN_SCOPE
+                or package.scope.evaluate_url(binding.asset_url).result is not ScopeResult.IN_SCOPE):
+            raise ValueError("Messaging browser route or bundle is out of scope")
+        action = ProposedAction(
+            target_id=package.target.id, package_id=package.id,
+            category=ActionCategory.BROWSER_NAVIGATION,
+            actor=ActorMode.AUTHENTICATED if binding.identity_id else ActorMode.ANONYMOUS,
+            source="postmessage_plan", purpose="Simulate bounded messaging browser navigation",
+            url=binding.route_url, method="GET", identity_id=binding.identity_id,
+            session_id=binding.browser_session_id if binding.identity_id else None,
+            hypothesis_id=hypothesis.id, vulnerability_class="postmessage",
+        )
+        if self.policy.evaluate(package, action, record=False).result.value != "ALLOW":
+            raise ValueError("Messaging navigation is not policy-allowed")
+        frozen = {"candidate_id": binding.candidate_id, "route_url": binding.route_url,
+                  "asset_url": binding.asset_url,
+                  "browser_session_id": binding.browser_session_id,
+                  "identity_id": binding.identity_id or "",
+                  "activation_type": binding.activation_type,
+                  "port_type": binding.port_type or "",
+                  "allowed_method": binding.allowed_method or "",
+                  "window_mode": binding.window_mode,
+                  "dom_field": binding.dom_field or "",
+                  "owned_object_id": owned.id if owned else "",
+                  "owned_canary_sha256": hashlib.sha256(owned.test_name.encode()).hexdigest()
+                  if owned else "",
+                  "owned_verified_at": owned.verified_at if owned else ""}
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prereq,
+            skill.controls,
+            tuple((StepType(kind), description) for kind, description in skill.workflow),
+            (), (), skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, skill.metadata.request_budget,
+            skill.metadata.token_budget, "READY_FOR_MANUAL_REVIEW",
+            datetime.now(timezone.utc).isoformat(), message_binding=frozen,
+        )
+        result = self.store.save(plan, regenerate=True)
+        if owned is not None:
+            assert self.objects is not None
+            self.objects.add_requirement(
+                plan_id=result["id"], target_id=package.target.id,
+                object_type=owned.object_type, recipe_id=owned.recipe_id,
+                identity_id=owned.creator_identity_id, tenant_id=owned.tenant_id,
+                parent_id=owned.parent_id, test_object_id=owned.id)
+        self.messages.bind_plan(package.target.id, binding.candidate_id,
+                                hypothesis.id, result["id"])
+        return result
 
     def bind_dom(self, package: TargetPackage, hypothesis: Hypothesis,
                  context: SkillContext, binding: DOMPlanBinding) -> dict[str, object]:

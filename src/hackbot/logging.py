@@ -94,11 +94,21 @@ class SecretRedactor:
 
     def data(self, value: object) -> object:
         if isinstance(value, Mapping):
+            sensitive_pair = any(
+                isinstance(item, str) and is_sensitive_key(item)
+                for key, item in value.items()
+                if str(key).lower() in {"name", "key"}
+            )
             return {
-                self.text(str(key)): REDACTED if is_sensitive_key(str(key)) else self.data(item)
+                self.text(str(key)): REDACTED if is_sensitive_key(str(key)) or (
+                    sensitive_pair and str(key).lower() in {"value", "values"}
+                ) else self.data(item)
                 for key, item in value.items()
             }
         if isinstance(value, (list, tuple, set)):
+            if isinstance(value, (list, tuple)) and len(value) == 2 and isinstance(value[0], str):
+                if is_sensitive_key(value[0]):
+                    return [self.data(value[0]), REDACTED]
             return [self.data(item) for item in value]
         if isinstance(value, str):
             return self.text(value)

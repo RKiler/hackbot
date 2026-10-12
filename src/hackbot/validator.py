@@ -9,12 +9,16 @@ import json
 import re
 import uuid
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .domain import ObservationState
 from .evidence import EvidenceType, Fact, FactStatus, Retention
 from .domxss_static import DOMCandidateStatus
 from .domxss_store import DOMXSSStore
+from .postmessage_static import MessageCandidateStatus
+from .postmessage_browser import (PostMessageBrowserExperimentExecutor,
+                                  lookalike_origin, verified_owned_canary)
+from .postmessage_store import PostMessageStore
 from .hypotheses import HypothesisStore
 from .identity import MembershipStatus
 from .identity_registry import IdentityRegistry
@@ -26,6 +30,7 @@ from .store import EvidenceFactStore
 from .target_loader import TargetPackageRepository
 from .target_scope import ScopeResult
 from .traffic import AuthState, ExchangeState, TrafficExchange, TrafficStore
+from .test_objects import ObjectRegistry
 from .validation_store import (CheckOutcome, FindingSpec, ValidationCheck,
                                ValidationResult, ValidationStatus, ValidationStore)
 
@@ -146,7 +151,7 @@ class ValidatorRegistry:
             self._items[name] = ExposureValidator(name == "sensitive-data-exposure")
         for name in _CLIENT_SKILLS:
             self._items[name] = (DOMXSSValidator() if name == "check-before-transform-dom-xss"
-                                 else ClientSideValidator(name))
+                                 else PostMessageValidator())
         self._items["internal-surface-candidate"] = InternalSurfaceValidator()
         self._items["typed-authorization-mutation"] = TypedMutationValidator()
         self._items["batch-object-authorization"] = BatchReadValidator()
@@ -164,12 +169,14 @@ class DeterministicValidatorEngine:
                  hypotheses: HypothesisStore, results: ValidationStore,
                  registry: ValidatorRegistry | None = None,
                  dom: DOMXSSStore | None = None,
+                 messages: PostMessageStore | None = None,
                  targets: TargetPackageRepository | None = None) -> None:
         self.runs, self.traffic, self.evidence = runs, traffic, evidence
         self.identities, self.hypotheses, self.results = identities, hypotheses, results
         self.registry = registry or ValidatorRegistry()
         self.comparator = ResponseComparator(evidence)
         self.dom = dom
+        self.messages = messages
         self.targets = targets
 
     def _semantic_object_hash(self, run: PlanRun, salted_hash: str | None,
@@ -449,6 +456,16 @@ class DeterministicValidatorEngine:
                         self.evidence.set_retention(
                             ref, Retention(retain=True, pinned=True, finding_related=True),
                             actor="dom_xss_validator", reason="confirmed_dom_xss_finding")
+        if self.messages is not None and run.skill_id == "postmessage-trust-analysis":
+            binding = context.plan.get("message_binding")
+            if isinstance(binding, dict) and isinstance(binding.get("candidate_id"), str):
+                self.messages.bind_validation(run.target_id, binding["candidate_id"],
+                                              run.id, recorded.id)
+                if recorded.status is ValidationStatus.CONFIRMED and finding is not None:
+                    for ref in recorded.supporting_evidence_ids:
+                        self.evidence.set_retention(
+                            ref, Retention(retain=True, pinned=True, finding_related=True),
+                            actor="postmessage_validator", reason="confirmed_message_finding")
         return recorded, finding
 
     def record_manual(self, run_id: str, target_id: str, status: ValidationStatus,
@@ -1186,9 +1203,476 @@ class ExposureValidator:
                          impact="ANONYMOUS_PROTECTED_CONTENT_READ", finding=finding)
 
 
+class PostMessageValidator:
+    id = "postmessage_cross_origin_capability"
+    version = "1.0.0"
+
+    @staticmethod
+    def _trace_valid(trial: dict[str, object], expected_method: object) -> bool:
+        return (trial.get("rpc_method") == expected_method
+                and PostMessageBrowserExperimentExecutor.trace_is_valid(
+                    trial.get("event_trace"),
+                    source_attested=trial.get("source_attested"),
+                    message_count=trial.get("message_count"),
+                    port_count=trial.get("port_count"),
+                    rpc_calls=trial.get("rpc_calls"),
+                    effect_kind=trial.get("effect_kind")))
+
+    @staticmethod
+    def _owned_denial_exchange(engine: DeterministicValidatorEngine, run: PlanRun,
+                               owned, first_trial_at: datetime) -> tuple[bool, tuple[str, ...]]:
+        if not owned.external_id_evidence_id:
+            return False, ()
+        try:
+            external = engine.evidence.read_content(
+                owned.external_id_evidence_id, allow_sensitive=True, max_bytes=256).decode("ascii")
+            verified_at = datetime.fromisoformat(owned.verified_at)
+        except (ValueError, UnicodeError, PermissionError, TypeError):
+            return False, ()
+        package = engine.targets.get_target_package(run.package_id) if engine.targets else None
+        if package is None:
+            return False, ()
+        with engine.evidence._connection() as db:
+            rows = db.execute("""SELECT r.observation_evidence_id AS request_ref,
+                p.observation_evidence_id AS response_ref, e.observed_at
+                FROM traffic_exchanges e
+                JOIN traffic_requests r ON r.request_id=e.request_id
+                JOIN traffic_responses p ON p.request_id=e.request_id
+                WHERE e.target_id=? AND e.package_id=? AND e.auth_state='ANONYMOUS'
+                  AND e.source='HACKBOT' AND e.capture_provider='HACKBOT'
+                  AND e.scope_result='IN_SCOPE' AND e.state='COMPLETE'
+                  AND r.method='GET' AND p.status_code IN (401,403)
+                ORDER BY e.observed_at DESC LIMIT 50""",
+                (run.target_id, run.package_id)).fetchall()
+        for row in rows:
+            refs = (row["request_ref"], row["response_ref"])
+            try:
+                observed = datetime.fromisoformat(row["observed_at"])
+                if not verified_at <= observed <= first_trial_at:
+                    continue
+                request = json.loads(engine.evidence.read_content(
+                    refs[0], allow_sensitive=True, max_bytes=4096))
+                url = request.get("url") if isinstance(request, dict) else None
+                parsed = urlsplit(url) if isinstance(url, str) else None
+                if (parsed is None or package.scope.evaluate_url(url).result
+                        is not ScopeResult.IN_SCOPE):
+                    continue
+                values = (*[unquote(part) for part in parsed.path.split("/")],
+                          *[value for key, value in parse_qsl(parsed.query,
+                                                               keep_blank_values=True)
+                            if key.lower().replace("-", "_") in {"id", "uuid", "object_id"}
+                            or key.lower().replace("-", "_").endswith("_id")])
+                if external in values:
+                    return True, refs
+            except (ValueError, UnicodeError, PermissionError, TypeError):
+                continue
+        return False, ()
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        run, frozen = context.run, context.plan.get("message_binding")
+        if engine.messages is None or engine.targets is None or not isinstance(frozen, dict):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "MESSAGE_VALIDATOR_DEPENDENCY_MISSING")
+        package = engine.targets.get_target_package(run.package_id)
+        candidate_id = frozen.get("candidate_id")
+        if (package is None or package.target.id != run.target_id
+                or not isinstance(candidate_id, str)
+                or not re.fullmatch(r"MSG-[0-9a-f]{32}", candidate_id)):
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_TARGET_OR_BINDING_INVALID")
+        candidate = engine.messages.get_candidate(run.target_id, candidate_id)
+        asset = engine.messages.current_asset(run.target_id, candidate_id)
+        route, asset_url = frozen.get("route_url"), frozen.get("asset_url")
+        window_mode = frozen.get("window_mode")
+        current = (candidate is not None and asset is not None
+                   and candidate.transport_kind == "WINDOW"
+                   and asset.recon_sha256 == asset.artifact_sha256
+                   and asset.artifact_sha256 in candidate.asset_hashes
+                   and isinstance(route, str) and isinstance(asset_url, str)
+                   and candidate.route == route and asset.asset_url_sha256 == _digest(asset_url)
+                   and package.scope.evaluate_url(route).result is ScopeResult.IN_SCOPE
+                   and package.scope.evaluate_url(asset_url).result is ScopeResult.IN_SCOPE)
+        current = (current and window_mode in {"IFRAME", "POPUP"}
+                   and (window_mode != "POPUP" or "OPENER" in candidate.sender_contexts))
+        checks = [_check("CURRENT_MESSAGING_BUNDLE", current,
+                         (asset.evidence_id,) if asset else ())]
+        if not current:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "MESSAGE_CURRENT_ASSET_UNVERIFIED", checks=tuple(checks))
+        assert candidate is not None and asset is not None
+        links = engine.messages.links(run.target_id, candidate_id)
+        if (links is None or links["hypothesis_id"] != run.hypothesis_id
+                or links["plan_id"] != run.plan_id or links["run_id"] != run.id):
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_AUDIT_BINDING_INVALID",
+                             checks=tuple(checks))
+        step = next((item for item in engine.runs.steps(run.id)
+                     if item.type == "VERIFY_BROWSER"), None)
+        result = engine.runs.result(step.id) if step else None
+        if (step is None or step.status is not RuntimeStepStatus.COMPLETED
+                or result is None or not 4 <= len(result.evidence_ids) <= 8):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "MESSAGE_BROWSER_CONTROLS_MISSING", checks=tuple(checks))
+        with engine.evidence._connection() as db:
+            dispatches = db.execute("""SELECT variant FROM plan_message_dispatches
+                WHERE run_id=? ORDER BY accounted_at,rowid""", (run.id,)).fetchall()
+        trials: list[dict[str, object]] = []
+        trial_times: list[datetime] = []
+        for ref in result.evidence_ids:
+            evidence = engine.evidence.get_evidence(ref)
+            if (evidence is None or evidence.target_ref != run.target_id
+                    or evidence.evidence_type != EvidenceType.MESSAGE_PROOF.value
+                    or evidence.source != "postmessage_browser"
+                    or evidence.provenance.record_id != candidate_id):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "MESSAGE_EVIDENCE_PROVENANCE_INVALID", checks=tuple(checks))
+            try:
+                trial = json.loads(engine.evidence.read_content(
+                    ref, allow_sensitive=True, max_bytes=8192))
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError, PermissionError):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "MESSAGE_EVIDENCE_UNREADABLE", checks=tuple(checks))
+            if (not isinstance(trial, dict) or trial.get("candidate_id") != candidate_id
+                    or trial.get("run_id") != run.id
+                    or trial.get("browser_session_id") != frozen.get("browser_session_id")
+                    or trial.get("route_sha256") != _digest(route)
+                    or trial.get("asset_sha256") != _digest(asset_url)
+                    or trial.get("owned_object_id") !=
+                    (frozen.get("owned_object_id") or None)
+                    or trial.get("owned_canary_sha256") !=
+                    (frozen.get("owned_canary_sha256") or None)
+                    or trial.get("victim_bundle_sha256") != asset.artifact_sha256
+                    or not re.fullmatch(r"MSGCTX-[0-9a-f]{32}", str(trial.get("context_id")))
+                    or type(trial.get("capability_observed")) is not bool
+                    or type(trial.get("source_attested")) is not bool
+                    or not self._trace_valid(trial, frozen.get("allowed_method") or None)
+                    or any(type(trial.get(name)) is not int or trial[name] < 0 or
+                           trial[name] > maximum for name, maximum in
+                           (("message_count", 3), ("port_count", 1), ("rpc_calls", 1),
+                            ("request_count", 24), ("denial_count", 24),
+                            ("rate_reserved_count", 24), ("rate_released_count", 24)))):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "MESSAGE_EVIDENCE_BINDING_INVALID", checks=tuple(checks))
+            trials.append(trial)
+            trial_times.append(evidence.created_at)
+        variants = [item["variant"] for item in trials]
+        order = (variants[:3] == ["NO_MESSAGE", "WRONG_TYPE", "TRUSTED"]
+                 and variants == [row["variant"] for row in dispatches]
+                 and variants[-1] in {"UNRELATED", "ATTACKER_PORT", "FRESH_REPRODUCTION",
+                                      "FRESH_WRONG_SOURCE", "LOOKALIKE_ORIGIN",
+                                      "FRESH_LOOKALIKE_ORIGIN"}
+                 and len(variants) == len(set(variants)))
+        checks.append(_check("MESSAGE_CONTROL_SEQUENCE", order, result.evidence_ids))
+        if not order:
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_CONTROL_SEQUENCE_INVALID",
+                             checks=tuple(checks))
+        policy_ok = True
+        with engine.evidence._connection() as db:
+            for trial in trials:
+                ids = trial.get("policy_decision_ids")
+                if (not isinstance(ids, list) or not 2 <= len(ids) <= 24
+                        or trial.get("rate_limiter") != "PHASE14_SHARED"
+                        or trial["request_count"] != len(ids)
+                        or trial["rate_reserved_count"] != trial["request_count"]
+                        or trial["rate_released_count"] != trial["rate_reserved_count"]
+                        or trial["denial_count"] or trial.get("error_code")):
+                    policy_ok = False
+                    break
+                navigations = 0
+                for decision_id in ids:
+                    row = db.execute("""SELECT d.result,d.scope_result,d.target_id,
+                        a.package_id,a.category,a.actor,a.method,a.source,a.vulnerability_class
+                        FROM policy_decisions d JOIN policy_actions a ON a.action_id=d.action_id
+                        WHERE d.decision_id=?""", (decision_id,)).fetchone()
+                    if (row is None or row["result"] != "ALLOW" or row["scope_result"] != "IN_SCOPE"
+                            or row["target_id"] != run.target_id
+                            or row["package_id"] != run.package_id
+                            or row["category"] not in {"BROWSER_NAVIGATION", "SAFE_READ"}
+                            or row["actor"] != ("AUTHENTICATED" if frozen.get("identity_id")
+                                                 else "ANONYMOUS")
+                            or row["method"] not in {"GET", "HEAD"}
+                            or row["source"] != "postmessage_browser"
+                            or row["vulnerability_class"] != "postmessage"):
+                        policy_ok = False
+                        break
+                    navigations += row["category"] == "BROWSER_NAVIGATION"
+                if not policy_ok or navigations < 1:
+                    policy_ok = False
+                    break
+        checks.append(_check("POLICY_SCOPE_EACH_TRIAL", policy_ok, result.evidence_ids))
+        if not policy_ok:
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_POLICY_AUDIT_INVALID",
+                             checks=tuple(checks))
+        controls = all(not item["capability_observed"] for item in trials[:2])
+        if candidate.port_accepted:
+            controls = controls and trials[1]["port_count"] == 1
+            if frozen.get("allowed_method"):
+                controls = controls and trials[1]["rpc_calls"] == 1
+        if "NO_PORT" in variants:
+            controls = controls and not trials[variants.index("NO_PORT")]["capability_observed"]
+        checks.append(_check("NO_MESSAGE_WRONG_TYPE_PORT_CONTROLS", controls,
+                             result.evidence_ids[:4]))
+        if not controls:
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_NEGATIVE_CONTROL_FAILED",
+                             checks=tuple(checks), contradicting=result.evidence_ids[:4])
+        proof_index = next((index for index, item in enumerate(trials)
+                            if item["variant"] in {"UNRELATED", "ATTACKER_PORT",
+                                                    "LOOKALIKE_ORIGIN"}
+                            and item["capability_observed"]), None)
+        if proof_index is None:
+            proof_index = next((index for index, item in enumerate(trials)
+                                if item["variant"] == "WRONG_SOURCE"
+                                and item["capability_observed"]), None)
+        if proof_index is None:
+            return _decision(ValidationStatus.REJECTED, "MESSAGE_UNTRUSTED_SENDER_DENIED",
+                             checks=tuple(checks), contradicting=result.evidence_ids)
+        proof = trials[proof_index]
+        attested = all(trials[index].get("source_attested") is True
+                       for index in (2, proof_index, len(trials) - 1)
+                       if index < len(trials))
+        checks.append(_check("FIXTURE_SENDER_WINDOW_ATTESTED", attested,
+                             (result.evidence_ids[proof_index],)))
+        if not attested:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "MESSAGE_SENDER_REFERENCE_UNVERIFIED", checks=tuple(checks))
+        source_only = proof["variant"] == "WRONG_SOURCE"
+        lookalike = proof["variant"] == "LOOKALIKE_ORIGIN"
+        expected_origin = f"{urlsplit(route).scheme}://{urlsplit(route).netloc}"
+        expected_probe_origin = None
+        if lookalike:
+            try:
+                expected_probe_origin = lookalike_origin(route, candidate.origin_validation)
+            except ValueError:
+                pass
+        expected_relationship = ("FIXTURE_OPENER_OF_VICTIM" if window_mode == "POPUP"
+                                 else "FIXTURE_PARENT_OF_VICTIM")
+        untrusted_context = (
+            proof.get("attacker_origin") == expected_origin
+            and proof.get("source_relationship") == "SIBLING_FRAME"
+            and "PARENT" in candidate.sender_contexts
+        ) if source_only else (
+            expected_probe_origin is not None
+            and proof.get("attacker_origin") == expected_probe_origin
+            and candidate.origin_validation in {"SUBSTRING", "STARTSWITH", "ENDSWITH",
+                                                "REGEX_REVIEW", "WEAK_COMPARISON"}
+            and package.scope.evaluate_url(proof["attacker_origin"] + "/").result
+            is not ScopeResult.IN_SCOPE
+            and proof.get("source_relationship") == expected_relationship
+        ) if lookalike else (
+            proof.get("attacker_origin") == "http://attacker.fixture.invalid"
+            and package.scope.evaluate_url(proof["attacker_origin"] + "/").result
+            is not ScopeResult.IN_SCOPE
+            and proof.get("source_relationship") == expected_relationship
+        )
+        checks.append(_check("UNTRUSTED_ORIGIN_OR_WINDOW", untrusted_context,
+                             (result.evidence_ids[proof_index],)))
+        if not untrusted_context:
+            return _decision(ValidationStatus.INVALID_TEST, "MESSAGE_ATTACKER_CONTEXT_INVALID",
+                             checks=tuple(checks))
+        if source_only and asset.source != "FIXTURE":
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "MESSAGE_SAME_ORIGIN_SENDER_CONTROL_UNPROVEN",
+                             checks=tuple(checks), supporting=result.evidence_ids)
+        dom_handoff = (DOMXSSValidator.message_handoff(engine, package, candidate,
+                                                       asset, frozen, proof)
+                       if proof.get("effect_kind") == "DOM_EXECUTION" else None)
+        def port_proof(trial: dict[str, object]) -> bool:
+            if not candidate.port_accepted or trial.get("effect_kind") == "DOM_EXECUTION":
+                return True
+            events = [entry[0] for entry in trial["event_trace"]]
+            if (trial.get("port_count") != 1 or trial.get("rpc_calls") != 1
+                    or "PORT_TRANSFERRED" not in events):
+                return False
+            if frozen.get("port_type") and (
+                    "READY_RECEIVED" not in events or
+                    events.index("READY_RECEIVED") > events.index("PORT_TRANSFERRED")):
+                return False
+            return True
+
+        owned = None
+        if proof.get("effect_kind") == "OWNED_DATA":
+            object_id = frozen.get("owned_object_id")
+            identity_id = frozen.get("identity_id")
+            if (isinstance(object_id, str) and isinstance(identity_id, str)
+                    and identity_id and frozen.get("allowed_method") == "readCanary"):
+                owned = verified_owned_canary(
+                    ObjectRegistry(engine.evidence), engine.evidence,
+                    target_id=run.target_id, package_id=run.package_id,
+                    plan_id=run.plan_id, run_id=run.id, identity_id=identity_id,
+                    object_id=object_id,
+                    canary_sha256=str(frozen.get("owned_canary_sha256") or ""),
+                    verified_at=str(frozen.get("owned_verified_at") or ""),
+                    active=False)
+            if owned is not None:
+                with engine.evidence._connection() as db:
+                    reservation = db.execute("SELECT created_at,expires_at,released_at "
+                        "FROM test_object_reservations WHERE test_object_id=? AND "
+                        "holder_run_id=? ORDER BY created_at DESC LIMIT 1",
+                        (owned.id, run.id)).fetchone()
+                try:
+                    reserved_at = datetime.fromisoformat(reservation["created_at"])
+                    expires_at = datetime.fromisoformat(reservation["expires_at"])
+                    released_at = (datetime.fromisoformat(reservation["released_at"])
+                                   if reservation["released_at"] else None)
+                    during_reservation = all(
+                        reserved_at <= moment <= expires_at and
+                        (released_at is None or moment <= released_at)
+                        for moment in trial_times)
+                except (TypeError, ValueError):
+                    during_reservation = False
+                if not during_reservation:
+                    owned = None
+        protected = (dom_handoff is not None if proof.get("effect_kind") == "DOM_EXECUTION"
+                     else proof.get("effect_kind") == "SYNTHETIC_DATA"
+                     and proof.get("effect_fingerprint") ==
+                     _digest("HACKBOT_SYNTHETIC_PRIVATE")
+                     and port_proof(proof)
+                     or proof.get("effect_kind") == "OWNED_DATA"
+                     and owned is not None
+                     and proof.get("effect_fingerprint") ==
+                     frozen.get("owned_canary_sha256")
+                     and port_proof(proof))
+        checks.append(_check("PROTECTED_MESSAGING_CAPABILITY", protected,
+                             (result.evidence_ids[proof_index],)))
+        if not protected:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "MESSAGE_CAPABILITY_IMPACT_UNCLASSIFIED", checks=tuple(checks))
+        if proof.get("effect_kind") == "SYNTHETIC_DATA":
+            fixture_only = asset.source == "FIXTURE"
+            checks.append(_check("SYNTHETIC_MARKER_FIXTURE_PROVENANCE", fixture_only,
+                                 (asset.evidence_id, result.evidence_ids[proof_index])))
+            if not fixture_only:
+                return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                                 "MESSAGE_SYNTHETIC_FIXTURE_ONLY", checks=tuple(checks),
+                                 supporting=result.evidence_ids)
+        privacy_refs: tuple[str, ...] = ()
+        if owned is not None and asset.source != "FIXTURE":
+            visibility, visibility_refs = engine.fact_value(
+                owned.id, "resource_visibility", run.target_id)
+            observed_denial, exchange_refs = self._owned_denial_exchange(
+                engine, run, owned, min(trial_times))
+            privacy_refs = tuple(dict.fromkeys((*visibility_refs, *exchange_refs)))
+            private = visibility == "PRIVATE" and observed_denial
+            checks.append(_check("OWNED_CANARY_PRIVATE_AND_PUBLIC_READ_DENIED",
+                                 private, privacy_refs))
+            if not private:
+                return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                                 "MESSAGE_OWNED_DATA_PRIVACY_UNPROVEN",
+                                 checks=tuple(checks), supporting=result.evidence_ids)
+        reproduction = trials[-1] if variants[-1] == (
+            "FRESH_WRONG_SOURCE" if source_only else
+            "FRESH_LOOKALIKE_ORIGIN" if lookalike else "FRESH_REPRODUCTION") else None
+        trusted = trials[2]
+        fresh = (reproduction is not None and trusted.get("capability_observed") is True
+                 and trusted.get("effect_kind") == proof.get("effect_kind")
+                 and port_proof(trusted)
+                 and (trusted.get("effect_fingerprint") != proof.get("effect_fingerprint")
+                      and DOMXSSValidator.message_handoff(engine, package, candidate,
+                                                           asset, frozen, trusted) == dom_handoff
+                      if dom_handoff else trusted.get("effect_fingerprint") ==
+                      proof.get("effect_fingerprint"))
+                 and reproduction.get("capability_observed") is True
+                 and reproduction.get("effect_kind") == proof.get("effect_kind")
+                 and port_proof(reproduction)
+                 and (reproduction.get("effect_fingerprint") != proof.get("effect_fingerprint")
+                      and DOMXSSValidator.message_handoff(engine, package, candidate,
+                                                           asset, frozen, reproduction) == dom_handoff
+                      if dom_handoff else reproduction.get("effect_fingerprint") ==
+                      proof.get("effect_fingerprint"))
+                 and reproduction.get("attacker_origin") == proof.get("attacker_origin")
+                 and reproduction.get("source_relationship") == proof.get("source_relationship")
+                 and reproduction.get("context_id") != proof.get("context_id")
+                 and len({item["context_id"] for item in trials}) == len(trials))
+        checks.append(_check("FRESH_MESSAGING_CONTEXT", fresh,
+                             (result.evidence_ids[proof_index], result.evidence_ids[-1])))
+        if not fresh or candidate.status is not MessageCandidateStatus.VALIDATION_READY:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "MESSAGE_FRESH_REPRODUCTION_MISSING", checks=tuple(checks))
+        map_ref = ()
+        if candidate.source_map_sha256:
+            with engine.evidence._connection() as db:
+                mapped = db.execute("""SELECT evidence_id FROM dom_source_maps WHERE target_id=?
+                    AND js_artifact_id=? AND map_sha256=? LIMIT 1""",
+                    (run.target_id, asset.artifact_id, candidate.source_map_sha256)).fetchone()
+            if mapped is None:
+                return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                                 "MESSAGE_SOURCE_MAP_PROVENANCE_MISSING", checks=tuple(checks))
+            map_ref = (mapped["evidence_id"],)
+        root_key = _digest("|".join((run.target_id, candidate.handler_fingerprint,
+                                      "MESSAGE_DOM_XSS" if dom_handoff else
+                                      "CROSS_ORIGIN_MESSAGE_CAPABILITY")))
+        surface = _digest("|".join((run.target_id, route,
+                                     ",".join(candidate.message_types))))
+        owned_disclosure = owned is not None and proof.get("effect_kind") == "OWNED_DATA"
+        finding = (FindingSpec(
+            "DOM_XSS", root_key, surface, "BROWSER_MESSAGE",
+            "Cross-origin message executes script in the target document",
+            "A controlled unauthorized browser context reached a Phase 21 HTML sink.",
+            "BROWSER_SCRIPT_EXECUTION_IN_TARGET_ORIGIN", preliminary_severity="MEDIUM")
+            if dom_handoff else FindingSpec(
+                "POSTMESSAGE", root_key, surface, "BROWSER_MESSAGE_PORT" if candidate.port_accepted
+                else "BROWSER_MESSAGE", "Untrusted window receives a protected messaging capability",
+                "A controlled unauthorized browser context received " +
+                ("a verified owned test-object canary." if owned_disclosure else
+                 "synthetic protected fixture data."),
+                "CROSS_ORIGIN_OWNED_TEST_DATA_DISCLOSURE" if owned_disclosure else
+                "CROSS_ORIGIN_SYNTHETIC_DATA_DISCLOSURE", preliminary_severity="MEDIUM"))
+        supporting = tuple(dict.fromkeys((*candidate.evidence_ids, asset.evidence_id,
+                                          *(dom_handoff.evidence_ids if dom_handoff else ()),
+                                          *(owned.verification_evidence_ids if owned else ()),
+                                          *privacy_refs,
+                                          *map_ref, *result.evidence_ids)))[:64]
+        impact = ("BROWSER_SCRIPT_EXECUTION_IN_TARGET_ORIGIN" if dom_handoff else
+                  "CROSS_ORIGIN_OWNED_TEST_DATA_DISCLOSURE" if owned_disclosure else
+                  "CROSS_ORIGIN_SYNTHETIC_DATA_DISCLOSURE")
+        return _decision(ValidationStatus.CONFIRMED,
+                         "DOM_MESSAGE_BROWSER_EXECUTION_REPRODUCED" if dom_handoff else
+                         "MESSAGE_CAPABILITY_REPRODUCED",
+                         checks=tuple(checks), controls=("NO_MESSAGE", "WRONG_TYPE", "TRUSTED",
+                                                         "NO_PORT" if candidate.port_accepted else "NO_PORT_NA",
+                                                         "WRONG_SOURCE" if source_only else
+                                                         "LOOKALIKE_ORIGIN" if lookalike
+                                                         else "UNRELATED_ORIGIN", "FRESH_CONTEXT"),
+                         supporting=supporting, reproductions=2,
+                         impact=impact, finding=finding)
+
+
 class DOMXSSValidator:
     id = "dom_xss_browser_execution"
     version = "1.0.0"
+
+    @staticmethod
+    def message_handoff(engine: DeterministicValidatorEngine, package, message_candidate,
+                        message_asset, frozen: dict[str, object], trial: dict[str, object]):
+        """Validate message-source execution against a current Phase 21 sink trace."""
+        field = frozen.get("dom_field")
+        if (engine.dom is None or not isinstance(field, str)
+                or field != engine.messages.dom_xss_field(package.target.id,
+                                                            message_candidate.candidate_id)
+                or trial.get("effect_kind") != "DOM_EXECUTION"
+                or trial.get("capability_observed") is not True
+                or not re.fullmatch(r"[0-9a-f]{64}", str(trial.get("effect_fingerprint")))
+                or trial.get("marker_context") not in {"MAIN", "IFRAME"}
+                or not isinstance(trial.get("document_origin"), str)
+                or trial["document_origin"] !=
+                f"{urlsplit(str(frozen.get('route_url'))).scheme}://"
+                f"{urlsplit(str(frozen.get('route_url'))).netloc}"
+                or package.scope.evaluate_url(trial["document_origin"] + "/").result
+                is not ScopeResult.IN_SCOPE):
+            return None
+        for candidate_id in engine.messages.dom_xss_handoffs(package.target.id,
+                                                               message_candidate.candidate_id):
+            flow = engine.dom.get_candidate(package.target.id, candidate_id)
+            flow_asset = engine.dom.candidate_asset(package.target.id, candidate_id)
+            if (flow is not None and flow_asset is not None
+                    and flow_asset.artifact_id == message_asset.artifact_id
+                    and flow.asset_sha256 == message_asset.artifact_sha256
+                    and flow.source in {f"event.data.{field}", f"e.data.{field}",
+                                        f"messageEvent.data.{field}"}
+                    and flow.sink_kind == "HTML_EXECUTION"
+                    and not flow.sanitizers and not flow.post_checks
+                    and not flow.unresolved_helper):
+                return flow
+        return None
 
     def evaluate(self, context: ValidationContext,
                  engine: DeterministicValidatorEngine) -> ValidatorDecision:

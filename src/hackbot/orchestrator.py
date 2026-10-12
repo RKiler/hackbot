@@ -19,6 +19,9 @@ from .object_recipes import RecipeCatalog, json_pointer, unique_json_pairs
 from .auth import AuthMechanism, AuthStatus
 from .domxss_browser import (DOMBrowserExperimentExecutor, DOMExperimentBinding,
                              DOMInputKind)
+from .postmessage_browser import (PostMessageBrowserExperimentExecutor,
+                                  MessageExperimentBinding)
+from .browser import BrowserError
 from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from .executor import ExecutionError, ExecutionResult, RequestTemplate, TrafficExecutor
 from .hypotheses import HypothesisStore
@@ -75,7 +78,8 @@ class PlanOrchestrator:
                  evidence: EvidenceFactStore, objects: ObjectRegistry | None = None,
                  recipes: RecipeCatalog | None = None,
                  mutations: MutationResultStore | None = None,
-                 dom: DOMBrowserExperimentExecutor | None = None) -> None:
+                 dom: DOMBrowserExperimentExecutor | None = None,
+                 messages: PostMessageBrowserExperimentExecutor | None = None) -> None:
         self.runs, self.targets, self.hypotheses = runs, targets, hypotheses
         self.context, self.checker, self.registry = context, checker, registry
         self.policy, self.approvals, self.executor = policy, approvals, executor
@@ -84,6 +88,7 @@ class PlanOrchestrator:
         self.recipes = recipes
         self.mutations = mutations
         self.dom = dom
+        self.messages = messages
 
     @staticmethod
     def _requirements(snapshot: PlanSnapshot, registry: SkillRegistry) -> tuple[tuple[str, ...], str]:
@@ -549,7 +554,51 @@ class PlanOrchestrator:
                 return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
                                     reason="DOM_CONTROLS_FROZEN", result=self._result(
                                         step, "Inert, benign, direct-dangerous, and transform-derived controls frozen."))
+            if (step.type == RuntimeStepType.ESTABLISH_CONTROL.value
+                    and snapshot.data.get("skill_id") == "postmessage-trust-analysis"
+                    and isinstance(snapshot.data.get("message_binding"), dict)):
+                return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                    reason="MESSAGE_CONTROLS_FROZEN", result=self._result(
+                                        step, "No-message, wrong-type, trusted, foreign-origin, source, and port controls frozen."))
             if step.type == RuntimeStepType.VERIFY_BROWSER.value:
+                if snapshot.data.get("skill_id") == "postmessage-trust-analysis":
+                    frozen = snapshot.data.get("message_binding")
+                    if self.messages is None or not isinstance(frozen, dict):
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="MESSAGE_EXECUTOR_UNAVAILABLE", waiting=RunStatus.BLOCKED)
+                    try:
+                        binding = MessageExperimentBinding(
+                            candidate_id=frozen["candidate_id"], run_id=run.id,
+                            browser_session_id=frozen["browser_session_id"],
+                            route_url=frozen["route_url"], asset_url=frozen["asset_url"],
+                            activation_type=frozen["activation_type"],
+                            port_type=frozen["port_type"] or None,
+                            allowed_method=frozen["allowed_method"] or None,
+                            identity_id=frozen["identity_id"] or None,
+                            window_mode=frozen["window_mode"],
+                            dom_field=frozen.get("dom_field") or None,
+                            owned_object_id=frozen.get("owned_object_id") or None,
+                            owned_canary_sha256=frozen.get("owned_canary_sha256") or None,
+                            owned_verified_at=frozen.get("owned_verified_at") or None,
+                        )
+                        proof = self.messages.run(run.package_id, binding)
+                    except (BrowserError, KeyError, TypeError, ValueError):
+                        consumed = self.runs.message_dispatch_count(run.id, step.id)
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="MESSAGE_RUNTIME_PREREQUISITE_FAILED",
+                                            waiting=RunStatus.BLOCKED, consumed=consumed)
+                    refs = tuple(item.evidence_id for item in proof.trials)
+                    if proof.status == "BLOCKED":
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="MESSAGE_BROWSER_POLICY_BLOCKED",
+                                            waiting=RunStatus.BLOCKED,
+                                            result=self._result(step, "Messaging browser proof blocked.",
+                                                                evidence_ids=refs),
+                                            consumed=len(proof.trials))
+                    return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                        reason="MESSAGE_BROWSER_" + proof.status,
+                                        result=self._result(step, "Bounded messaging browser result: " + proof.status,
+                                                            evidence_ids=refs), consumed=len(proof.trials))
                 frozen = snapshot.data.get("dom_binding")
                 if (self.dom is None or snapshot.data.get("skill_id") != "check-before-transform-dom-xss"
                         or not isinstance(frozen, dict)):
@@ -580,6 +629,17 @@ class PlanOrchestrator:
                                     result=self._result(step, "Bounded DOM browser result: " + proof.status,
                                                         evidence_ids=refs), consumed=len(proof.trials))
             if step.type == RuntimeStepType.COMPARE_METADATA.value:
+                if snapshot.data.get("skill_id") == "postmessage-trust-analysis":
+                    proof_step = next((item for item in self.runs.steps(run.id)
+                                       if item.type == RuntimeStepType.VERIFY_BROWSER.value), None)
+                    proof_result = self.runs.result(proof_step.id) if proof_step else None
+                    if proof_result is None:
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="MESSAGE_PROOF_RESULT_MISSING", waiting=RunStatus.BLOCKED)
+                    return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                        reason="MESSAGE_CONTROLS_COMPARED",
+                                        result=self._result(step, "Messaging controls and proof metadata recorded.",
+                                                            evidence_ids=proof_result.evidence_ids))
                 if snapshot.data.get("skill_id") == "check-before-transform-dom-xss":
                     proof_step = next((item for item in self.runs.steps(run.id)
                                        if item.type == RuntimeStepType.VERIFY_BROWSER.value), None)
