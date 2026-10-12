@@ -45,6 +45,7 @@ class RuntimeStepType(StrEnum):
     COMPARE_METADATA = "COMPARE_METADATA"
     WAIT_APPROVAL = "WAIT_APPROVAL"
     MANUAL_REVIEW = "MANUAL_REVIEW"
+    VERIFY_BROWSER = "VERIFY_BROWSER"
 
 
 class RuntimeStepStatus(StrEnum):
@@ -432,6 +433,48 @@ class PlanRunStore:
                        "WHERE run_id=?", (_now(), run_id))
             self._event(db, run_id, step_id, "DISPATCH_ACCOUNTED", "BUDGET_RESERVED")
             return not row["pause_requested"] and not row["cancel_requested"]
+
+    def account_dom_dispatch(self, run_id: str, step_id: str, variant: str) -> bool:
+        if variant not in {"INERT", "BENIGN", "DIRECT_DANGEROUS", "ENCODED_ONCE",
+                           "ENCODED_TWICE", "FRESH_REPRODUCTION"}:
+            raise ValueError("Invalid DOM browser variant")
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("""
+                SELECT status,current_step,requests_consumed,request_budget,
+                       pause_requested,cancel_requested FROM plan_runs WHERE run_id=?
+            """, (run_id,)).fetchone()
+            step = db.execute("""
+                SELECT ordinal,status,step_type FROM plan_run_steps
+                WHERE step_id=? AND run_id=?
+            """, (step_id, run_id)).fetchone()
+            if (run is None or step is None or run["status"] != "RUNNING"
+                    or step["status"] != "EXECUTING" or step["step_type"] != "VERIFY_BROWSER"
+                    or step["ordinal"] != run["current_step"]
+                    or run["pause_requested"] or run["cancel_requested"]
+                    or run["requests_consumed"] >= run["request_budget"]
+                    or db.execute("""
+                        SELECT 1 FROM plan_dom_dispatches
+                        WHERE run_id=? AND step_id=? AND variant=?
+                    """, (run_id, step_id, variant)).fetchone() is not None):
+                return False
+            now = _now()
+            db.execute("""
+                INSERT INTO plan_dom_dispatches(run_id,step_id,variant,accounted_at)
+                VALUES (?,?,?,?)
+            """, (run_id, step_id, variant, now))
+            db.execute("""
+                UPDATE plan_runs SET requests_consumed=requests_consumed+1,updated_at=?
+                WHERE run_id=?
+            """, (now, run_id))
+            self._event(db, run_id, step_id, "DISPATCH_ACCOUNTED", "DOM_BROWSER_NAVIGATION")
+            return True
+
+    def dom_dispatch_count(self, run_id: str, step_id: str) -> int:
+        with self.store._connection() as db:
+            return db.execute("""
+                SELECT count(*) FROM plan_dom_dispatches WHERE run_id=? AND step_id=?
+            """, (run_id, step_id)).fetchone()[0]
 
     def policy(self, run_id: str, step_id: str, decision_id: str,
                approval_id: str | None, reason: str) -> None:

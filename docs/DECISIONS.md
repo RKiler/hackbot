@@ -224,3 +224,12 @@ integration decisions, not silent defaults.
 | D-104 | Bind nested and mixed-batch tests only to exact observed read-only operations and known, Fact-backed ObjectRegistry IDs; keep the executable batch to two IDs. | This expands Phase 19's manual-only nested lead without enabling ID guessing or mass batch mutation. |
 | D-105 | Inject only recipe-declared CSRF headers via a trusted executor-side resolver; do not put token values into plans, skill context, results, or dashboard metadata. | Captured tokens can be stale, and token resolution is a trusted execution capability, not reasoning input. |
 | D-106 | Expose Phase 20 metadata through the private BugHunter API and render only redacted summaries in the existing authenticated recon dashboard gateway; keep gateway routes and service configuration unchanged. | The Phase 20 dashboard requirement is an explicit integration task, while the security controls and persistence remain BugHunter-owned. |
+
+## Phase 21
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-107 | Keep DOM XSS artifact, analysis, candidate, and trial state in BugHunter SQLite schema 17; obtain current JS and directly referenced maps only through the controlled executor and preserve content-addressed protected Evidence. | Recon stores metadata, not authoritative raw bodies; hash drift must invalidate stale traces without duplicating the recon corpus. |
+| D-108 | Use bounded Babel AST function-local tracing and source maps as candidate evidence; require an observed in-scope page route and frozen Phase 12/15/16 bindings before active proof. | Static source/sink strings, source maps, and inferred routes do not demonstrate reachability or authorization. |
+| D-109 | Permit only fixed harmless, transform-driven browser variants under Phase 13 scope/policy, a six-navigation plan cap, fresh contexts, and exact loaded-bundle hash checks; prohibit arbitrary browser evaluation. | Real browser interpretation is required, but payload spraying, stale bundles, unscoped redirects, and automation-created markers are not acceptable proof. |
+| D-110 | Let Phase 17 alone confirm DOM XSS after controls, policy audit, target-origin marker execution, and fresh reproduction; pin supporting Evidence and expose only target-scoped metadata through the private control plane. | The confirmed Finding must have a durable candidate-to-validation audit chain, while the existing gateway remains responsible for browser authentication and CSRF. |

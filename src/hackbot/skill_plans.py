@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from itertools import combinations
+import hashlib
 import json
 import re
 from typing import Any
@@ -13,6 +14,8 @@ from urllib.parse import urlsplit
 import uuid
 
 from .authorization_binding import reference_fingerprint
+from .domxss_static import DOMCandidateStatus
+from .domxss_store import DOMXSSStore
 from .mutation_binding import MutationStage, STAGES, mutation_fingerprint
 from .executor import RequestTemplate
 from .hypotheses import Hypothesis
@@ -25,6 +28,7 @@ from .recon import ReconRepository
 from .skills import SkillMetadata, SkillRegistry
 from .store import EvidenceFactStore
 from .target_package import PackageStatus, TargetPackage
+from .target_scope import ScopeResult
 from .traffic import TrafficStore
 from .test_objects import ObjectRegistry, ObjectState
 
@@ -99,13 +103,15 @@ class SkillContextBuilder:
     def __init__(self, store: EvidenceFactStore, registry: IdentityRegistry,
                  traffic: TrafficStore, browser: Any | None = None,
                  recon: ReconRepository | None = None,
-                 objects: ObjectRegistry | None = None) -> None:
+                 objects: ObjectRegistry | None = None,
+                 dom: DOMXSSStore | None = None) -> None:
         self.store = store
         self.registry = registry
         self.traffic = traffic
         self.browser = browser
         self.recon = recon
         self.objects = objects
+        self.dom = dom
 
     def build(self, hypothesis: Hypothesis, profile: TargetProfile | None,
               package: TargetPackage | None = None,
@@ -215,16 +221,35 @@ class SkillContextBuilder:
             flags.add("graphql_operation")
         if "API_GRAPHQL_MUTATION" in signals or hypothesis.category == "GRAPHQL_MUTATION":
             flags.add("graphql_mutation")
-        if any(s.startswith("JS_") for s in signals):
+        if hypothesis.category != "DOM_XSS" and any(s.startswith("JS_") for s in signals):
             flags.add("current_js")  # Still requires current-bundle validation later.
         if "JS_POSTMESSAGE" in signals:
             flags.add("message_listener")
-        if "JS_DOM_SINK" in signals:
+        if hypothesis.category != "DOM_XSS" and "JS_DOM_SINK" in signals:
             flags.add("dangerous_dom_sink")
-        if "JS_DECODER" in signals:
+        if hypothesis.category != "DOM_XSS" and "JS_DECODER" in signals:
             flags.add("transformation_trace")
-        if "JS_SOURCE" in signals:
+        if hypothesis.category != "DOM_XSS" and "JS_SOURCE" in signals:
             flags.add("attacker_controlled_source")
+        if (self.dom is not None and hypothesis.category == "DOM_XSS"
+                and re.fullmatch(r"js:DOM-[0-9a-f]{32}", hypothesis.surface_key)):
+            candidate_id = hypothesis.surface_key[3:]
+            candidate = self.dom.get_candidate(hypothesis.target_id, candidate_id)
+            artifact = self.dom.candidate_asset(hypothesis.target_id, candidate_id)
+            if (candidate is not None and artifact is not None and artifact.state == "CURRENT"
+                    and artifact.recon_sha256 == artifact.artifact_sha256
+                    and candidate.asset_sha256 == artifact.artifact_sha256
+                    and candidate.status in {DOMCandidateStatus.STATICALLY_SUPPORTED,
+                                             DOMCandidateStatus.RUNTIME_READY,
+                                             DOMCandidateStatus.RUNTIME_TESTED,
+                                             DOMCandidateStatus.VALIDATION_READY}):
+                flags.add("current_js")
+                if candidate.attacker_controlled:
+                    flags.add("attacker_controlled_source")
+                if candidate.transforms and candidate.check_before_transform:
+                    flags.add("transformation_trace")
+                if candidate.sink_kind in {"HTML_EXECUTION", "URL_RESOURCE", "NAVIGATION_URL"}:
+                    flags.add("dangerous_dom_sink")
         if "FEATURE_DOWNLOAD" in signals or "FEATURE_PII_OBJECT" in signals:
             flags.add("sensitive_artifact")  # Candidate only, never secret bytes.
         if any(f["predicate"] == "data_classification" and f["status"] == "ACTIVE"
@@ -340,6 +365,7 @@ class InvestigationPlan:
     status: str
     created_at: str
     comparison_pairs: tuple[dict[str, int], ...] = ()
+    dom_binding: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
@@ -359,6 +385,7 @@ class InvestigationPlan:
                 "request_budget": self.request_budget, "token_budget": self.token_budget,
                 "expected_request_count": len(self.proposed_actions), "status": self.status,
                 "created_at": self.created_at, "comparison_pairs": list(self.comparison_pairs),
+                "dom_binding": self.dom_binding,
                 "execution_started": False, "finding_status": "UNVALIDATED"}
 
 
@@ -398,6 +425,17 @@ class TypedMutationPlanBinding:
     boundary_identity_id: str
     boundary_session_id: str
     boundary: str
+
+
+@dataclass(frozen=True, slots=True)
+class DOMPlanBinding:
+    candidate_id: str
+    route_url: str
+    asset_url: str
+    browser_session_id: str
+    identity_id: str | None
+    input_kind: str
+    input_name: str | None = None
 
 
 class SkillPlanStore:
@@ -460,8 +498,80 @@ def _safe_plan_values(value: object) -> bool:
 
 class SkillPlanner:
     def __init__(self, registry: SkillRegistry, checker: PrerequisiteChecker,
-                 policy: PolicyEngine, store: SkillPlanStore) -> None:
+                 policy: PolicyEngine, store: SkillPlanStore,
+                 dom: DOMXSSStore | None = None) -> None:
         self.registry, self.checker, self.policy, self.store = registry, checker, policy, store
+        self.dom = dom
+
+    def bind_dom(self, package: TargetPackage, hypothesis: Hypothesis,
+                 context: SkillContext, binding: DOMPlanBinding) -> dict[str, object]:
+        if (self.dom is None or hypothesis.target_id != package.target.id
+                or context.target_id != package.target.id or hypothesis.category != "DOM_XSS"
+                or hypothesis.surface_key != "js:" + binding.candidate_id
+                or binding.input_kind not in {"QUERY", "FRAGMENT"}
+                or (binding.input_kind == "QUERY" and
+                    (not binding.input_name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,39}",
+                                                             binding.input_name)))
+                or (binding.input_kind == "FRAGMENT" and binding.input_name is not None)):
+            raise ValueError("DOM plan binding is invalid")
+        candidate = self.dom.get_candidate(package.target.id, binding.candidate_id)
+        artifact = self.dom.candidate_asset(package.target.id, binding.candidate_id)
+        if (candidate is None or artifact is None or artifact.state != "CURRENT"
+                or artifact.recon_sha256 != artifact.artifact_sha256
+                or candidate.asset_sha256 != artifact.artifact_sha256
+                or candidate.route != binding.route_url
+                or hashlib.sha256(binding.asset_url.encode()).hexdigest() != artifact.asset_url_sha256
+                or (binding.input_kind == "QUERY" and candidate.source != "location.search")
+                or (binding.input_kind == "FRAGMENT" and candidate.source != "location.hash")
+                or candidate.status not in {DOMCandidateStatus.STATICALLY_SUPPORTED,
+                                            DOMCandidateStatus.RUNTIME_READY}):
+            raise ValueError("DOM candidate is stale or route is unbound")
+        skill = self.registry.select("check-before-transform-dom-xss")
+        prereq = self.checker.check(skill.metadata, context)
+        if prereq.state is not PrerequisiteState.READY:
+            raise ValueError("DOM prerequisites are not current")
+        route = urlsplit(binding.route_url)
+        asset_url = urlsplit(binding.asset_url)
+        if (route.scheme not in {"http", "https"} or not route.hostname
+                or route.username or route.password or route.query or route.fragment
+                or asset_url.username or asset_url.password or asset_url.query or asset_url.fragment
+                or package.scope.evaluate_url(binding.route_url).result is not ScopeResult.IN_SCOPE
+                or package.scope.evaluate_url(binding.asset_url).result is not ScopeResult.IN_SCOPE):
+            raise ValueError("DOM browser route or bundle is out of scope")
+        action = ProposedAction(
+            target_id=package.target.id, package_id=package.id,
+            category=ActionCategory.BROWSER_NAVIGATION,
+            actor=ActorMode.AUTHENTICATED if binding.identity_id else ActorMode.ANONYMOUS,
+            source="domxss_plan", purpose="Simulate bounded DOM browser navigation",
+            url=binding.route_url, method="GET", identity_id=binding.identity_id,
+            session_id=binding.browser_session_id if binding.identity_id else None,
+            hypothesis_id=hypothesis.id, vulnerability_class="dom_xss",
+        )
+        decision = self.policy.evaluate(package, action, record=False)
+        if decision.result.value != "ALLOW":
+            raise ValueError("DOM browser navigation is not policy-allowed")
+        frozen = {"candidate_id": binding.candidate_id, "route_url": binding.route_url,
+                  "asset_url": binding.asset_url,
+                  "browser_session_id": binding.browser_session_id,
+                  "identity_id": binding.identity_id or "",
+                  "input_kind": binding.input_kind,
+                  "input_name": binding.input_name or ""}
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prereq,
+            skill.controls,
+            tuple((StepType(kind), description) for kind, description in skill.workflow),
+            (), (), skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, skill.metadata.request_budget,
+            skill.metadata.token_budget, "READY_FOR_MANUAL_REVIEW",
+            datetime.now(timezone.utc).isoformat(), dom_binding=frozen,
+        )
+        result = self.store.save(plan, regenerate=True)
+        self.dom.bind_plan(package.target.id, binding.candidate_id, hypothesis.id, result["id"])
+        return result
 
     @staticmethod
     def _template(context: SkillContext) -> RequestTemplate | None:

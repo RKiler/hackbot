@@ -22,5 +22,5 @@ hackbot = "hackbot.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hackbot = ["migrations/*.sql", "skill_catalog/core/*/*/SKILL.md",
+hackbot = ["migrations/*.sql", "dom_ast.cjs", "dom_map.cjs", "ui/*", "skill_catalog/core/*/*/SKILL.md",
            "skill_catalog/imported/*/SKILL.md", "skill_catalog/personal/*/SKILL.md"]

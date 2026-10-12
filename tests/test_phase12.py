@@ -83,6 +83,13 @@ class FixtureRecon:
                              1024, 200, prov("js_assets", 51))] if host_id == 1 else []
         return Page(tuple(rows[:limit]), None)
 
+    def get_js_asset(self, domain_id, asset_id):
+        self.calls.append(("get_js_asset", asset_id))
+        if asset_id == 51:
+            return ReconJsAsset(51, 1, "https://api.example.test/static/app.js", "a" * 64,
+                                1024, 200, prov("js_assets", 51))
+        return None
+
     def get_js_analysis(self, domain_id, asset_id):
         self.calls.append(("get_js_analysis", asset_id))
         return ReconJsAnalysis(61, asset_id, 1000, {"graphql_operations": 2,

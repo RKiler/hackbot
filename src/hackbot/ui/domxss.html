@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="">
+  <title>DOM XSS | BugHunter</title>
+  <link rel="stylesheet" href="/domxss/assets/domxss.css">
+  <script src="/domxss/assets/domxss.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">BH</span><span>BugHunter</span><span class="section-name">DOM XSS</span></div>
+    <div class="top-actions">
+      <label for="target">Target</label>
+      <select id="target" aria-label="Target package"></select>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <div class="page-heading">
+      <div><p class="eyebrow">Client-side research</p><h1>DOM XSS</h1></div>
+      <p id="status" role="status" aria-live="polite"></p>
+    </div>
+    <div id="metrics" class="metrics" aria-label="Target metrics"></div>
+    <div class="tabs" role="tablist" aria-label="DOM XSS views">
+      <button class="tab active" type="button" data-tab="candidates" role="tab" aria-selected="true">Candidates</button>
+      <button class="tab" type="button" data-tab="assets" role="tab" aria-selected="false">Assets</button>
+    </div>
+    <section id="candidates-panel" class="workspace" aria-label="Candidates">
+      <div class="list-pane">
+        <div class="pane-heading"><h2>Candidate queue</h2><button id="next-page" type="button" disabled>Next</button></div>
+        <div class="table-scroll"><table><thead><tr><th>Score</th><th>Source → sink</th><th>Status</th><th>Asset</th></tr></thead><tbody id="candidate-rows"></tbody></table></div>
+      </div>
+      <div class="detail-pane">
+        <div class="pane-heading"><h2>Investigation</h2><span id="candidate-id" class="mono"></span></div>
+        <div id="candidate-empty" class="empty">Select a candidate.</div>
+        <div id="candidate-detail" hidden>
+          <div id="flow" class="flow"></div>
+          <dl id="candidate-facts" class="facts"></dl>
+          <h3>Evidence and run</h3>
+          <div id="run-status" class="run-status"></div>
+          <div id="trials" class="trials"></div>
+          <div id="evidence" class="evidence"></div>
+          <h3>Actions</h3>
+          <div class="controls">
+            <label>Observed page exchange ID<input id="exchange-id" autocomplete="off" spellcheck="false" placeholder="EXCHANGE-…"></label>
+            <button id="bind-route" type="button">Link page</button>
+            <button id="prepare" type="button">Prepare</button>
+            <label>Browser session<select id="browser-session"></select></label>
+            <label>Input kind<select id="input-kind"><option value="QUERY">Query</option><option value="FRAGMENT">Fragment</option></select></label>
+            <label>Input name<input id="input-name" autocomplete="off" spellcheck="false" placeholder="next"></label>
+            <button id="bind-plan" type="button">Bind plan</button>
+            <button id="start-run" type="button">Start run</button>
+            <button id="advance-run" type="button">Advance</button>
+            <button id="validate-run" type="button">Validate</button>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="assets-panel" class="assets-panel" aria-label="Assets" hidden>
+      <div class="pane-heading"><h2>Ranked JavaScript assets</h2><span id="asset-total"></span></div>
+      <div class="table-scroll"><table><thead><tr><th>Score</th><th>Host</th><th>Response hash</th><th>Signals</th><th></th></tr></thead><tbody id="asset-rows"></tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>

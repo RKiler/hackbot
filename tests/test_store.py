@@ -58,7 +58,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 16)
+        self.assertEqual(version, 17)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -80,6 +80,9 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-local-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            for table in ("dom_candidate_events", "plan_dom_dispatches", "dom_flow_candidates",
+                          "dom_analysis_runs", "dom_source_maps", "dom_js_artifacts"):
+                connection.execute(f"DROP TABLE {table}")
             connection.execute("DROP TABLE authorization_mutation_results")
             for table in ("authorization_hunt_objects", "authorization_observations",
                           "authorization_hunt_candidates", "authorization_candidates",
@@ -89,7 +92,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=14")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 16)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 17)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)

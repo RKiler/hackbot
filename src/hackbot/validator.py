@@ -9,9 +9,12 @@ import json
 import re
 import uuid
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from .domain import ObservationState
-from .evidence import Fact, FactStatus
+from .evidence import EvidenceType, Fact, FactStatus, Retention
+from .domxss_static import DOMCandidateStatus
+from .domxss_store import DOMXSSStore
 from .hypotheses import HypothesisStore
 from .identity import MembershipStatus
 from .identity_registry import IdentityRegistry
@@ -20,6 +23,8 @@ from .typed_mutations import MutationPhase
 from .plan_runs import PlanRun, PlanRunStore, RunStatus, RuntimeStep, RuntimeStepStatus
 from .response_compare import ResponseComparator, ResponseFeatures
 from .store import EvidenceFactStore
+from .target_loader import TargetPackageRepository
+from .target_scope import ScopeResult
 from .traffic import AuthState, ExchangeState, TrafficExchange, TrafficStore
 from .validation_store import (CheckOutcome, FindingSpec, ValidationCheck,
                                ValidationResult, ValidationStatus, ValidationStore)
@@ -140,7 +145,8 @@ class ValidatorRegistry:
         for name in _EXPOSURE_SKILLS:
             self._items[name] = ExposureValidator(name == "sensitive-data-exposure")
         for name in _CLIENT_SKILLS:
-            self._items[name] = ClientSideValidator(name)
+            self._items[name] = (DOMXSSValidator() if name == "check-before-transform-dom-xss"
+                                 else ClientSideValidator(name))
         self._items["internal-surface-candidate"] = InternalSurfaceValidator()
         self._items["typed-authorization-mutation"] = TypedMutationValidator()
         self._items["batch-object-authorization"] = BatchReadValidator()
@@ -156,11 +162,15 @@ class DeterministicValidatorEngine:
     def __init__(self, *, runs: PlanRunStore, traffic: TrafficStore,
                  evidence: EvidenceFactStore, identities: IdentityRegistry,
                  hypotheses: HypothesisStore, results: ValidationStore,
-                 registry: ValidatorRegistry | None = None) -> None:
+                 registry: ValidatorRegistry | None = None,
+                 dom: DOMXSSStore | None = None,
+                 targets: TargetPackageRepository | None = None) -> None:
         self.runs, self.traffic, self.evidence = runs, traffic, evidence
         self.identities, self.hypotheses, self.results = identities, hypotheses, results
         self.registry = registry or ValidatorRegistry()
         self.comparator = ResponseComparator(evidence)
+        self.dom = dom
+        self.targets = targets
 
     def _semantic_object_hash(self, run: PlanRun, salted_hash: str | None,
                               object_type: str | None) -> str | None:
@@ -301,6 +311,14 @@ class DeterministicValidatorEngine:
         observations: list[Observation] = []
         snap_parts = [run.id, run.snapshot_hash, run.status.value]
         for step in self.runs.steps(run.id):
+            if step.type == "VERIFY_BROWSER":
+                result = self.runs.result(step.id)
+                snap_parts.append(step.id + ":" + (result.id if result else "MISSING"))
+                if result:
+                    for ref in result.evidence_ids:
+                        item = self.evidence.get_evidence(ref)
+                        snap_parts.append(ref + ":" + (item.content_hash if item else "MISSING"))
+                continue
             if step.type != "EXECUTE_REQUEST":
                 continue
             result = self.runs.result(step.id)
@@ -420,7 +438,18 @@ class DeterministicValidatorEngine:
              "NEEDS_MANUAL_REVIEW": "Evidence requires independent researcher review.",
              "INSUFFICIENT_EVIDENCE": "Required protected evidence is missing."}[decision.status.value],
             _now())
-        return self.results.record(result, decision.finding)
+        recorded, finding = self.results.record(result, decision.finding)
+        if self.dom is not None and run.skill_id == "check-before-transform-dom-xss":
+            binding = context.plan.get("dom_binding")
+            if isinstance(binding, dict) and isinstance(binding.get("candidate_id"), str):
+                self.dom.bind_validation(run.target_id, binding["candidate_id"],
+                                         run.id, recorded.id)
+                if recorded.status is ValidationStatus.CONFIRMED and finding is not None:
+                    for ref in recorded.supporting_evidence_ids:
+                        self.evidence.set_retention(
+                            ref, Retention(retain=True, pinned=True, finding_related=True),
+                            actor="dom_xss_validator", reason="confirmed_dom_xss_finding")
+        return recorded, finding
 
     def record_manual(self, run_id: str, target_id: str, status: ValidationStatus,
                       evidence_ids: tuple[str, ...], reason_code: str) -> ValidationResult:
@@ -1155,6 +1184,229 @@ class ExposureValidator:
                          checks=tuple(checks), controls=("OWNER_CONTROL", "INVALID_OBJECT"),
                          supporting=evidence, reproductions=len(matches),
                          impact="ANONYMOUS_PROTECTED_CONTENT_READ", finding=finding)
+
+
+class DOMXSSValidator:
+    id = "dom_xss_browser_execution"
+    version = "1.0.0"
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        run, frozen = context.run, context.plan.get("dom_binding")
+        if engine.dom is None or engine.targets is None or not isinstance(frozen, dict):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "DOM_VALIDATOR_DEPENDENCY_MISSING")
+        package = engine.targets.get_target_package(run.package_id)
+        if package is None or package.target.id != run.target_id:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "DOM_TARGET_PACKAGE_MISSING")
+        candidate_id = frozen.get("candidate_id")
+        if not isinstance(candidate_id, str) or not re.fullmatch(r"DOM-[0-9a-f]{32}", candidate_id):
+            return _decision(ValidationStatus.INVALID_TEST, "DOM_PLAN_BINDING_INVALID")
+        candidate = engine.dom.get_candidate(run.target_id, candidate_id)
+        asset = engine.dom.candidate_asset(run.target_id, candidate_id)
+        if candidate is None or asset is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "DOM_STATIC_TRACE_MISSING")
+        route, asset_url = frozen.get("route_url"), frozen.get("asset_url")
+        current = (asset.state == "CURRENT" and asset.recon_sha256 == asset.artifact_sha256
+                   and candidate.asset_sha256 == asset.artifact_sha256
+                   and isinstance(route, str) and isinstance(asset_url, str)
+                   and candidate.route == route
+                   and not urlsplit(asset_url).query and not urlsplit(asset_url).fragment
+                   and asset.asset_url_sha256 == _digest(asset_url)
+                   and package.scope.evaluate_url(route).result is ScopeResult.IN_SCOPE
+                   and package.scope.evaluate_url(asset_url).result is ScopeResult.IN_SCOPE)
+        trace = (candidate.attacker_controlled and candidate.check_before_transform
+                 and bool(candidate.validation) and bool(candidate.transforms)
+                 and candidate.sink_kind in {"HTML_EXECUTION", "URL_RESOURCE", "NAVIGATION_URL"}
+                 and not candidate.post_checks and not candidate.sanitizers
+                 and not candidate.unresolved_helper)
+        checks = [_check("CURRENT_JS_ASSET", current, (asset.evidence_id,)),
+                  _check("SOURCE_SINK_TRACE", trace, candidate.evidence_ids[:4])]
+        if not current or not trace:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "DOM_CURRENT_TRACE_UNVERIFIED", checks=tuple(checks))
+        with engine.evidence._connection() as db:
+            link = db.execute("""
+                SELECT hypothesis_id,plan_id,run_id FROM dom_flow_candidates
+                WHERE target_id=? AND candidate_id=?
+            """, (run.target_id, candidate_id)).fetchone()
+            dispatches = db.execute("""
+                SELECT variant FROM plan_dom_dispatches WHERE run_id=?
+                ORDER BY accounted_at,rowid
+            """, (run.id,)).fetchall()
+        if (link is None or link["hypothesis_id"] != run.hypothesis_id
+                or link["plan_id"] != run.plan_id or link["run_id"] != run.id):
+            return _decision(ValidationStatus.INVALID_TEST, "DOM_AUDIT_BINDING_INVALID",
+                             checks=tuple(checks))
+        step = next((item for item in engine.runs.steps(run.id)
+                     if item.type == "VERIFY_BROWSER"), None)
+        result = engine.runs.result(step.id) if step else None
+        if (step is None or step.status is not RuntimeStepStatus.COMPLETED
+                or result is None or not 1 <= len(result.evidence_ids) <= 6):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "DOM_BROWSER_TRIALS_MISSING",
+                             checks=tuple(checks))
+        trials: list[dict[str, object]] = []
+        for ref in result.evidence_ids:
+            evidence = engine.evidence.get_evidence(ref)
+            if (evidence is None or evidence.target_ref != run.target_id
+                    or evidence.evidence_type != EvidenceType.DOM_PROOF.value
+                    or evidence.source != "domxss_browser"
+                    or evidence.provenance.record_id != candidate_id):
+                return _decision(ValidationStatus.INVALID_TEST, "DOM_EVIDENCE_PROVENANCE_INVALID",
+                                 checks=tuple(checks))
+            try:
+                trial = json.loads(engine.evidence.read_content(ref, max_bytes=8192))
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError, PermissionError):
+                return _decision(ValidationStatus.INVALID_TEST, "DOM_EVIDENCE_UNREADABLE",
+                                 checks=tuple(checks))
+            if (not isinstance(trial, dict) or trial.get("candidate_id") != candidate_id
+                    or trial.get("run_id") != run.id
+                    or trial.get("browser_session_id") != frozen.get("browser_session_id")
+                    or trial.get("route_url_sha256") != _digest(route)
+                    or trial.get("asset_url_sha256") != asset.asset_url_sha256
+                    or trial.get("bundle_sha256") != candidate.asset_sha256
+                    or trial.get("input_kind") != frozen.get("input_kind")
+                    or (trial.get("input_name") or "") != frozen.get("input_name")
+                    or type(trial.get("marker_observed")) is not bool
+                    or not re.fullmatch(r"DOMCTX-[0-9a-f]{32}", str(trial.get("context_id")))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(trial.get("probe_url_sha256")))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(trial.get("marker_sha256")))
+                    or type(trial.get("csp_present")) is not bool
+                    or type(trial.get("trusted_types_enforced")) is not bool
+                    or not isinstance(trial.get("sandbox_flags"), list)
+                    or type(trial.get("request_count")) is not int
+                    or not 1 <= trial["request_count"] <= 24):
+                return _decision(ValidationStatus.INVALID_TEST, "DOM_EVIDENCE_BINDING_INVALID",
+                                 checks=tuple(checks))
+            trials.append(trial)
+        variants = [item["variant"] for item in trials]
+        expected_prefix = ["INERT", "BENIGN", "DIRECT_DANGEROUS", "ENCODED_ONCE"]
+        ordered = (variants[:4] == expected_prefix
+                   and variants == [item["variant"] for item in dispatches]
+                   and (len(variants) == 4 or
+                        variants[4:] in (["FRESH_REPRODUCTION"],
+                                         ["ENCODED_TWICE"],
+                                         ["ENCODED_TWICE", "FRESH_REPRODUCTION"]))
+                   and all(item.get("payload_variant") == item.get("variant")
+                           for item in trials if item.get("variant") != "FRESH_REPRODUCTION")
+                   and all(item.get("payload_variant") in {"ENCODED_ONCE", "ENCODED_TWICE"}
+                           for item in trials if item.get("variant") == "FRESH_REPRODUCTION"))
+        checks.append(_check("BROWSER_TRIAL_ORDER", ordered, result.evidence_ids))
+        if not ordered:
+            return _decision(ValidationStatus.INVALID_TEST, "DOM_CONTROL_SEQUENCE_INVALID",
+                             checks=tuple(checks))
+        policy_ok = True
+        with engine.evidence._connection() as db:
+            for trial in trials:
+                ids = trial.get("policy_decision_ids")
+                if (not isinstance(ids, list) or len(ids) < 2
+                        or len(ids) > 25 or trial["request_count"] > len(ids) - 1):
+                    policy_ok = False
+                    break
+                navigations = 0
+                for decision_id in ids:
+                    row = db.execute("""
+                        SELECT d.result,d.scope_result,d.target_id,a.package_id,
+                               a.category,a.actor,a.method,a.source,a.vulnerability_class
+                        FROM policy_decisions d JOIN policy_actions a ON a.action_id=d.action_id
+                        WHERE d.decision_id=?
+                    """, (decision_id,)).fetchone()
+                    if (row is None or row["result"] != "ALLOW" or row["scope_result"] != "IN_SCOPE"
+                            or row["target_id"] != run.target_id
+                            or row["package_id"] != run.package_id
+                            or row["category"] not in {"BROWSER_NAVIGATION", "SAFE_READ"}
+                            or row["source"] != "domxss_browser"
+                            or row["method"] not in {"GET", "HEAD"}
+                            or row["actor"] != ("AUTHENTICATED" if frozen.get("identity_id")
+                                                 else "ANONYMOUS")
+                            or row["vulnerability_class"] != "dom_xss"):
+                        policy_ok = False
+                        break
+                    navigations += row["category"] == "BROWSER_NAVIGATION"
+                if not policy_ok or navigations < 1:
+                    policy_ok = False
+                    break
+        checks.append(_check("POLICY_SCOPE_FOR_EVERY_TRIAL", policy_ok, result.evidence_ids))
+        if not policy_ok:
+            return _decision(ValidationStatus.INVALID_TEST, "DOM_POLICY_AUDIT_INVALID",
+                             checks=tuple(checks))
+        controls_clear = all(not item["marker_observed"] for item in trials[:3])
+        checks.append(_check("INERT_BENIGN_DIRECT_CONTROLS", controls_clear,
+                             result.evidence_ids[:3]))
+        if not controls_clear:
+            return _decision(ValidationStatus.INVALID_TEST, "DOM_NEGATIVE_CONTROL_FAILED",
+                             checks=tuple(checks), contradicting=result.evidence_ids[:3])
+        successful = [(index, item) for index, item in enumerate(trials)
+                      if item["variant"] in {"ENCODED_ONCE", "ENCODED_TWICE"}
+                      and item["marker_observed"] is True]
+        if not successful:
+            blocked = any(item.get("browser_blocked") or item.get("denial_count")
+                          or item.get("error_code") for item in trials)
+            status = (ValidationStatus.NEEDS_MANUAL_REVIEW if blocked
+                      else ValidationStatus.REJECTED)
+            return _decision(status, "DOM_BROWSER_BLOCKED" if blocked else "DOM_NO_EXECUTION",
+                             checks=tuple(checks), contradicting=result.evidence_ids)
+        proof_index, proof = successful[0]
+        reproduction = trials[-1] if trials[-1]["variant"] == "FRESH_REPRODUCTION" else None
+        fresh = (reproduction is not None and reproduction["marker_observed"] is True
+                 and reproduction["payload_variant"] == proof["variant"]
+                 and reproduction["marker_sha256"] != proof["marker_sha256"]
+                 and reproduction["context_id"] != proof["context_id"]
+                 and len({item["context_id"] for item in trials}) == len(trials))
+        checks.append(_check("FRESH_BROWSER_CONTEXT", fresh,
+                             (result.evidence_ids[proof_index], result.evidence_ids[-1])))
+        if not fresh:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "DOM_FRESH_REPRODUCTION_MISSING", checks=tuple(checks))
+        origins = (proof.get("document_origin"), reproduction.get("document_origin"))
+        origin_ok = all(isinstance(origin, str) and
+                        package.scope.evaluate_url(origin + "/").result is ScopeResult.IN_SCOPE
+                        for origin in origins)
+        execution_ok = all(item.get("marker_context") in {"MAIN", "IFRAME"}
+                           and not item.get("browser_blocked") and not item.get("navigation_only")
+                           for item in (proof, reproduction))
+        checks.extend((_check("TARGET_ORIGIN_EXECUTION", origin_ok,
+                              (result.evidence_ids[proof_index], result.evidence_ids[-1])),
+                       _check("EXECUTION_NOT_NAVIGATION", execution_ok,
+                              (result.evidence_ids[proof_index], result.evidence_ids[-1])),
+                       _check("CSP_TT_SANDBOX_RECORDED", True,
+                              (result.evidence_ids[proof_index], result.evidence_ids[-1]))))
+        if not origin_ok or not execution_ok:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "DOM_EXECUTION_CONTEXT_UNCLEAR", checks=tuple(checks))
+        if candidate.status is not DOMCandidateStatus.VALIDATION_READY:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "DOM_CANDIDATE_NOT_VALIDATION_READY", checks=tuple(checks))
+        map_ref = ()
+        if candidate.source_map_sha256:
+            with engine.evidence._connection() as db:
+                source_map = db.execute("""
+                    SELECT evidence_id FROM dom_source_maps WHERE target_id=?
+                      AND js_artifact_id=? AND map_sha256=? LIMIT 1
+                """, (run.target_id, asset.artifact_id,
+                      candidate.source_map_sha256)).fetchone()
+            if source_map is None:
+                return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                                 "DOM_SOURCE_MAP_PROVENANCE_MISSING", checks=tuple(checks))
+            map_ref = (source_map["evidence_id"],)
+        root_key = _digest("|".join((run.target_id, asset.asset_url_sha256,
+                                      candidate.mapped_source or str(candidate.sink_location),
+                                      candidate.source, candidate.sink)))
+        surface = _digest("|".join((run.target_id, route, candidate.sink)))
+        finding = FindingSpec(
+            "DOM_XSS", root_key, surface, "BROWSER_DOCUMENT",
+            "Check-before-transform DOM XSS executes in target browser context",
+            "Browser execution reproduced using a harmless DOM attribute marker.",
+            "BROWSER_SCRIPT_EXECUTION_IN_TARGET_ORIGIN",
+            preliminary_severity="MEDIUM",
+        )
+        supporting = tuple(dict.fromkeys((*candidate.evidence_ids, asset.evidence_id,
+                                          *map_ref, *result.evidence_ids)))[:64]
+        return _decision(ValidationStatus.CONFIRMED, "DOM_BROWSER_EXECUTION_REPRODUCED",
+                         checks=tuple(checks), controls=("INERT", "BENIGN", "DIRECT_NEGATIVE",
+                                                        "TRANSFORMED_PROOF", "FRESH_CONTEXT"),
+                         supporting=supporting, reproductions=2,
+                         impact="BROWSER_SCRIPT_EXECUTION_IN_TARGET_ORIGIN", finding=finding)
 
 
 class ClientSideValidator:

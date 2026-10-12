@@ -10,6 +10,7 @@ import os
 import re
 import sys
 from typing import Mapping, TextIO
+from urllib.parse import parse_qsl, urlsplit
 
 
 REDACTED = "[REDACTED]"
@@ -30,6 +31,7 @@ _BEARER = re.compile(
     r"(?i)\bBearer[ \t]+(?!\[REDACTED\])"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;\]}'\"]+)"
 )
+_URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"']+")
 _SENSITIVE_PARTS = (
     "password", "passwd", "pwd", "cookie", "authorization", "apikey",
     "accesskey", "privatekey", "secret", "credential", "session", "token",
@@ -62,6 +64,23 @@ class SecretRedactor:
     def text(self, value: str) -> str:
         for secret in self.known_values:
             value = value.replace(secret, REDACTED)
+
+        def replace_url(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            try:
+                parsed = urlsplit(raw)
+                has_userinfo = "@" in parsed.netloc
+                has_secret_query = any(is_sensitive_key(key) for key, _ in parse_qsl(
+                    parsed.query, keep_blank_values=True
+                ))
+                has_secret_fragment = any(is_sensitive_key(key) for key, _ in parse_qsl(
+                    parsed.fragment, keep_blank_values=True
+                ))
+            except ValueError:
+                return REDACTED
+            return REDACTED if has_userinfo or has_secret_query or has_secret_fragment else raw
+
+        value = _URL.sub(replace_url, value)
         value = _HEADER.sub(lambda match: match.group("prefix") + REDACTED, value)
         value = _AUTH_INLINE.sub(lambda match: match.group("prefix") + REDACTED, value)
         value = _BEARER.sub("Bearer " + REDACTED, value)

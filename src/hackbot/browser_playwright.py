@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+import uuid
 
 from .browser import (BrowserError, BrowserProxyConfig, IdentityObservation,
                       IdentityVerificationRule)
 from .browser_trust import ProfileTrustError, install_profile_ca
+from .domxss_browser import DOMBrowserObservation
 from .secrets import SecretValue
 
 
@@ -26,6 +29,7 @@ class PlaywrightBrowserDriver:
         self._executable_path = executable_path
         self._playwright = None
         self._contexts: dict[str, object] = {}
+        self._proxy_settings: dict[str, BrowserProxyConfig] = {}
 
     def start(self, session_id: str, profile: Path, *, display: str | None,
               proxy: BrowserProxyConfig) -> None:
@@ -67,9 +71,11 @@ class PlaywrightBrowserDriver:
         except Exception:
             raise BrowserError("Chromium launch failed") from None
         self._contexts[session_id] = context
+        self._proxy_settings[session_id] = proxy
 
     def stop(self, session_id: str) -> None:
         context = self._contexts.pop(session_id, None)
+        self._proxy_settings.pop(session_id, None)
         if context is not None:
             try:
                 context.close()
@@ -137,3 +143,151 @@ class PlaywrightBrowserDriver:
             user_id=read(rule.user_id_selector), email=read(rule.email_selector),
             tenant_id=read(rule.tenant_selector),
         )
+
+    def execute_dom_variant(self, session_id: str, url: str, marker: str,
+                            expected_asset_url: str,
+                            gate: Callable[[str, str, bool], bool], *,
+                            authenticated: bool, request_cap: int,
+                            timeout_ms: int) -> DOMBrowserObservation:
+        """Fresh isolated browser; all network requests pass the supplied policy gate."""
+        source = self._contexts.get(session_id)
+        proxy = self._proxy_settings.get(session_id)
+        if source is None or proxy is None or self._playwright is None:
+            raise BrowserError("Verified browser session is not running")
+        if proxy.capture_required and proxy.ca_certificate is not None:
+            raise BrowserError("Fresh-context proxy trust is not configured")
+        if not 1 <= request_cap <= 48 or not 1000 <= timeout_ms <= 20000:
+            raise BrowserError("DOM browser budget is invalid")
+        options = {"headless": True, "chromium_sandbox": False}
+        if self._executable_path is not None:
+            options["executable_path"] = str(self._executable_path)
+        if proxy.enabled:
+            options["proxy"] = {"server": proxy.proxy_url}
+        try:
+            storage_state = source.storage_state() if authenticated else None
+            browser = self._playwright.chromium.launch(**options)
+        except Exception:
+            raise BrowserError("Fresh DOM browser context could not start") from None
+        context = None
+        count = 0
+        denied = 0
+        blocked_by_browser = False
+        response_status = None
+        bundle_sha256 = None
+        csp = None
+        navigation_only = False
+        context_id = "DOMCTX-" + uuid.uuid4().hex
+        try:
+            context = browser.new_context(
+                storage_state=storage_state, accept_downloads=False,
+                ignore_https_errors=False, service_workers="block",
+            )
+
+            def handle(route) -> None:
+                nonlocal count, denied, bundle_sha256
+                request = route.request
+                count += 1
+                if count > request_cap or not gate(request.url, request.method,
+                                                    request.is_navigation_request()):
+                    denied += 1
+                    route.abort()
+                    return
+                try:
+                    response = route.fetch(max_redirects=0, timeout=min(timeout_ms, 5000))
+                    if response.status in {301, 302, 303, 307, 308}:
+                        destination = response.headers.get("location")
+                        if not destination or not gate(urljoin(request.url, destination), "GET", True):
+                            denied += 1
+                            route.abort()
+                            return
+                    if int(response.headers.get("content-length", "0")) > 2_097_152:
+                        denied += 1
+                        route.abort()
+                        return
+                    if request.url == expected_asset_url and response.status == 200:
+                        body = response.body()
+                        if len(body) > 1_048_576:
+                            denied += 1
+                            route.abort()
+                            return
+                        bundle_sha256 = hashlib.sha256(body).hexdigest()
+                    route.fulfill(response=response)
+                except Exception:
+                    denied += 1
+                    try:
+                        route.abort()
+                    except Exception:
+                        pass
+
+            context.route("**/*", handle)
+            page = context.new_page()
+
+            def console_error(message) -> None:
+                nonlocal blocked_by_browser
+                if message.type == "error" and (
+                        "content security policy" in message.text.lower() or
+                        "trusted types" in message.text.lower()):
+                    blocked_by_browser = True
+
+            page.on("console", console_error)
+            error_code = None
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                response_status = response.status if response else None
+                csp = response.headers.get("content-security-policy") if response else None
+                page.wait_for_timeout(600)
+            except Exception:
+                error_code = "BROWSER_NAVIGATION_FAILED"
+            marker_context = None
+            document_origin = None
+            for index, frame in enumerate(page.frames[:16]):
+                try:
+                    value = frame.locator("html").get_attribute("data-hackbot-dom-proof", timeout=500)
+                except Exception:
+                    continue
+                if value == marker:
+                    marker_context = "MAIN" if index == 0 else "IFRAME"
+                    parsed = urlsplit(frame.url)
+                    if parsed.scheme in {"http", "https"} and parsed.hostname:
+                        document_origin = f"{parsed.scheme}://{parsed.netloc}"
+                    elif index > 0 and frame.url == "about:blank":
+                        try:
+                            sandbox = frame.frame_element().get_attribute("sandbox")
+                        except Exception:
+                            sandbox = ""
+                        if sandbox is None or "allow-same-origin" in sandbox.split():
+                            parent = urlsplit(page.url)
+                            if parent.scheme in {"http", "https"} and parent.hostname:
+                                document_origin = f"{parent.scheme}://{parent.netloc}"
+                    break
+            sandboxes = []
+            try:
+                for iframe in page.locator("iframe").all()[:8]:
+                    value = iframe.get_attribute("sandbox", timeout=500)
+                    if value is not None:
+                        sandboxes.append(value[:120])
+            except Exception:
+                pass
+            try:
+                before, after = urlsplit(url), urlsplit(page.url)
+                navigation_only = (marker_context is None and
+                                   (before.netloc, before.path) != (after.netloc, after.path))
+            except ValueError:
+                pass
+            return DOMBrowserObservation(
+                context_id=context_id, marker_observed=marker_context is not None,
+                marker_context=marker_context, document_origin=document_origin,
+                response_status=response_status, bundle_sha256=bundle_sha256,
+                csp_present=bool(csp),
+                trusted_types_enforced=bool(csp and "require-trusted-types-for" in csp.lower()),
+                sandbox_flags=tuple(sandboxes), browser_blocked=blocked_by_browser,
+                navigation_only=navigation_only, request_count=count,
+                denial_count=denied, error_code=error_code,
+            )
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            browser.close()

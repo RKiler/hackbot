@@ -17,6 +17,8 @@ from .mutation_binding import (MutationStage, ResolvedMutationStage,
 from .mutation_results import MutationResultStore, MutationStatus
 from .object_recipes import RecipeCatalog, json_pointer, unique_json_pairs
 from .auth import AuthMechanism, AuthStatus
+from .domxss_browser import (DOMBrowserExperimentExecutor, DOMExperimentBinding,
+                             DOMInputKind)
 from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from .executor import ExecutionError, ExecutionResult, RequestTemplate, TrafficExecutor
 from .hypotheses import HypothesisStore
@@ -42,7 +44,7 @@ _MAP = {
     "ESTABLISH_CONTROL": RuntimeStepType.ESTABLISH_CONTROL.value,
     "EXECUTE_REQUEST": RuntimeStepType.EXECUTE_REQUEST.value,
     "COMPARE_RESPONSE": RuntimeStepType.COMPARE_METADATA.value,
-    "VERIFY_BROWSER": RuntimeStepType.MANUAL_REVIEW.value,
+    "VERIFY_BROWSER": RuntimeStepType.VERIFY_BROWSER.value,
     "MANUAL_REVIEW": RuntimeStepType.MANUAL_REVIEW.value,
 }
 _ACTIVE = frozenset({ActionCategory.SAFE_READ, ActionCategory.AUTHORIZATION_TEST,
@@ -72,7 +74,8 @@ class PlanOrchestrator:
                  executor: TrafficExecutor, traffic: TrafficStore,
                  evidence: EvidenceFactStore, objects: ObjectRegistry | None = None,
                  recipes: RecipeCatalog | None = None,
-                 mutations: MutationResultStore | None = None) -> None:
+                 mutations: MutationResultStore | None = None,
+                 dom: DOMBrowserExperimentExecutor | None = None) -> None:
         self.runs, self.targets, self.hypotheses = runs, targets, hypotheses
         self.context, self.checker, self.registry = context, checker, registry
         self.policy, self.approvals, self.executor = policy, approvals, executor
@@ -80,6 +83,7 @@ class PlanOrchestrator:
         self.objects = objects
         self.recipes = recipes
         self.mutations = mutations
+        self.dom = dom
 
     @staticmethod
     def _requirements(snapshot: PlanSnapshot, registry: SkillRegistry) -> tuple[tuple[str, ...], str]:
@@ -539,7 +543,54 @@ class PlanOrchestrator:
                 return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
                                     reason="METADATA_OBSERVED", result=self._result(
                                         step, "Existing evidence or traffic metadata inspected.", evidence_ids=refs))
+            if (step.type == RuntimeStepType.ESTABLISH_CONTROL.value
+                    and snapshot.data.get("skill_id") == "check-before-transform-dom-xss"
+                    and isinstance(snapshot.data.get("dom_binding"), dict)):
+                return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                    reason="DOM_CONTROLS_FROZEN", result=self._result(
+                                        step, "Inert, benign, direct-dangerous, and transform-derived controls frozen."))
+            if step.type == RuntimeStepType.VERIFY_BROWSER.value:
+                frozen = snapshot.data.get("dom_binding")
+                if (self.dom is None or snapshot.data.get("skill_id") != "check-before-transform-dom-xss"
+                        or not isinstance(frozen, dict)):
+                    return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                        reason="DOM_EXECUTOR_UNAVAILABLE", waiting=RunStatus.BLOCKED)
+                try:
+                    binding = DOMExperimentBinding(
+                        candidate_id=frozen["candidate_id"], run_id=run.id,
+                        browser_session_id=frozen["browser_session_id"],
+                        route_url=frozen["route_url"], asset_url=frozen["asset_url"],
+                        input_kind=DOMInputKind(frozen["input_kind"]),
+                        input_name=frozen["input_name"] or None,
+                    )
+                    proof = self.dom.run(run.package_id, binding)
+                except (KeyError, TypeError, ValueError):
+                    consumed = self.runs.dom_dispatch_count(run.id, step.id)
+                    return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                        reason="DOM_RUNTIME_PREREQUISITE_FAILED", waiting=RunStatus.BLOCKED,
+                                        consumed=consumed)
+                refs = tuple(item.evidence_id for item in proof.trials)
+                if proof.status == "BLOCKED":
+                    return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                        reason="DOM_BROWSER_POLICY_BLOCKED", waiting=RunStatus.BLOCKED,
+                                        result=self._result(step, "Browser request gate blocked the proof.",
+                                                            evidence_ids=refs), consumed=len(proof.trials))
+                return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                    reason="DOM_BROWSER_" + proof.status,
+                                    result=self._result(step, "Bounded DOM browser result: " + proof.status,
+                                                        evidence_ids=refs), consumed=len(proof.trials))
             if step.type == RuntimeStepType.COMPARE_METADATA.value:
+                if snapshot.data.get("skill_id") == "check-before-transform-dom-xss":
+                    proof_step = next((item for item in self.runs.steps(run.id)
+                                       if item.type == RuntimeStepType.VERIFY_BROWSER.value), None)
+                    proof_result = self.runs.result(proof_step.id) if proof_step else None
+                    if proof_result is None:
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="DOM_PROOF_RESULT_MISSING", waiting=RunStatus.BLOCKED)
+                    return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                        reason="DOM_CONTROLS_COMPARED",
+                                        result=self._result(step, "Browser controls and proof metadata recorded.",
+                                                            evidence_ids=proof_result.evidence_ids))
                 pairs = snapshot.data.get("comparison_pairs", [])
                 if not isinstance(pairs, list) or not pairs:
                     return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,

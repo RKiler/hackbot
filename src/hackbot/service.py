@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 import socket
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 from . import __version__
@@ -23,6 +24,9 @@ from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
 from .browser_playwright import PlaywrightBrowserDriver
 from .burp import BurpExecutionProxyAdapter, BurpProxyProvider
 from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
+from .domxss import DOMXSSSpecialist
+from .domxss_browser import DOMBrowserExperimentExecutor
+from .domxss_store import DOMXSSStore
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
@@ -44,7 +48,8 @@ from .rate_limit import RateLimiter
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
-from .skill_plans import PrerequisiteChecker, SkillContextBuilder, SkillPlanStore, SkillPlanner, SkillRouter
+from .skill_plans import (DOMPlanBinding, PrerequisiteChecker, SkillContextBuilder,
+                          SkillPlanStore, SkillPlanner, SkillRouter)
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
@@ -99,6 +104,7 @@ class BugHunterRuntime:
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
+        self.domxss_store = DOMXSSStore(self.store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
         self.skill_checker = PrerequisiteChecker()
         self.skill_router = SkillRouter(self.skills, self.skill_checker)
@@ -109,7 +115,8 @@ class BugHunterRuntime:
                                    audit=self.policy_store, rate=self.rate)
         self.objects = ObjectRegistry(self.store)
         self.policy.owned_object = self.objects.owned_for_action
-        self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy, self.skill_plans)
+        self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy,
+                                         self.skill_plans, self.domxss_store)
         self.permits = PolicyPermitStore(self.store)
         self.executor = TrafficExecutor(
             targets=self.targets, policy=self.policy, permits=self.permits,
@@ -123,8 +130,16 @@ class BugHunterRuntime:
         except ConfigError:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
-                                                 self.browser, self.recon, self.objects)
+                                                 self.browser, self.recon, self.objects,
+                                                 self.domxss_store)
+        self.domxss = (DOMXSSSpecialist(recon=self.recon, targets=self.targets,
+                                       executor=self.executor, store=self.domxss_store)
+                       if self.recon is not None else None)
         self.run_store = PlanRunStore(self.store)
+        self.domxss_browser = DOMBrowserExperimentExecutor(
+            targets=self.targets, store=self.domxss_store, browser=self.browser,
+            driver=self.driver, policy=self.policy, runs=self.run_store,
+            evidence=self.store)
         object_settings = config.objects or ObjectSettings(config.paths.root / "recipes")
         self.object_factory = ObjectFactory(
             objects=self.objects, recipes=RecipeCatalog(object_settings), policy=self.policy,
@@ -136,13 +151,15 @@ class BugHunterRuntime:
         self.validator = DeterministicValidatorEngine(
             runs=self.run_store, traffic=self.traffic, evidence=self.store,
             identities=self.registry, hypotheses=self.hypotheses,
-            results=self.validations, registry=self.validator_registry)
+            results=self.validations, registry=self.validator_registry,
+            dom=self.domxss_store, targets=self.targets)
         self.orchestrator = PlanOrchestrator(
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
             traffic=self.traffic, evidence=self.store, objects=self.objects,
-            recipes=self.object_factory.recipes, mutations=self.mutation_results)
+            recipes=self.object_factory.recipes, mutations=self.mutation_results,
+            dom=self.domxss_browser)
         self.authorization_ledger = AuthorizationStore(self.store)
         self.authorization = AuthorizationSpecialist(
             identities=self.registry, browser=self.browser, objects=self.objects,
@@ -275,6 +292,13 @@ class BugHunterRuntime:
                                                         (package.target.id,)).fetchone()[0],
                 "traffic": connection.execute("SELECT count(*) FROM traffic_exchanges WHERE target_id=?",
                                                (package.target.id,)).fetchone()[0],
+                "dom_xss_candidates": connection.execute(
+                    "SELECT count(*) FROM dom_flow_candidates WHERE target_id=?",
+                    (package.target.id,)).fetchone()[0],
+                "dom_xss_high_priority": connection.execute(
+                    "SELECT count(*) FROM dom_flow_candidates WHERE target_id=? AND score>=75 "
+                    "AND status NOT IN ('STALE','REJECTED')",
+                    (package.target.id,)).fetchone()[0],
             }
         return {"id": package.id, "target_id": package.target.id, "name": package.to_dict()["name"],
                 "primary_domain": package.primary_domain, "status": package.status.value,
@@ -346,6 +370,33 @@ def _body(allowed: frozenset[str]) -> dict[str, Any]:
     return value
 
 
+def _dom_candidate_view(candidate, links: dict[str, str | None] | None = None) -> dict[str, object]:
+    return {
+        "id": candidate.candidate_id,
+        "target_id": candidate.target_id,
+        "recon_asset_id": candidate.recon_asset_id,
+        "asset_sha256": candidate.asset_sha256,
+        "source": candidate.source,
+        "source_line": candidate.source_location.line,
+        "checks": [step.operation for step in candidate.validation],
+        "transforms": [step.operation for step in candidate.transforms],
+        "post_checks": [step.operation for step in candidate.post_checks],
+        "sanitizers": [step.operation for step in candidate.sanitizers],
+        "sink": candidate.sink,
+        "sink_kind": candidate.sink_kind,
+        "sink_line": candidate.sink_location.line,
+        "check_before_transform": candidate.check_before_transform,
+        "attacker_controlled": candidate.attacker_controlled,
+        "score": candidate.score,
+        "status": candidate.status.value,
+        "route": candidate.route,
+        "mapped_source": candidate.mapped_source,
+        "source_map_sha256": candidate.source_map_sha256,
+        "evidence_ids": list(candidate.evidence_ids[:16]),
+        "links": links or {},
+    }
+
+
 def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | None = None) -> Flask:
     """WSGI factory. Bind with exactly one worker on a private Unix socket."""
     service = runtime or BugHunterRuntime(config or load_config())
@@ -357,7 +408,21 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def no_store(response):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        if request.path == "/domxss" or request.path.startswith("/domxss/assets/"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         return response
+
+    @app.get("/domxss")
+    def domxss_view():
+        return send_from_directory(Path(__file__).resolve().parent / "ui", "domxss.html")
+
+    @app.get("/domxss/assets/<name>")
+    def domxss_asset(name: str):
+        if name not in {"domxss.css", "domxss.js"}:
+            raise LookupError("asset not found")
+        return send_from_directory(Path(__file__).resolve().parent / "ui", name)
 
     @app.errorhandler(LookupError)
     def not_found(_exc):
@@ -429,6 +494,202 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "scope": package.scope.to_dict(), "program_rules": package.rules.to_dict(),
                         "autonomy": package.autonomy.to_dict(), "rate": package.rate.to_dict(),
                         "authority": "TARGET_PACKAGE", "recon_inventory": "NOT_AUTHORIZATION"})
+
+    @app.get("/v1/domxss/<package_id>/inventory")
+    def domxss_inventory(package_id: str):
+        package = service.package(package_id)
+        if service.domxss is None:
+            return jsonify(error="recon_unavailable"), 503
+        items = []
+        for lead in service.domxss.inventory(package_id):
+            asset = lead.asset
+            items.append({"recon_asset_id": asset.asset_id,
+                          "host": urlsplit(asset.asset_url).hostname,
+                          "asset_url_sha256": hashlib.sha256(asset.asset_url.encode()).hexdigest(),
+                          "latest_sha256": asset.latest_sha256,
+                          "score": lead.score, "reasons": list(lead.reasons)})
+        return jsonify({"target_id": package.target.id, "items": items, "bounded": True})
+
+    @app.get("/v1/domxss/<package_id>/candidates")
+    def domxss_candidates(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        candidates = service.domxss_store.list_candidates(
+            package.target.id, limit=page.limit, cursor=page.cursor)
+        return jsonify({"target_id": package.target.id,
+                        "items": [_dom_candidate_view(item) for item in candidates.items],
+                        "next_cursor": candidates.next_cursor})
+
+    @app.get("/v1/domxss/<package_id>/metrics")
+    def domxss_metrics(package_id: str):
+        package = service.package(package_id)
+        with service.store._connection() as db:
+            assets = db.execute("SELECT count(*) FROM dom_analysis_runs WHERE target_id=?",
+                                (package.target.id,)).fetchone()[0]
+            rows = db.execute("""
+                SELECT status,count(*) AS total FROM dom_flow_candidates
+                WHERE target_id=? GROUP BY status
+            """, (package.target.id,)).fetchall()
+            browser_actions = db.execute("""
+                SELECT count(*) FROM plan_dom_dispatches d JOIN plan_runs r ON r.run_id=d.run_id
+                WHERE r.target_id=?
+            """, (package.target.id,)).fetchone()[0]
+            confirmed = db.execute("""
+                SELECT count(*) FROM validations WHERE target_id=? AND skill_id=? AND status=?
+            """, (package.target.id, "check-before-transform-dom-xss",
+                  "CONFIRMED")).fetchone()[0]
+        statuses = {row["status"]: row["total"] for row in rows}
+        return jsonify({"target_id": package.target.id, "assets_analyzed": assets,
+                        "candidates": sum(statuses.values()), "by_status": statuses,
+                        "browser_actions": browser_actions, "confirmed": confirmed,
+                        "rejected": statuses.get("REJECTED", 0) + statuses.get("RUNTIME_TESTED", 0),
+                        "manual_review": statuses.get("NEEDS_MANUAL_REVIEW", 0)})
+
+    @app.get("/v1/domxss/<package_id>/candidates/<candidate_id>")
+    def domxss_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        item = service.domxss_store.get_candidate(package.target.id, candidate_id)
+        if item is None:
+            raise LookupError("candidate not found")
+        return jsonify(_dom_candidate_view(
+            item, service.domxss_store.candidate_links(package.target.id, candidate_id)))
+
+    @app.get("/v1/domxss/<package_id>/candidates/<candidate_id>/runtime")
+    def domxss_runtime(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        links = service.domxss_store.candidate_links(package.target.id, candidate_id)
+        if links is None:
+            raise LookupError("candidate not found")
+        run = service.run_store.get(links["run_id"], package.target.id) if links["run_id"] else None
+        validation = (service.validations.get(links["validation_id"], package.target.id)
+                      if links["validation_id"] else None)
+        trials = []
+        if run is not None:
+            for step in service.run_store.steps(run.id):
+                if step.type != "VERIFY_BROWSER":
+                    continue
+                result = service.run_store.result(step.id)
+                for ref in result.evidence_ids[:6] if result else ():
+                    evidence = service.store.get_evidence(ref)
+                    if (evidence is None or evidence.target_ref != package.target.id
+                            or evidence.evidence_type != "DOM_PROOF"):
+                        continue
+                    try:
+                        record = json.loads(service.store.read_content(ref, max_bytes=8192))
+                    except (ValueError, UnicodeError, PermissionError):
+                        continue
+                    trials.append({"variant": record.get("variant"),
+                                   "marker_observed": record.get("marker_observed"),
+                                   "marker_context": record.get("marker_context"),
+                                   "document_origin": record.get("document_origin"),
+                                   "csp_present": record.get("csp_present"),
+                                   "trusted_types_enforced": record.get("trusted_types_enforced"),
+                                   "sandbox_flags": record.get("sandbox_flags"),
+                                   "browser_blocked": record.get("browser_blocked"),
+                                   "navigation_only": record.get("navigation_only"),
+                                   "response_status": record.get("response_status"),
+                                   "request_count": record.get("request_count"),
+                                   "evidence_id": ref})
+        return jsonify({"target_id": package.target.id, "links": links,
+                        "run_status": run.status.value if run else None,
+                        "validation_status": validation.status.value if validation else None,
+                        "trials": trials})
+
+    @app.post("/v1/domxss/<package_id>/analyze")
+    def domxss_analyze(package_id: str):
+        body = _body(frozenset({"recon_asset_id"}))
+        package = service.package(package_id)
+        asset_id = body.get("recon_asset_id")
+        if type(asset_id) is not int or asset_id <= 0:
+            raise ValueError("invalid recon asset")
+        if service.domxss is None:
+            return jsonify(error="recon_unavailable"), 503
+        lead = next((item for item in service.domxss.inventory(package_id)
+                     if item.asset.asset_id == asset_id), None)
+        if lead is None:
+            raise LookupError("asset not in bounded in-scope inventory")
+        result = service.domxss.acquire(package_id, lead.asset)
+        if result.artifact is None or result.status.value not in {"REUSED", "RETRIEVED"}:
+            return jsonify({"target_id": package.target.id, "status": result.status.value,
+                            "reason_code": result.reason_code,
+                            "exchange_ids": list(result.exchange_ids)}), 202
+        analysis_id, analysis = service.domxss.analyze(package.target.id,
+                                                      result.artifact.artifact_id)
+        source_map_status = "NOT_REQUESTED"
+        mapped_ids: list[str] = []
+        if any(item.score >= 75 for item in analysis.candidates):
+            mapped = service.domxss.acquire_source_map(package_id, lead.asset, result.artifact)
+            source_map_status = mapped.status.value
+            if mapped.source_map is not None:
+                for item in analysis.candidates:
+                    if item.score < 75:
+                        continue
+                    try:
+                        service.domxss_store.map_candidate(package.target.id, item.candidate_id,
+                                                           mapped.source_map)
+                    except ValueError:
+                        source_map_status = "MAPPING_FAILED"
+                        continue
+                    mapped_ids.append(item.candidate_id)
+        return jsonify({"target_id": package.target.id, "status": analysis.status,
+                        "analysis_id": analysis_id, "asset_sha256": analysis.asset_sha256,
+                        "candidate_ids": [item.candidate_id for item in analysis.candidates],
+                        "parse_errors": analysis.parse_errors,
+                        "source_map_status": source_map_status,
+                        "mapped_candidate_ids": mapped_ids}), 201
+
+    @app.post("/v1/domxss/<package_id>/candidates/<candidate_id>/route")
+    def domxss_bind_route(package_id: str, candidate_id: str):
+        body = _body(frozenset({"exchange_id"}))
+        if not isinstance(body.get("exchange_id"), str) or service.domxss is None:
+            raise ValueError("observed exchange required")
+        item = service.domxss.bind_observed_route(
+            package_id, candidate_id, body["exchange_id"], service.traffic)
+        return jsonify(_dom_candidate_view(item))
+
+    @app.post("/v1/domxss/<package_id>/candidates/<candidate_id>/prepare")
+    def domxss_prepare(package_id: str, candidate_id: str):
+        _body(frozenset())
+        if service.domxss is None:
+            return jsonify(error="recon_unavailable"), 503
+        prepared = service.domxss.prepare_candidate(
+            package_id, candidate_id, hypotheses=service.hypotheses,
+            contexts=service.skill_context, router=service.skill_router,
+            planner=service.skill_planner)
+        return jsonify({"hypothesis_id": prepared.hypothesis.id,
+                        "plan_id": prepared.plan["id"],
+                        "skill_id": prepared.selected_skill,
+                        "prerequisite_state": prepared.prerequisite_state}), 201
+
+    @app.post("/v1/domxss/<package_id>/candidates/<candidate_id>/bind-plan")
+    def domxss_bind_plan(package_id: str, candidate_id: str):
+        body = _body(frozenset({"browser_session_id", "input_kind", "input_name"}))
+        package = service.package(package_id)
+        candidate = service.domxss_store.get_candidate(package.target.id, candidate_id)
+        asset = service.domxss_store.candidate_asset(package.target.id, candidate_id)
+        links = service.domxss_store.candidate_links(package.target.id, candidate_id)
+        if candidate is None or asset is None or links is None or not links["hypothesis_id"]:
+            raise LookupError("prepared candidate not found")
+        if service.domxss is None:
+            return jsonify(error="recon_unavailable"), 503
+        lead = next((item for item in service.domxss.inventory(package_id)
+                     if item.asset.asset_id == asset.recon_asset_id and
+                     hashlib.sha256(item.asset.asset_url.encode()).hexdigest()
+                     == asset.asset_url_sha256), None)
+        session_id = body.get("browser_session_id")
+        session = service.browser.get(session_id) if isinstance(session_id, str) else None
+        if lead is None or session is None or session.target_id != package.target.id or not candidate.route:
+            raise ValueError("current asset and target browser session required")
+        hypothesis = service.hypotheses.get(links["hypothesis_id"], package.target.id)
+        if hypothesis is None:
+            raise ValueError("DOM hypothesis unavailable")
+        context = service.skill_context.build(hypothesis, None, package=package)
+        plan = service.skill_planner.bind_dom(
+            package, hypothesis, context,
+            DOMPlanBinding(candidate_id, candidate.route, lead.asset.asset_url,
+                           session.id, session.identity_id, body.get("input_kind"),
+                           body.get("input_name")))
+        return jsonify({"plan_id": plan["id"], "status": plan["status"]}), 201
 
     @app.get("/v1/objects/recipes")
     def object_recipes():

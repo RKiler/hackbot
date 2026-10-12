@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import timedelta, datetime, timezone
 import gzip
+import hashlib
 import http.client
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,8 @@ from hackbot.auth import AuthContextManager, AuthMechanism, AuthStatus
 from hackbot.browser import BrowserSessionManager, IdentityObservation, IdentityVerificationRule
 from hackbot.config import (BrowserSettings, ExecutorSettings, SecretBindingConfig,
                             SecretSettings, StoreSettings)
+from hackbot.domxss import DOMAcquisitionStatus, DOMXSSSpecialist
+from hackbot.domxss_store import DOMXSSStore
 from hackbot.executor import (ExecutionError, ProxyRoute, RequestTemplate, TrafficExecutor)
 from hackbot.identity import IdentityStatus
 from hackbot.identity_registry import IdentityRegistry
@@ -25,6 +28,7 @@ from hackbot.policy import PolicyEngine
 from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction
 from hackbot.policy_store import PolicyStore
 from hackbot.rate_limit import ExperimentBudget, RateLimiter
+from hackbot.recon import Page, Provenance, ReconJsAsset, ReconTarget
 from hackbot.secrets import RoutedSecretProvider
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
@@ -59,6 +63,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path == "/assets/app.js":
+            return self._answer(200, b'const api_key="fixture-secret";location.search;iframe.src;\n'
+                                b'//# sourceMappingURL=app.js.map',
+                                (("Content-Type", "application/javascript"),))
+        if self.path == "/assets/app.js.map":
+            return self._answer(200, b'{"version":3,"sources":["app.js"],"mappings":"AAAA"}',
+                                (("Content-Type", "application/json"),))
+        if self.path == "/assets/fallback.js":
+            return self._answer(200, b"<html>fallback</html>", (("Content-Type", "text/html"),))
         if self.path.startswith("/fixture/"):
             parts = self.path.split("/")
             if (len(parts) == 6 and parts[3] == "projects" and parts[4] == "batch"):
@@ -445,6 +458,58 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(self.executor.execute(action, permit, template).error, ExecutionError.PERMIT_DENIED)
         self.assertEqual(len(self.server.received), 1)
         self.assertEqual(self.traffic.get_exchange(good.exchange_ids[0]).state, ExchangeState.COMPLETE)
+
+    def test_protected_asset_capture_is_typed_and_local_only(self):
+        action = self.action("/assets/app.js")
+        result = self.run_action(action, artifact_capture_kind="JS")
+        self.assertIsNone(result.error)
+        self.assertIsNotNone(result.artifact_evidence_id)
+        self.assertIn(b"fixture-secret", self.store.read_content(
+            result.artifact_evidence_id, allow_sensitive=True))
+        self.assertEqual(len(result.exchange_ids), 1)
+
+        map_action = self.action("/assets/app.js.map")
+        source_map = self.run_action(map_action, artifact_capture_kind="SOURCE_MAP")
+        self.assertIsNotNone(source_map.artifact_evidence_id)
+        fallback = self.run_action(self.action("/assets/fallback.js"), artifact_capture_kind="JS")
+        self.assertIsNone(fallback.artifact_evidence_id)
+        invalid = self.run_action(self.action("/assets/app.js"), artifact_capture_kind="SOURCE_MAP")
+        self.assertIsNone(invalid.artifact_evidence_id)
+
+    def test_dom_specialist_acquires_once_through_policy_executor(self):
+        body = (b'const api_key="fixture-secret";location.search;iframe.src;\n'
+                b'//# sourceMappingURL=app.js.map')
+        digest = hashlib.sha256(body).hexdigest()
+        asset = ReconJsAsset(91, 7, self.base + "/assets/app.js", digest, len(body), 200,
+                             Provenance("js_assets", 91, None, "fixture"))
+
+        class LocalRecon:
+            def resolve_target(self, _name):
+                return ReconTarget(7, "example.test", True, True,
+                                   Provenance("domains", 7, None, "fixture"))
+
+            def list_js_assets(self, _domain_id, _host_id, *, limit, cursor=None):
+                return Page((asset,), None)
+
+            def get_js_asset(self, _domain_id, asset_id):
+                return asset if asset_id == asset.asset_id else None
+
+        specialist = DOMXSSSpecialist(recon=LocalRecon(), targets=self.targets,
+                                      executor=self.executor, store=DOMXSSStore(self.store))
+        first = specialist.acquire(self.package.id, asset)
+        self.assertEqual(first.status, DOMAcquisitionStatus.RETRIEVED)
+        self.assertEqual(first.artifact.artifact_sha256, digest)
+        self.assertEqual(len(first.exchange_ids), 1)
+        self.assertEqual(len(self.server.received), 1)
+        second = specialist.acquire(self.package.id, asset)
+        self.assertEqual(second.status, DOMAcquisitionStatus.REUSED)
+        self.assertEqual(len(self.server.received), 1)
+        source_map = specialist.acquire_source_map(self.package.id, asset, first.artifact)
+        self.assertEqual(source_map.status, DOMAcquisitionStatus.RETRIEVED)
+        self.assertEqual(len(self.server.received), 2)
+        reused_map = specialist.acquire_source_map(self.package.id, asset, first.artifact)
+        self.assertEqual(reused_map.status, DOMAcquisitionStatus.REUSED)
+        self.assertEqual(len(self.server.received), 2)
 
     def test_scope_policy_change_and_redirects(self):
         out = self.action("/redirect-out")

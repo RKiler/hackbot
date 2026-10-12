@@ -84,6 +84,18 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn("basicsecret123", output)
         self.assertIn("status=denied", output)
 
+    def test_embedded_url_credentials_are_redacted(self) -> None:
+        output = json.dumps(self._log(
+            "request=https://alice:pass123@example.test/path "
+            "next=https://example.test/?token=querysecret123&ok=1 "
+            "callback=https://example.test/#access_token=fragmentsecret123 "
+            "safe=https://example.test/public"
+        ))
+        self.assertNotIn("pass123", output)
+        self.assertNotIn("querysecret123", output)
+        self.assertNotIn("fragmentsecret123", output)
+        self.assertIn("https://example.test/public", output)
+
     def test_quoted_bearer_token(self) -> None:
         output = json.dumps(self._log('Bearer "quotedsecret123"'))
         self.assertNotIn("quotedsecret123", output)

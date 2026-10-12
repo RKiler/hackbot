@@ -305,6 +305,22 @@ class PostgresReconRepository:
             r["http_status"], _prov("js_assets", r, "last_seen", "latest_recon_row"),
         ))
 
+    def get_js_asset(self, domain_id: int, asset_id: int) -> ReconJsAsset | None:
+        _id(domain_id)
+        _id(asset_id)
+        rows = self._read("""
+            SELECT a.id,a.live_host_id,a.asset_url,a.sha256,a.size_bytes,a.http_status,a.last_seen
+            FROM js_assets a JOIN live_hosts lh ON lh.id=a.live_host_id
+            JOIN subdomains s ON s.id=lh.subdomain_id
+            WHERE a.id=%s AND s.domain_id=%s LIMIT 1
+        """, (asset_id, domain_id))
+        if not rows:
+            return None
+        row = rows[0]
+        return ReconJsAsset(row["id"], row["live_host_id"], row["asset_url"], row["sha256"],
+                            row["size_bytes"], row["http_status"],
+                            _prov("js_assets", row, "last_seen", "latest_recon_row"))
+
     def get_js_analysis(self, domain_id: int, asset_id: int) -> ReconJsAnalysis | None:
         _id(domain_id)
         _id(asset_id)

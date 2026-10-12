@@ -8,8 +8,8 @@ prerequisites: [in_scope_target, current_js, attacker_controlled_source, transfo
 risk: LOW
 required_validators: [browser_execution, source_sink_trace]
 token_budget: 2000
-request_budget: 4
-version: 1.0.0
+request_budget: 6
+version: 1.1.0
 source: CORE
 execution_mode: PLAN_ONLY
 when_to_use: Use for a current bundle with a traceable source, security decision, later transform, and sink.

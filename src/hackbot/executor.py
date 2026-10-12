@@ -21,6 +21,7 @@ import requests
 from .auth import AuthContextManager, AuthMechanism, AuthStatus
 from .config import ExecutorSettings
 from .domain import TrafficSource, normalize_content_type
+from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from .logging import SecretRedactor, is_sensitive_key
 from .permit_store import PermitError, PolicyPermitStore
 from .policy import PolicyEngine
@@ -155,6 +156,7 @@ class ExecutionResult:
     started_at: datetime
     finished_at: datetime
     evidence_ids: tuple[str, ...]
+    artifact_evidence_id: str | None = None
 
 
 class _Stop(Exception):
@@ -309,7 +311,8 @@ class TrafficExecutor:
                 execution_id: str | None = None,
                 continue_dispatch: Callable[[], bool] | None = None,
                 on_dispatch: Callable[[str], bool] | None = None,
-                token_header: str | None = None) -> ExecutionResult:
+                token_header: str | None = None,
+                artifact_capture_kind: str | None = None) -> ExecutionResult:
         start = datetime.now(timezone.utc)
         execution_id = execution_id or "EXEC-" + uuid.uuid4().hex
         exchange_ids: list[str] = []
@@ -320,6 +323,7 @@ class TrafficExecutor:
         content_type: str | None = None
         body_size = 0
         truncated = False
+        artifact_evidence_id: str | None = None
         initial = permit if isinstance(permit, PolicyPermit) else None
         deadline = time.monotonic() + self.settings.overall_timeout_seconds
         try:
@@ -343,6 +347,12 @@ class TrafficExecutor:
             if token_header is not None and (token_header != "X-CSRF-Token" or
                                              template.method not in {"POST", "PUT", "PATCH", "DELETE"} or
                                              action.actor is not ActorMode.AUTHENTICATED):
+                raise _Stop(ExecutionError.INVALID_REQUEST)
+            if artifact_capture_kind is not None and (
+                artifact_capture_kind not in {"JS", "SOURCE_MAP"}
+                or template.method != "GET" or action.category is not ActionCategory.SAFE_READ
+                or template.body not in (None, b"")
+            ):
                 raise _Stop(ExecutionError.INVALID_REQUEST)
             current_action, current_template, current_permit = action, template, initial
             hop_limit = min(self.settings.max_redirects + 1, max_dispatches or self.settings.max_redirects + 1)
@@ -463,6 +473,30 @@ class TrafficExecutor:
                     stored = self.traffic.store_response(exchange.id, observation)
                     if stored.response is not None:
                         evidence_ids.extend(stored.response.record.evidence_ids)
+                    if artifact_capture_kind and status == 200 and body and not truncated:
+                        path = urlsplit(current_template.url).path.lower()
+                        is_html = content_type in {"text/html", "application/xhtml+xml"}
+                        accepted = (
+                            not is_html and (
+                                artifact_capture_kind == "JS" and (
+                                    content_type in {"application/javascript", "text/javascript", "application/x-javascript"}
+                                    or path.endswith((".js", ".mjs", ".cjs"))
+                                ) or artifact_capture_kind == "SOURCE_MAP" and (
+                                    content_type in {"application/json", "text/plain"} and path.endswith(".map")
+                                )
+                            )
+                        )
+                        if accepted:
+                            asset_evidence = self.traffic.evidence.create_evidence(
+                                EvidenceType.JS_ASSET if artifact_capture_kind == "JS" else EvidenceType.SOURCE_MAP,
+                                body, source="controlled_asset_fetch",
+                                provenance=EvidenceProvenance(system="HACKBOT", entity="ASSET_FETCH",
+                                                               record_id=exchange.id),
+                                target_ref=current_action.target_id, sensitivity=Sensitivity.SENSITIVE,
+                                metadata={"exchange_id": exchange.id, "asset_kind": artifact_capture_kind},
+                            )
+                            artifact_evidence_id = asset_evidence.evidence_id
+                            evidence_ids.append(asset_evidence.evidence_id)
                     self.permits.record(current_permit, "RESPONSE_RECEIVED", "HTTP_RESPONSE", exchange.id)
                 finally:
                     self.rate.release(reservation.reservation_id)
@@ -537,4 +571,5 @@ class TrafficExecutor:
             initial.decision_id if initial else None, initial.approval_id if initial else None,
             tuple(exchange_ids), error, status, content_type, body_size, truncated,
             tuple(redirects), start, datetime.now(timezone.utc), tuple(evidence_ids),
+            artifact_evidence_id,
         )

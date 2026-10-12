@@ -188,8 +188,12 @@ class ReconTests(unittest.TestCase):
             "extraction": {"secret": "PRIVATE_VALUE"},
         }])
         asset = self.repo.list_js_assets(5, 12).items[0]
+        delta_asset = self.repo.get_js_asset(5, 3)
         analysis = self.repo.get_js_analysis(5, 3)
         self.assertEqual(asset.latest_sha256, "abc")
+        self.assertEqual(delta_asset, asset)
+        self.assertIn((3, 5), [params for sql, params in self.connection.calls
+                              if "FROM js_assets a JOIN live_hosts" in sql])
         self.assertEqual(analysis.signal_counts["endpoint_paths"], 1)
         self.assertNotIn("PRIVATE_VALUE", repr(analysis))
         sql = " ".join(query for query, _ in self.connection.calls)
@@ -233,6 +237,7 @@ class ReconTests(unittest.TestCase):
         self.repo.list_endpoints(5, 12)
         self.repo.list_parameters(5, 7)
         self.repo.list_js_assets(5, 12)
+        self.repo.get_js_asset(5, 3)
         self.repo.get_js_analysis(5, 3)
         self.repo.list_endpoint_js_references(5, 7)
         self.repo.list_api_surfaces(5, "graphql")

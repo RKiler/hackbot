@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from hackbot.browser import IdentityObservation
 from hackbot.config import BrowserSettings, TargetSettings, load_config
+from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
 from hackbot.service import BugHunterRuntime, create_app
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
@@ -99,6 +101,64 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.post("/v1/objects/TESTOBJ-" + "a" * 32 +
                                           "/mutate", json={"field": "name", "value": "unsafe"}).status_code,
                          404)
+
+    def test_domxss_api_is_target_scoped_bounded_and_has_no_payload_surface(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        view = self.client.get("/domxss")
+        self.assertEqual(view.status_code, 200)
+        self.assertIn("frame-ancestors 'none'", view.headers["Content-Security-Policy"])
+        self.assertIn(b'content=""', view.data)
+        view.close()
+        asset = self.client.get("/domxss/assets/domxss.js")
+        self.assertEqual(asset.status_code, 200)
+        asset.close()
+        self.assertEqual(self.client.get("/domxss/assets/unknown.js").status_code, 404)
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            self.assertEqual(self.get("/v1/domxss/example/candidates")["items"], [])
+            self.assertEqual(self.get("/v1/domxss/example/metrics")["browser_actions"], 0)
+            self.assertEqual(self.client.get("/v1/domxss/example/inventory").status_code, 503)
+            self.assertEqual(self.client.get("/v1/domxss/not-here/candidates").status_code, 404)
+            self.assertEqual(self.client.get("/v1/domxss/example/candidates?limit=999").status_code, 400)
+            self.assertEqual(self.client.get("/v1/domxss/example/candidates/DOM-" + "a" * 32).status_code,
+                             404)
+            self.assertEqual(self.client.post("/v1/domxss/example/analyze",
+                                              json={"recon_asset_id": 1}).status_code, 503)
+            self.assertEqual(self.client.post("/v1/domxss/example/analyze",
+                                              json={"javascript": "alert(1)"}).status_code, 400)
+            self.assertEqual(self.client.post("/v1/domxss/example/candidates/DOM-" + "a" * 32 +
+                                              "/prepare", json={}).status_code, 503)
+
+    def test_domxss_analyze_maps_only_high_priority_candidates(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        high = SimpleNamespace(candidate_id="DOM-" + "a" * 32, score=80)
+        low = SimpleNamespace(candidate_id="DOM-" + "b" * 32, score=40)
+        fake = Mock()
+        fake.inventory.return_value = (SimpleNamespace(asset=SimpleNamespace(asset_id=91)),)
+        fake.acquire.return_value = SimpleNamespace(
+            status=DOMAcquisitionStatus.REUSED, artifact=SimpleNamespace(artifact_id="DOMART-fixture"),
+            exchange_ids=())
+        fake.analyze.return_value = ("DOMAN-fixture", SimpleNamespace(
+            status="ANALYZED", asset_sha256="a" * 64, candidates=(high, low), parse_errors=0))
+        fake.acquire_source_map.return_value = SimpleNamespace(
+            status=DOMAcquisitionStatus.RETRIEVED, source_map=object())
+        with (patch.object(self.runtime, "domxss", fake),
+              patch.object(self.runtime.domxss_store, "map_candidate") as mapping,
+              patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic"))):
+            response = self.client.post("/v1/domxss/example/analyze", json={"recon_asset_id": 91})
+        self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+        self.assertEqual(response.get_json()["source_map_status"], "RETRIEVED")
+        self.assertEqual(response.get_json()["mapped_candidate_ids"], [high.candidate_id])
+        mapping.assert_called_once()
+        self.assertEqual(mapping.call_args.args[1], high.candidate_id)
+
+        fake.analyze.return_value = ("DOMAN-fixture", SimpleNamespace(
+            status="ANALYZED", asset_sha256="a" * 64, candidates=(low,), parse_errors=0))
+        fake.acquire_source_map.reset_mock()
+        with (patch.object(self.runtime, "domxss", fake),
+              patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic"))):
+            response = self.client.post("/v1/domxss/example/analyze", json={"recon_asset_id": 91})
+        self.assertEqual(response.get_json()["source_map_status"], "NOT_REQUESTED")
+        fake.acquire_source_map.assert_not_called()
 
     def test_authorization_api_is_target_scoped_bounded_and_local_only(self):
         self.runtime.registry.register_target(self.runtime.package("example"))
