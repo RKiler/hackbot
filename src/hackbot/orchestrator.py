@@ -11,7 +11,7 @@ import uuid
 from urllib.parse import urlsplit
 from typing import Any
 
-from .authorization_binding import resolve_authorization_request
+from .authorization_binding import resolve_authorization_request, resolve_exposure_read
 from .mutation_binding import (MutationStage, ResolvedMutationStage,
                                mutation_fingerprint, resolve_mutation_stage)
 from .mutation_results import MutationResultStore, MutationStatus
@@ -19,6 +19,7 @@ from .object_recipes import RecipeCatalog, json_pointer, unique_json_pairs
 from .auth import AuthMechanism, AuthStatus
 from .domxss_browser import (DOMBrowserExperimentExecutor, DOMExperimentBinding,
                              DOMInputKind)
+from .exposure import ExposureSpecialist
 from .postmessage_browser import (PostMessageBrowserExperimentExecutor,
                                   MessageExperimentBinding)
 from .browser import BrowserError
@@ -79,7 +80,8 @@ class PlanOrchestrator:
                  recipes: RecipeCatalog | None = None,
                  mutations: MutationResultStore | None = None,
                  dom: DOMBrowserExperimentExecutor | None = None,
-                 messages: PostMessageBrowserExperimentExecutor | None = None) -> None:
+                 messages: PostMessageBrowserExperimentExecutor | None = None,
+                 exposure: ExposureSpecialist | None = None) -> None:
         self.runs, self.targets, self.hypotheses = runs, targets, hypotheses
         self.context, self.checker, self.registry = context, checker, registry
         self.policy, self.approvals, self.executor = policy, approvals, executor
@@ -89,6 +91,25 @@ class PlanOrchestrator:
         self.mutations = mutations
         self.dom = dom
         self.messages = messages
+        self.exposure = exposure
+
+    def _exposure_binding_valid(self, package, frozen: object) -> bool:
+        if self.exposure is None or not isinstance(frozen, dict):
+            return False
+        candidate_id = frozen.get("candidate_id")
+        if not isinstance(candidate_id, str):
+            return False
+        candidate = self.exposure.current_candidate(package, candidate_id)
+        return bool(candidate is not None and candidate.source.value == frozen.get("source")
+                    and candidate.artifact_sha256 == frozen.get("artifact_sha256")
+                    and candidate.credential is not None
+                    and candidate.credential.fingerprint_sha256 == frozen.get("credential_fingerprint")
+                    and any(link["current"] and link["source"] == frozen.get("source") and
+                            link["source_ref"] == frozen.get("source_ref") and
+                            link["evidence_id"] == frozen.get("evidence_id") and
+                            link["artifact_sha256"] == frozen.get("artifact_sha256")
+                            for link in self.exposure.store.source_links(package.target.id,
+                                                                           candidate_id)))
 
     @staticmethod
     def _requirements(snapshot: PlanSnapshot, registry: SkillRegistry) -> tuple[tuple[str, ...], str]:
@@ -228,7 +249,49 @@ class PlanOrchestrator:
             if not isinstance(descriptor, dict) or not isinstance(shape, dict):
                 raise ValueError
             resolved_mutation: ResolvedMutationStage | None = None
-            if shape.get("binding") == "AUTHORIZATION_RECIPE_MUTATION_V1":
+            if shape.get("binding") == "EXPOSURE_HTTP_V1":
+                package = self.targets.get_target_package(run.package_id)
+                frozen = snapshot.data.get("exposure_binding")
+                if (self.exposure is None or package is None or
+                        package.target.id != run.target_id or not isinstance(frozen, dict) or
+                        set(shape) != set(frozen) | {"binding", "method", "authentication", "fingerprint"} or
+                        any(shape.get(key) != value for key, value in frozen.items()) or
+                        shape.get("method") != "GET" or
+                        shape.get("authentication") != "EXECUTOR_SUPPLIED" or
+                        hashlib.sha256(json.dumps({key: value for key, value in shape.items()
+                                                   if key != "fingerprint"}, sort_keys=True,
+                                                  separators=(",", ":")).encode()).hexdigest()
+                        != shape.get("fingerprint") or
+                        descriptor.get("request_template_fingerprint") != shape["fingerprint"] or
+                        descriptor.get("simulation_only") is not True or
+                        descriptor.get("role") != "BOUNDARY" or step.role != "BOUNDARY"):
+                    raise ValueError
+                template = self.exposure.resolve_captured_response(package, frozen)
+            elif shape.get("binding") == "EXPOSURE_VHOST_V1":
+                package = self.targets.get_target_package(run.package_id)
+                frozen = snapshot.data.get("exposure_binding")
+                if (self.exposure is None or package is None or not isinstance(frozen, dict)
+                        or package.target.id != run.target_id or
+                        set(shape) != set(frozen) | {"binding", "variant", "method",
+                                                         "authentication", "fingerprint"} or
+                        any(shape.get(key) != value for key, value in frozen.items()) or
+                        shape.get("method") != "GET" or
+                        shape.get("authentication") != "EXECUTOR_SUPPLIED" or
+                        shape.get("variant") not in {"NORMAL", "INVALID", "CANDIDATE"} or
+                        hashlib.sha256(json.dumps({key: value for key, value in shape.items()
+                                                   if key != "fingerprint"}, sort_keys=True,
+                                                  separators=(",", ":")).encode()).hexdigest()
+                        != shape.get("fingerprint") or
+                        descriptor.get("request_template_fingerprint") != shape["fingerprint"] or
+                        descriptor.get("simulation_only") is not True or
+                        descriptor.get("role") != step.role or
+                        step.role != {"NORMAL": "CONTROL", "INVALID": "OTHER",
+                                      "CANDIDATE": "BOUNDARY"}[shape["variant"]] or
+                        descriptor.get("control_kind") != (
+                            "INVALID_HOST" if shape["variant"] == "INVALID" else None)):
+                    raise ValueError
+                template = self.exposure.resolve_vhost(package, frozen, shape["variant"], run.id)
+            elif shape.get("binding") == "AUTHORIZATION_RECIPE_MUTATION_V1":
                 if (self.objects is None or self.recipes is None or self.mutations is None or
                         descriptor.get("simulation_only") is not True):
                     raise ValueError
@@ -267,6 +330,7 @@ class PlanOrchestrator:
                             "OBJECT_UPDATE" if template.method in {"PATCH", "PUT", "POST"} else "SAFE_READ")):
                     raise ValueError
             elif shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
+                                        "EXPOSURE_OBJECT_PATH_V1",
                                         "AUTHORIZATION_GRAPHQL_QUERY_V1",
                                         "AUTHORIZATION_GRAPHQL_MUTATION_V1",
                                         "AUTHORIZATION_NESTED_PARENT_V1",
@@ -276,7 +340,9 @@ class PlanOrchestrator:
                 package = self.targets.get_target_package(run.package_id)
                 if package is None or package.target.id != run.target_id:
                     raise ValueError
-                template, owned_hash = resolve_authorization_request(
+                resolver = (resolve_exposure_read if shape["binding"] == "EXPOSURE_OBJECT_PATH_V1"
+                            else resolve_authorization_request)
+                template, owned_hash = resolver(
                     shape, package=package, run_id=run.id, objects=self.objects,
                     traffic=self.traffic, evidence=self.evidence)
                 item = self.objects.get(shape["test_object_id"], run.target_id)
@@ -335,6 +401,7 @@ class PlanOrchestrator:
             if category not in _ACTIVE or actor not in {ActorMode.ANONYMOUS, ActorMode.AUTHENTICATED}:
                 raise ValueError
             if shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
+                                        "EXPOSURE_OBJECT_PATH_V1",
                                         "AUTHORIZATION_GRAPHQL_QUERY_V1",
                                         "AUTHORIZATION_GRAPHQL_MUTATION_V1",
                                         "AUTHORIZATION_NESTED_PARENT_V1",
@@ -348,6 +415,14 @@ class PlanOrchestrator:
                         actor is not (ActorMode.ANONYMOUS if shape["variant"] == "ANONYMOUS"
                                       else ActorMode.AUTHENTICATED)):
                     raise ValueError
+            if shape.get("binding") == "EXPOSURE_VHOST_V1" and (
+                    category is not ActionCategory.SAFE_READ or actor is not ActorMode.ANONYMOUS
+                    or descriptor.get("identity_id") or descriptor.get("session_id")):
+                raise ValueError
+            if shape.get("binding") == "EXPOSURE_HTTP_V1" and (
+                    category is not ActionCategory.SAFE_READ or actor is not ActorMode.ANONYMOUS
+                    or descriptor.get("identity_id") or descriptor.get("session_id")):
+                raise ValueError
             identity_id = descriptor.get("identity_id")
             session_id = descriptor.get("session_id")
             if (actor is ActorMode.AUTHENTICATED and (not identity_id or not session_id)
@@ -560,6 +635,14 @@ class PlanOrchestrator:
                 return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
                                     reason="MESSAGE_CONTROLS_FROZEN", result=self._result(
                                         step, "No-message, wrong-type, trusted, foreign-origin, source, and port controls frozen."))
+            if (step.type == RuntimeStepType.ESTABLISH_CONTROL.value
+                    and snapshot.data.get("skill_id") == "credential-disclosure"):
+                if not self._exposure_binding_valid(package, snapshot.data.get("exposure_binding")):
+                    return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                        reason="EXPOSURE_ARTIFACT_STALE", waiting=RunStatus.BLOCKED)
+                return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                    reason="EXPOSURE_ARTIFACT_FROZEN", result=self._result(
+                                        step, "Current protected artifact and credential fingerprint bound."))
             if step.type == RuntimeStepType.VERIFY_BROWSER.value:
                 if snapshot.data.get("skill_id") == "postmessage-trust-analysis":
                     frozen = snapshot.data.get("message_binding")
@@ -629,6 +712,29 @@ class PlanOrchestrator:
                                     result=self._result(step, "Bounded DOM browser result: " + proof.status,
                                                         evidence_ids=refs), consumed=len(proof.trials))
             if step.type == RuntimeStepType.COMPARE_METADATA.value:
+                if snapshot.data.get("skill_id") == "protected-response-exposure":
+                    proof_step = next((item for item in self.runs.steps(run.id)
+                                       if item.action_slot == 0), None)
+                    proof = self.runs.result(proof_step.id) if proof_step else None
+                    if proof is None or not proof.exchange_ids:
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="EXPOSURE_CURRENT_RESPONSE_MISSING",
+                                            waiting=RunStatus.BLOCKED)
+                    return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                        reason="EXPOSURE_RESPONSE_COMPARED",
+                                        result=self._result(step, "Current response metadata recorded.",
+                                                            evidence_ids=proof.evidence_ids[:8]))
+                if snapshot.data.get("skill_id") == "credential-disclosure":
+                    frozen = snapshot.data.get("exposure_binding")
+                    if not self._exposure_binding_valid(package, frozen):
+                        return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                            reason="EXPOSURE_ARTIFACT_STALE", waiting=RunStatus.BLOCKED)
+                    candidate = self.exposure.current_candidate(package, frozen["candidate_id"])
+                    assert candidate is not None
+                    return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                        reason="EXPOSURE_CONTROLS_COMPARED", result=self._result(
+                                            step, "Currentness, public-identifier, and placeholder controls recorded.",
+                                            evidence_ids=candidate.evidence_ids[:8]))
                 if snapshot.data.get("skill_id") == "postmessage-trust-analysis":
                     proof_step = next((item for item in self.runs.steps(run.id)
                                        if item.type == RuntimeStepType.VERIFY_BROWSER.value), None)
@@ -778,7 +884,11 @@ class PlanOrchestrator:
                 max_dispatches=remaining, execution_id=execution_id,
                 continue_dispatch=lambda: self.runs.should_dispatch(run.id),
                 on_dispatch=lambda exchange_id: self.runs.account_dispatch(
-                    run.id, step.id, exchange_id), token_header=token_header)
+                    run.id, step.id, exchange_id), token_header=token_header,
+                artifact_capture_kind=("EXPOSURE" if
+                                       snapshot.data.get("skill_id") in {
+                                           "internal-vhost-access", "protected-response-exposure"}
+                                       else None))
             evidence_ids = self._record_execution_evidence(run, step, execution)
             result = self._result(step, "HTTP observation recorded." if execution.error is None else
                                   "Execution ended with a classified error.",

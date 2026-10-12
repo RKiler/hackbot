@@ -166,6 +166,7 @@ class RatePolicy:
 class ProgramRules:
     automated_testing_allowed: bool | None = None
     account_creation_allowed: bool | None = None
+    internal_vhost_testing_allowed: bool = False
     excluded_vulnerability_classes: tuple[str, ...] = ()
     forbidden_actions: tuple[str, ...] = ()
     third_party_restrictions: str | None = field(default=None, repr=False)
@@ -173,7 +174,8 @@ class ProgramRules:
     special_testing_notes: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
-        for value in (self.automated_testing_allowed, self.account_creation_allowed):
+        for value in (self.automated_testing_allowed, self.account_creation_allowed,
+                      self.internal_vhost_testing_allowed):
             if value is not None and type(value) is not bool:
                 raise ValueError("Invalid program rule boolean")
         for labels in (self.excluded_vulnerability_classes, self.forbidden_actions):
@@ -214,6 +216,7 @@ class ProgramRules:
         return {
             "automated_testing_allowed": self.automated_testing_allowed,
             "account_creation_allowed": self.account_creation_allowed,
+            "internal_vhost_testing_allowed": self.internal_vhost_testing_allowed,
             "excluded_vulnerability_classes": list(self.excluded_vulnerability_classes),
             "forbidden_actions": list(self.forbidden_actions),
             "third_party_restrictions": "[WITHHELD]" if self.third_party_restrictions else None,

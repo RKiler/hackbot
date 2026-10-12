@@ -63,6 +63,36 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path == "/assets/app-vhost.js":
+            normal = (b'const virtualHost = "http://admin.svc.internal"; '
+                      b'const route = "/assets/app-vhost.js";')
+            if self.headers.get("Host") == "admin.svc.internal":
+                mode = getattr(self.server, "fixture_vhost_mode", "vulnerable")
+                if mode == "secure":
+                    return self._answer(403, b"denied", (("Content-Type", "text/plain"),))
+                if mode == "title_only":
+                    return self._answer(200, b'{"title":"Internal Admin"}',
+                                        (("Content-Type", "application/json"),))
+                return self._answer(200, b'{"client_secret":"FixtureOnlyInternal-z8Qp4Rm7Tn2Yv6Wk"}',
+                                    (("Content-Type", "application/json"),))
+            return self._answer(200, normal, (("Content-Type", "application/javascript"),))
+        if self.path in {"/fixture/config.json", "/fixture/debug.txt",
+                         "/fixture/backup.json", "/fixture/dummy.json"}:
+            if getattr(self.server, "fixture_exposure_mode", "normal") == "deny":
+                return self._answer(403, b"denied", (("Content-Type", "text/plain"),))
+            if self.path == "/fixture/dummy.json":
+                body = b'{"password":"changeme"}'
+            elif self.path == "/fixture/debug.txt":
+                body = (b'Traceback: fixture application.py line 7\n'
+                        b'client_secret="FixtureOnlyDebug-z8Qp4Rm7Tn2Yv6Wk"')
+            elif self.path == "/fixture/backup.json":
+                body = b'{"client_secret":"FixtureOnlyBackup-z8Qp4Rm7Tn2Yv6Wk"}'
+            else:
+                body = b'{"client_secret":"FixtureOnlyConfig-z8Qp4Rm7Tn2Yv6Wk"}'
+            if getattr(self.server, "fixture_exposure_mode", "normal") == "changed":
+                body = b'{"status":"public"}'
+            content_type = "text/plain" if self.path.endswith(".txt") else "application/json"
+            return self._answer(200, body, (("Content-Type", content_type),))
         if self.path == "/assets/app.js":
             return self._answer(200, b'const api_key="fixture-secret";location.search;iframe.src;\n'
                                 b'//# sourceMappingURL=app.js.map',
@@ -433,6 +463,15 @@ class ExecutorTests(unittest.TestCase):
         self.browser.verify(session.id, rule)
         return identity, session
 
+    def test_plain_request_fingerprint_remains_backward_compatible(self):
+        url = self.base + "/fixture"
+        expected = hashlib.sha256(json.dumps(
+            ["GET", url, (), None], separators=(",", ":"),
+            ensure_ascii=True).encode()).hexdigest()
+        self.assertEqual(RequestTemplate("GET", url).fingerprint(), expected)
+        self.assertNotEqual(RequestTemplate("GET", url, host_override="admin.internal").fingerprint(),
+                            expected)
+
     def test_no_permit_wrong_binding_expiry_and_reuse_send_zero_extra(self):
         action = self.action()
         template = RequestTemplate("GET", action.url)
@@ -594,6 +633,10 @@ class ExecutorTests(unittest.TestCase):
             self.assertIsNone(result.error)
             self.assertTrue(result.truncated)
             self.assertEqual(result.body_bytes_captured, 1024)
+            exposure = self.run_action(self.action(path), artifact_capture_kind="EXPOSURE")
+            self.assertIsNone(exposure.error)
+            self.assertTrue(exposure.truncated)
+            self.assertIsNone(exposure.artifact_evidence_id)
         timeout = self.run_action(self.action("/sleep"))
         self.assertEqual(timeout.error, ExecutionError.TIMEOUT)
         self.assertEqual(self.traffic.get_exchange(timeout.exchange_ids[0]).state, ExchangeState.TIMEOUT)

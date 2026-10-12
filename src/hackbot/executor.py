@@ -71,6 +71,7 @@ class RequestTemplate:
     url: str = field(repr=False)
     headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     body: bytes | None = field(default=None, repr=False)
+    host_override: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.method not in _METHODS or not isinstance(self.url, str) or not 1 <= len(self.url) <= 4096:
@@ -93,10 +94,18 @@ class RequestTemplate:
             raise ValueError("Invalid request body")
         if self.method in {"GET", "HEAD"} and self.body not in (None, b""):
             raise ValueError("GET and HEAD bodies are not supported")
+        if self.host_override is not None and (
+                self.method != "GET" or not re.fullmatch(
+                    r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?",
+                    self.host_override) or ".." in self.host_override or
+                self.host_override.lower() == (urlsplit(self.url).hostname or "").lower()):
+            raise ValueError("Invalid bounded virtual-host override")
 
     def fingerprint(self) -> str:
         data = [self.method, self.url, self.headers,
                 hashlib.sha256(self.body).hexdigest() if self.body is not None else None]
+        if self.host_override is not None:
+            data.append({"host_override": self.host_override})
         return hashlib.sha256(json.dumps(data, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
 
@@ -349,7 +358,7 @@ class TrafficExecutor:
                                              action.actor is not ActorMode.AUTHENTICATED):
                 raise _Stop(ExecutionError.INVALID_REQUEST)
             if artifact_capture_kind is not None and (
-                artifact_capture_kind not in {"JS", "SOURCE_MAP"}
+                artifact_capture_kind not in {"JS", "SOURCE_MAP", "EXPOSURE"}
                 or template.method != "GET" or action.category is not ActionCategory.SAFE_READ
                 or template.body not in (None, b"")
             ):
@@ -363,6 +372,11 @@ class TrafficExecutor:
                     raise _Stop(ExecutionError.TIMEOUT)
                 package = self.targets.get_target_package(current_action.package_id)
                 if package is None or package.target.id != current_action.target_id:
+                    raise _Stop(ExecutionError.POLICY_DENIED)
+                if current_template.host_override is not None and (
+                        package.rules.internal_vhost_testing_allowed is not True or hop != 0 or
+                        current_template.method != "GET" or
+                        current_action.actor is not ActorMode.ANONYMOUS):
                     raise _Stop(ExecutionError.POLICY_DENIED)
                 self.permits.record(current_permit, "HOP_REQUESTED", "PRECHECK")
                 decision = self.policy.evaluate(package, current_action, record=True)
@@ -391,6 +405,8 @@ class TrafficExecutor:
                     route = self._route(current_action)
                     headers = dict(current_template.headers)
                     headers["Accept-Encoding"] = "gzip, deflate"
+                    if current_template.host_override is not None:
+                        headers["Host"] = current_template.host_override
                     if auth_header:
                         headers[auth_header[0]] = auth_header[1]
                     if token_header is not None:
@@ -483,12 +499,17 @@ class TrafficExecutor:
                                     or path.endswith((".js", ".mjs", ".cjs"))
                                 ) or artifact_capture_kind == "SOURCE_MAP" and (
                                     content_type in {"application/json", "text/plain"} and path.endswith(".map")
+                                ) or artifact_capture_kind == "EXPOSURE" and (
+                                    content_type in {"application/json", "text/plain",
+                                                     "application/octet-stream", "application/pdf"}
                                 )
                             )
                         )
                         if accepted:
                             asset_evidence = self.traffic.evidence.create_evidence(
-                                EvidenceType.JS_ASSET if artifact_capture_kind == "JS" else EvidenceType.SOURCE_MAP,
+                                EvidenceType.JS_ASSET if artifact_capture_kind == "JS" else
+                                EvidenceType.SOURCE_MAP if artifact_capture_kind == "SOURCE_MAP" else
+                                EvidenceType.HTTP_RESPONSE,
                                 body, source="controlled_asset_fetch",
                                 provenance=EvidenceProvenance(system="HACKBOT", entity="ASSET_FETCH",
                                                                record_id=exchange.id),
@@ -502,6 +523,8 @@ class TrafficExecutor:
                     self.rate.release(reservation.reservation_id)
                 if status not in _REDIRECTS or "Location" not in response.headers:
                     break
+                if current_template.host_override is not None:
+                    raise _Stop(ExecutionError.REDIRECT_DENIED)
                 try:
                     destination = urljoin(current_template.url, response.headers["Location"])
                 except ValueError:

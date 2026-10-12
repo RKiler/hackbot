@@ -15,6 +15,9 @@ from .domain import ObservationState
 from .evidence import EvidenceType, Fact, FactStatus, Retention
 from .domxss_static import DOMCandidateStatus
 from .domxss_store import DOMXSSStore
+from .exposure import ExposureSpecialist
+from .exposure_models import ExposureSource, ExposureStatus
+from .exposure_static import MAX_JS_SCAN_BYTES, MAX_MAP_SCAN_BYTES
 from .postmessage_static import MessageCandidateStatus
 from .postmessage_browser import (PostMessageBrowserExperimentExecutor,
                                   lookalike_origin, verified_owned_canary)
@@ -44,6 +47,10 @@ _AUTH_SKILLS = {
 }
 _GRAPHQL_SKILLS = {"graphql-object-authorization", "graphql-mutation-authorization"}
 _EXPOSURE_SKILLS = {"unauthenticated-sensitive-download", "sensitive-data-exposure"}
+_EXPOSURE_SKILLS.add("credential-disclosure")
+_EXPOSURE_SKILLS.add("internal-vhost-access")
+_EXPOSURE_SKILLS.add("protected-response-exposure")
+_EXPOSURE_SKILLS.add("overexposed-api-response")
 _CLIENT_SKILLS = {"check-before-transform-dom-xss", "postmessage-trust-analysis"}
 _KINDS = {**{skill: "AUTHORIZATION" for skill in _AUTH_SKILLS},
           **{skill: "GRAPHQL" for skill in _GRAPHQL_SKILLS},
@@ -62,6 +69,11 @@ _EXPECTED_VALIDATORS = {
     "graphql-mutation-authorization": {"state_readback", "role_matrix"},
     "unauthenticated-sensitive-download": {"content_hash_match", "authorization_control"},
     "sensitive-data-exposure": {"sensitivity_review", "public_by_design_check"},
+    "credential-disclosure": {"current_artifact", "credential_semantics", "public_by_design_check"},
+    "internal-vhost-access": {"scope_review", "current_reachability", "protected_effect"},
+    "protected-response-exposure": {"current_response", "credential_semantics",
+                                    "public_by_design_check"},
+    "overexposed-api-response": {"field_policy", "owner_control", "role_boundary"},
     "check-before-transform-dom-xss": {"browser_execution", "source_sink_trace"},
     "postmessage-trust-analysis": {"origin_control", "capability_proof"},
     "internal-surface-candidate": {"scope_review", "current_reachability"},
@@ -148,7 +160,11 @@ class ValidatorRegistry:
         for name in _GRAPHQL_SKILLS:
             self._items[name] = GraphQLValidator(name == "graphql-mutation-authorization")
         for name in _EXPOSURE_SKILLS:
-            self._items[name] = ExposureValidator(name == "sensitive-data-exposure")
+            self._items[name] = (ExposureArtifactValidator() if name == "credential-disclosure"
+                                 else ExposureVHostValidator() if name == "internal-vhost-access"
+                                 else ExposureHttpValidator() if name == "protected-response-exposure"
+                                 else ExposureFieldValidator() if name == "overexposed-api-response"
+                                 else ExposureValidator(name == "sensitive-data-exposure"))
         for name in _CLIENT_SKILLS:
             self._items[name] = (DOMXSSValidator() if name == "check-before-transform-dom-xss"
                                  else PostMessageValidator())
@@ -170,7 +186,8 @@ class DeterministicValidatorEngine:
                  registry: ValidatorRegistry | None = None,
                  dom: DOMXSSStore | None = None,
                  messages: PostMessageStore | None = None,
-                 targets: TargetPackageRepository | None = None) -> None:
+                 targets: TargetPackageRepository | None = None,
+                 exposure: ExposureSpecialist | None = None) -> None:
         self.runs, self.traffic, self.evidence = runs, traffic, evidence
         self.identities, self.hypotheses, self.results = identities, hypotheses, results
         self.registry = registry or ValidatorRegistry()
@@ -178,6 +195,7 @@ class DeterministicValidatorEngine:
         self.dom = dom
         self.messages = messages
         self.targets = targets
+        self.exposure = exposure
 
     def _semantic_object_hash(self, run: PlanRun, salted_hash: str | None,
                               object_type: str | None) -> str | None:
@@ -466,6 +484,16 @@ class DeterministicValidatorEngine:
                         self.evidence.set_retention(
                             ref, Retention(retain=True, pinned=True, finding_related=True),
                             actor="postmessage_validator", reason="confirmed_message_finding")
+        if self.exposure is not None and run.skill_id in _EXPOSURE_SKILLS:
+            candidate_id = self.exposure.store.candidate_for_plan(run.target_id, run.plan_id)
+            if candidate_id is not None:
+                self.exposure.store.bind_validation(run.target_id, candidate_id,
+                                                    run.id, recorded.id)
+                if recorded.status is ValidationStatus.CONFIRMED and finding is not None:
+                    for ref in recorded.supporting_evidence_ids:
+                        self.evidence.set_retention(
+                            ref, Retention(retain=True, pinned=True, finding_related=True),
+                            actor="exposure_validator", reason="confirmed_credential_exposure")
         return recorded, finding
 
     def record_manual(self, run_id: str, target_id: str, status: ValidationStatus,
@@ -1122,6 +1150,471 @@ class GraphQLValidator:
                          checks=tuple(checks), controls=("OWNER_CONTROL", "INVALID_OBJECT"),
                          supporting=evidence, reproductions=len(matches),
                          impact="GRAPHQL_PROTECTED_OBJECT_READ", finding=finding)
+
+
+class ExposureFieldValidator:
+    """A trusted field policy, not a JSON key name, defines the privacy boundary."""
+
+    id = "restricted_api_field_exposure"
+    version = "1.0.0"
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        if (engine.exposure is None or context.plan.get("skill_id") !=
+                "overexposed-api-response"):
+            return _decision(ValidationStatus.INVALID_TEST, "FIELD_EXPOSURE_BINDING_MISSING")
+        candidate_id = engine.exposure.store.candidate_for_plan(
+            context.run.target_id, context.run.plan_id)
+        candidate = engine.exposure.store.get(context.run.target_id, candidate_id) if candidate_id else None
+        if candidate is None or candidate.category.value != "OVEREXPOSED_API_RESPONSE":
+            return _decision(ValidationStatus.INVALID_TEST, "FIELD_EXPOSURE_CANDIDATE_MISSING")
+        owner, boundaries, negatives = engine._controls(context)
+        checks = engine._base_checks(owner, boundaries, negatives)
+        if (owner is None or len(boundaries) != 1 or len(negatives) != 1 or
+                any(item.outcome is CheckOutcome.FAIL for item in checks) or
+                not all(item.audit_valid for item in (owner, *boundaries, *negatives))):
+            return _decision(ValidationStatus.INVALID_TEST, "FIELD_EXPOSURE_CONTROLS_INVALID",
+                             checks=checks)
+        member = boundaries[0]
+        target, object_hash = context.run.target_id, owner.object_ref_hash
+        if (not object_hash or member.object_ref_hash != object_hash or
+                owner.identity_id == member.identity_id or
+                owner.features.status_code != 200):
+            return _decision(ValidationStatus.INVALID_TEST, "FIELD_OBJECT_OR_ROLE_UNPROVEN",
+                             checks=checks)
+        if member.features.status_code in _DENIED:
+            return _decision(ValidationStatus.REJECTED, "FIELD_BOUNDARY_DENIED",
+                             checks=checks, contradicting=member.evidence_ids[:4])
+        visibility, vis_refs = engine.fact_value(object_hash, "resource_visibility", target)
+        if visibility == "PUBLIC":
+            return _decision(ValidationStatus.REJECTED, "FIELD_RESOURCE_PUBLIC",
+                             checks=checks, contradicting=vis_refs)
+        classification, class_refs = engine.fact_value(object_hash, "data_classification", target)
+        restricted, field_refs = engine.fact_value(object_hash, "field_visibility", target)
+        if visibility != "PRIVATE" or classification != "SENSITIVE":
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "TRUSTED_FIELD_PRIVACY_POLICY_MISSING", checks=checks)
+        owner_membership = engine.membership(owner.identity_id, target)
+        member_membership = engine.membership(member.identity_id, target)
+        if owner_membership is None or member_membership is None:
+            return _decision(ValidationStatus.INVALID_TEST, "FIELD_ROLE_BOUNDARY_UNPROVEN",
+                             checks=checks)
+        cross_tenant = owner_membership[0] != member_membership[0]
+        if not cross_tenant:
+            if (not isinstance(restricted, str) or
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}:ROLE-[0-9a-f]{32}",
+                                     restricted)):
+                return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                                 "TRUSTED_FIELD_PRIVACY_POLICY_MISSING", checks=checks)
+            field_name, required_role = restricted.split(":", 1)
+            if (required_role not in owner_membership[1] or
+                    required_role in member_membership[1]):
+                return _decision(ValidationStatus.INVALID_TEST, "FIELD_ROLE_BOUNDARY_UNPROVEN",
+                                 checks=checks)
+        if (member.features.status_code != 200 or
+                object_hash not in owner.features.object_id_hashes or
+                object_hash not in member.features.object_id_hashes):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "FIELD_SAME_OBJECT_UNPROVEN", checks=checks)
+        def body(item: Observation) -> dict[str, object] | None:
+            ref = item.exchange.response.body_evidence_id if item.exchange.response else None
+            record = engine.evidence.get_evidence(ref) if ref else None
+            if (record is None or record.target_ref != target or
+                    record.redaction_status.value != "ORIGINAL" or
+                    record.content_size > 8192 or
+                    record.content_hash != item.features.body_hash):
+                return None
+            try:
+                value = json.loads(engine.evidence.read_content(ref, allow_sensitive=True,
+                                                                max_bytes=8192))
+                return value if isinstance(value, dict) else None
+            except (KeyError, TypeError, ValueError, PermissionError):
+                return None
+        owner_body, member_body = body(owner), body(member)
+        if owner_body is None or member_body is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "FIELD_RESPONSE_CONTENT_UNAVAILABLE", checks=checks)
+        if cross_tenant:
+            pii_fields = ("email", "phone", "address", "date_of_birth", "dob",
+                          "account_number", "government_id")
+            field_name = next((field for field in pii_fields
+                               if field in owner_body and field in member_body and
+                               isinstance(owner_body[field], str) and
+                               len(owner_body[field]) >= 5 and
+                               owner_body[field] == member_body[field]), None)
+            if field_name is None:
+                return _decision(ValidationStatus.REJECTED, "FOREIGN_PRIVATE_PII_NOT_DISCLOSED",
+                                 checks=checks, contradicting=member.evidence_ids[:4])
+        elif field_name not in owner_body:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "FIELD_RESPONSE_CONTENT_UNAVAILABLE", checks=checks)
+        if field_name not in member_body:
+            return _decision(ValidationStatus.REJECTED, "RESTRICTED_FIELD_REMOVED",
+                             checks=checks, contradicting=member.evidence_ids[:4])
+        owner_value = owner_body[field_name]
+        member_value = member_body[field_name]
+        if not isinstance(owner_value, (str, int)) or not owner_value or owner_value != member_value:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "RESTRICTED_FIELD_VALUE_NOT_PROVEN", checks=checks)
+        refs = tuple(dict.fromkeys((*owner.evidence_ids[:4], *member.evidence_ids[:4],
+                                    *negatives[0].evidence_ids[:2], *vis_refs,
+                                    *class_refs, *field_refs, *owner_membership[2],
+                                    *member_membership[2])))[:48]
+        checks = (*checks, _check("TRUSTED_PRIVATE_DATA_POLICY", True,
+                                 class_refs if cross_tenant else field_refs),
+                  _check("MEMBER_RECEIVED_OWNER_FIELD", True, member.evidence_ids[:4]))
+        title = ("Foreign tenant received private profile data" if cross_tenant else
+                 "Lower-role API response includes a restricted field")
+        impact = "CROSS_TENANT_PRIVATE_PII_DISCLOSURE" if cross_tenant else "RESTRICTED_API_FIELD_DISCLOSED"
+        finding = FindingSpec(
+            "FIELD_LEVEL_AUTHORIZATION", _digest(target + ":" + candidate_id + ":" + field_name),
+            _digest(candidate.location), None,
+            title,
+            "A verified unauthorized account received protected data for one controlled object. The invalid-object control was denied.",
+            impact, None, "MEDIUM")
+        return _decision(ValidationStatus.CONFIRMED, "RESTRICTED_FIELD_DISCLOSED",
+                         checks=checks, controls=("OWNER", "FOREIGN_TENANT" if cross_tenant else "LOWER_ROLE", "INVALID_OBJECT"),
+                         supporting=refs, reproductions=1,
+                         impact=impact, finding=finding)
+
+
+class ExposureHttpValidator:
+    """One fresh, exact Phase 14 re-read of a protected anonymous response."""
+
+    id = "controlled_response_exposure"
+    version = "1.0.0"
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        frozen = context.plan.get("exposure_binding")
+        if (engine.exposure is None or engine.targets is None or
+                not isinstance(frozen, dict) or
+                context.plan.get("skill_id") != "protected-response-exposure"):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_HTTP_BINDING_MISSING")
+        package = engine.targets.get_target_package(context.run.package_id)
+        if package is None or package.target.id != context.run.target_id:
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_HTTP_PACKAGE_MISSING")
+        try:
+            template = engine.exposure.resolve_captured_response(package, frozen)
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_HTTP_SOURCE_UNTRUSTED")
+        candidate = engine.exposure.store.get(context.run.target_id, frozen["candidate_id"])
+        original = engine.evidence.get_evidence(frozen["evidence_id"])
+        if (candidate is None or candidate.credential is None or original is None or
+                original.target_ref != context.run.target_id or
+                original.evidence_type != EvidenceType.HTTP_RESPONSE.value or
+                original.content_hash != frozen["artifact_sha256"] or
+                original.redaction_status.value != "ORIGINAL"):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_HTTP_ARTIFACT_INVALID")
+        if len(context.observations) != 1:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "EXPOSURE_HTTP_REPRODUCTION_MISSING")
+        observed = context.observations[0]
+        if (not observed.audit_valid or observed.actor != "ANONYMOUS" or
+                observed.step.action_slot != 0 or
+                observed.exchange.request.record.method != "GET"):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_HTTP_POLICY_UNPROVEN")
+        try:
+            request = json.loads(engine.evidence.read_content(
+                observed.exchange.request.observation_evidence_id,
+                allow_sensitive=True, max_bytes=8192))
+            if request["url"] != template.url:
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "EXPOSURE_HTTP_URL_MISMATCH")
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return _decision(ValidationStatus.INVALID_TEST,
+                             "EXPOSURE_HTTP_REQUEST_UNAVAILABLE")
+        refs = tuple(dict.fromkeys((original.evidence_id, *observed.evidence_ids)))[:32]
+        if observed.features.status_code in _DENIED:
+            return _decision(ValidationStatus.REJECTED, "EXPOSURE_HTTP_CURRENTLY_DENIED",
+                             contradicting=refs)
+        if (observed.features.status_code != 200 or
+                observed.features.body_hash != original.content_hash):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "EXPOSURE_HTTP_CURRENT_HASH_CHANGED", contradicting=refs)
+        current_record = next((record for ref in observed.evidence_ids
+                               if (record := engine.evidence.get_evidence(ref)) is not None and
+                               record.target_ref == context.run.target_id and
+                               record.evidence_type == EvidenceType.HTTP_RESPONSE.value and
+                               record.source == "controlled_asset_fetch" and
+                               record.content_hash == original.content_hash and
+                               record.redaction_status.value == "ORIGINAL" and
+                               record.content_size <= 65_536), None)
+        if current_record is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "EXPOSURE_HTTP_CURRENT_BYTES_UNAVAILABLE", supporting=refs)
+        try:
+            body = engine.evidence.read_content(current_record.evidence_id,
+                                                allow_sensitive=True, max_bytes=65_536)
+        except (KeyError, ValueError, PermissionError):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "EXPOSURE_HTTP_BYTES_UNAVAILABLE", supporting=refs)
+        signal = next((item for item in engine.exposure.analyzer.analyze_js(body).signals
+                       if item.fingerprint_sha256 == candidate.credential.fingerprint_sha256), None)
+        if signal is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "EXPOSURE_HTTP_CREDENTIAL_NOT_REPRODUCED", supporting=refs)
+        if signal.status in {ExposureStatus.REJECTED_PUBLIC,
+                             ExposureStatus.REJECTED_PLACEHOLDER}:
+            return _decision(ValidationStatus.REJECTED,
+                             "EXPOSURE_HTTP_PUBLIC_OR_SAMPLE", contradicting=refs)
+        credential_ok = signal.status is ExposureStatus.FORMAT_VALID and (
+            signal.credential_type in {"CLIENT_SECRET", "PASSWORD", "PRIVATE_KEY",
+                                       "CONNECTION_STRING", "KNOWN_FORMAT_TOKEN"} or
+            signal.credential_type in {"API_KEY", "TOKEN"} and
+            "APPLICATION_REQUEST_USAGE" in signal.reason_codes)
+        if not credential_ok:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "EXPOSURE_HTTP_CREDENTIAL_SEMANTICS_UNPROVEN", supporting=refs)
+        checks = (_check("EXACT_SCOPED_SOURCE", True, refs[:1]),
+                  _check("ANONYMOUS_POLICY_REPRODUCTION", True, refs[-4:]),
+                  _check("CURRENT_NON_PUBLIC_CREDENTIAL", True,
+                         (original.evidence_id, current_record.evidence_id)))
+        finding = FindingSpec(
+            "CREDENTIAL_DISCLOSURE", _digest(context.run.target_id + ":" +
+                                             candidate.credential.fingerprint_sha256),
+            _digest(template.url), None,
+            "Anonymous response discloses non-public application credential",
+            "One exact scoped response was re-read anonymously and still contained non-public credential material. No credential was used.",
+            "NON_PUBLIC_CREDENTIAL_DISCLOSED", None, "MEDIUM")
+        return _decision(ValidationStatus.CONFIRMED,
+                         "EXPOSURE_HTTP_CREDENTIAL_REPRODUCED", checks=checks,
+                         controls=("EXACT_ORIGINAL", "FRESH_ANONYMOUS", "PUBLIC_VALUE_FILTER"),
+                         supporting=refs, reproductions=1,
+                         impact="NON_PUBLIC_CREDENTIAL_DISCLOSED", finding=finding)
+
+
+class ExposureVHostValidator:
+    """Candidate-only protected content behind an explicitly approved Host route."""
+
+    id = "bounded_internal_vhost_exposure"
+    version = "1.0.0"
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        frozen = context.plan.get("exposure_binding")
+        if (engine.exposure is None or engine.targets is None or
+                not isinstance(frozen, dict) or
+                context.plan.get("skill_id") != "internal-vhost-access"):
+            return _decision(ValidationStatus.INVALID_TEST, "VHOST_BINDING_MISSING")
+        package = engine.targets.get_target_package(context.run.package_id)
+        if (package is None or package.target.id != context.run.target_id or
+                package.rules.internal_vhost_testing_allowed is not True or
+                package.scope.evaluate_url(str(frozen.get("url", ""))).result
+                is not ScopeResult.IN_SCOPE):
+            return _decision(ValidationStatus.INVALID_TEST, "VHOST_POLICY_OR_SCOPE_MISSING")
+        candidate_id = frozen.get("candidate_id")
+        if not isinstance(candidate_id, str):
+            return _decision(ValidationStatus.INVALID_TEST, "VHOST_CANDIDATE_MISSING")
+        candidate = engine.exposure.current_candidate(package, candidate_id)
+        if candidate is None or candidate.artifact_sha256 != frozen.get("artifact_sha256"):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "VHOST_SOURCE_STALE")
+        try:
+            host = engine.exposure.vhost_reference(package, candidate_id,
+                                                    str(frozen["source_ref"]))
+        except (KeyError, ValueError, PermissionError):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "VHOST_SOURCE_UNPROVEN")
+        if hashlib.sha256(host.encode()).hexdigest() != frozen.get("host_sha256"):
+            return _decision(ValidationStatus.INVALID_TEST, "VHOST_HOST_BINDING_CHANGED")
+        observations = {item.step.action_slot: item for item in context.observations}
+        if set(observations) != {0, 1, 2}:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "VHOST_THREE_CONTROLS_MISSING")
+        normal, invalid, routed = (observations[index] for index in (0, 1, 2))
+        expected_hosts = (None,
+                          "invalid-" + hashlib.sha256(context.run.id.encode()).hexdigest()[:16]
+                          + ".invalid", host)
+        for index, item in enumerate((normal, invalid, routed)):
+            if (not item.audit_valid or item.actor != "ANONYMOUS" or
+                    item.exchange.request.record.method != "GET" or
+                    item.exchange.response is None or
+                    item.exchange.response.record.status_code is None):
+                return _decision(ValidationStatus.INVALID_TEST, "VHOST_CONTROL_UNTRUSTED")
+            ref = item.exchange.request.observation_evidence_id
+            try:
+                observed = json.loads(engine.evidence.read_content(
+                    ref, allow_sensitive=True, max_bytes=8192))
+                headers = {str(name).lower(): value for name, value in observed["headers"]}
+                if (observed["url"] != frozen["url"] or
+                        headers.get("host") != expected_hosts[index]):
+                    return _decision(ValidationStatus.INVALID_TEST, "VHOST_HOST_OR_DESTINATION_MISMATCH")
+            except (KeyError, TypeError, ValueError, PermissionError):
+                return _decision(ValidationStatus.INVALID_TEST, "VHOST_REQUEST_EVIDENCE_MISSING")
+        refs = tuple(dict.fromkeys((str(frozen["evidence_id"]),
+                                    *(ref for item in (normal, invalid, routed)
+                                      for ref in item.evidence_ids[:4]))))[:32]
+        if routed.features.status_code in _DENIED:
+            return _decision(ValidationStatus.REJECTED, "INTERNAL_VHOST_DENIED",
+                             contradicting=refs)
+        if (routed.features.status_code != 200 or not routed.features.body_hash or
+                routed.features.body_hash in {normal.features.body_hash,
+                                              invalid.features.body_hash}):
+            return _decision(ValidationStatus.REJECTED, "VHOST_NOT_DISTINCT_OR_NOT_REACHABLE",
+                             contradicting=refs)
+        def captured_body(item: Observation) -> bytes | None:
+            for ref in item.evidence_ids:
+                record = engine.evidence.get_evidence(ref)
+                if (record is None or record.target_ref != context.run.target_id or
+                        record.evidence_type != EvidenceType.HTTP_RESPONSE.value or
+                        record.source != "controlled_asset_fetch" or
+                        record.redaction_status.value != "ORIGINAL" or
+                        record.content_hash != item.features.body_hash or
+                        record.content_size > 65_536):
+                    continue
+                try:
+                    return engine.evidence.read_content(ref, allow_sensitive=True,
+                                                        max_bytes=65_536)
+                except (KeyError, ValueError, PermissionError):
+                    return None
+            return None
+        body = captured_body(routed)
+        if body is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "VHOST_PROTECTED_BYTES_UNAVAILABLE", supporting=refs)
+        analysis = engine.exposure.analyzer.analyze_js(body)
+        credential = next((signal for signal in analysis.signals
+                           if signal.status is ExposureStatus.FORMAT_VALID and
+                           signal.credential_type in {"CLIENT_SECRET", "PASSWORD",
+                                                      "PRIVATE_KEY", "CONNECTION_STRING",
+                                                      "KNOWN_FORMAT_TOKEN"}), None)
+        if credential is None:
+            return _decision(ValidationStatus.REJECTED, "VHOST_NO_PROTECTED_EFFECT",
+                             contradicting=refs)
+        for item in (normal, invalid):
+            comparison = captured_body(item)
+            if comparison is not None and any(
+                    signal.fingerprint_sha256 == credential.fingerprint_sha256
+                    for signal in engine.exposure.analyzer.analyze_js(comparison).signals):
+                return _decision(ValidationStatus.REJECTED, "VHOST_SECRET_ON_CONTROL_ROUTE",
+                                 contradicting=refs)
+        checks = (_check("EXPLICIT_SCOPE_AND_POLICY", True, refs[:1]),
+                  _check("THREE_AUDITED_HOST_CONTROLS", True, refs[:4]),
+                  _check("CANDIDATE_ONLY_PROTECTED_CONTENT", True, refs[-4:]))
+        finding = FindingSpec(
+            "INTERNAL_SURFACE_EXPOSURE", _digest(context.run.target_id + ":" + candidate_id),
+            _digest(str(frozen["url"])), None,
+            "Internal virtual host exposes non-public configuration",
+            "A sourced internal Host routed an unauthenticated scoped request to configuration containing non-public credential material; normal and invalid Host controls did not.",
+            "INTERNAL_VHOST_CREDENTIAL_DISCLOSURE", None, "MEDIUM")
+        return _decision(ValidationStatus.CONFIRMED, "INTERNAL_VHOST_PROTECTED_CONTENT",
+                         checks=checks, controls=("NORMAL_HOST", "INVALID_HOST", "SOURCED_HOST"),
+                         supporting=refs, reproductions=1,
+                         impact="INTERNAL_VHOST_CREDENTIAL_DISCLOSURE", finding=finding)
+
+
+class ExposureArtifactValidator:
+    """Validate an exact protected JS/map artifact without using the discovered value."""
+
+    id = "credential_artifact_exposure"
+    version = "1.0.0"
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        frozen = context.plan.get("exposure_binding")
+        if (engine.exposure is None or engine.targets is None or not isinstance(frozen, dict)
+                or context.plan.get("skill_id") != "credential-disclosure"):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_BINDING_MISSING")
+        package = engine.targets.get_target_package(context.run.package_id)
+        if package is None or package.target.id != context.run.target_id:
+            return _decision(ValidationStatus.INVALID_TEST, "TARGET_PACKAGE_MISSING")
+        candidate_id = frozen.get("candidate_id")
+        if not isinstance(candidate_id, str):
+            return _decision(ValidationStatus.INVALID_TEST, "EXPOSURE_BINDING_INVALID")
+        candidate = engine.exposure.current_candidate(package, candidate_id)
+        if candidate is None:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "CURRENT_ARTIFACT_UNPROVEN")
+        link = next((item for item in engine.exposure.store.source_links(
+            context.run.target_id, candidate_id) if item["current"] and
+            all(item.get(key) == frozen.get(key) for key in
+                ("source_ref", "evidence_id", "artifact_sha256")) and
+            item["source"] == frozen.get("source")), None)
+        if (link is None or candidate.credential is None or
+                candidate.credential.fingerprint_sha256 != frozen.get("credential_fingerprint") or
+                candidate.artifact_sha256 != frozen.get("artifact_sha256") or
+                candidate.source not in {ExposureSource.JS_ASSET, ExposureSource.SOURCE_MAP}):
+            return _decision(ValidationStatus.INVALID_TEST, "ARTIFACT_BINDING_MISMATCH")
+        source_ref = str(link["source_ref"])
+        if candidate.source is ExposureSource.JS_ASSET:
+            asset = engine.exposure.dom.get_asset(context.run.target_id, source_ref)
+            retrieval_id = asset.retrieval_exchange_id if asset else None
+        else:
+            source_map = engine.exposure.dom.get_source_map_by_id(context.run.target_id, source_ref)
+            asset = (engine.exposure.dom.get_asset(context.run.target_id, source_map.js_artifact_id)
+                     if source_map else None)
+            retrieval_id = source_map.retrieval_exchange_id if source_map else None
+        if asset is None:
+            return _decision(ValidationStatus.INVALID_TEST, "ARTIFACT_SOURCE_MISSING")
+        source_evidence = engine.evidence.get_evidence(str(link["evidence_id"]))
+        if (source_evidence is None or source_evidence.target_ref != context.run.target_id
+                or source_evidence.sensitivity.value != "SENSITIVE"
+                or source_evidence.content_hash != frozen["artifact_sha256"]
+                or source_evidence.redaction_status.value != "ORIGINAL"):
+            return _decision(ValidationStatus.INVALID_TEST, "PROTECTED_SOURCE_INVALID")
+        retrieval_refs: tuple[str, ...] = ()
+        if asset.source == "CONTROLLED_HTTP":
+            exchange = engine.traffic.get_exchange(retrieval_id) if retrieval_id else None
+            if (exchange is None or exchange.state is not ExchangeState.COMPLETE
+                    or exchange.target_id != context.run.target_id or
+                    exchange.package_id != package.id or exchange.scope_result is not ScopeResult.IN_SCOPE
+                    or exchange.attribution.auth_state is not AuthState.ANONYMOUS
+                    or exchange.response is None or exchange.response.record.status_code != 200
+                    or exchange.response.body_hash != frozen["artifact_sha256"]):
+                return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                                 "ANONYMOUS_CONTROLLED_RETRIEVAL_UNPROVEN")
+            retrieval_refs = tuple(dict.fromkeys((*exchange.request.record.evidence_ids[:2],
+                                                   *exchange.response.record.evidence_ids[:2])))
+        elif asset.source != "FIXTURE" or not package.primary_domain.endswith(".test"):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "CONTROLLED_RETRIEVAL_REQUIRED")
+        try:
+            body = engine.evidence.read_content(
+                source_evidence.evidence_id, allow_sensitive=True,
+                max_bytes=MAX_JS_SCAN_BYTES if candidate.source is ExposureSource.JS_ASSET
+                else MAX_MAP_SCAN_BYTES)
+        except (KeyError, ValueError, PermissionError):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "ARTIFACT_BYTES_UNAVAILABLE")
+        if hashlib.sha256(body).hexdigest() != frozen["artifact_sha256"]:
+            return _decision(ValidationStatus.INVALID_TEST, "ARTIFACT_HASH_MISMATCH")
+        analysis = (engine.exposure.analyzer.analyze_js(body)
+                    if candidate.source is ExposureSource.JS_ASSET else
+                    engine.exposure.analyzer.analyze_source_map(body))
+        signal = next((item for item in analysis.signals if
+                       item.fingerprint_sha256 == frozen["credential_fingerprint"]), None)
+        refs = tuple(dict.fromkeys((source_evidence.evidence_id, *retrieval_refs)))[:16]
+        checks = (_check("CURRENT_ARTIFACT", True, refs),
+                  _check("ANONYMOUS_PUBLIC_RETRIEVAL", True, refs),
+                  _check("CREDENTIAL_PRESENT", signal is not None, refs))
+        if signal is None or analysis.truncated or analysis.parse_error:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "CREDENTIAL_SIGNAL_UNPROVEN", checks=checks)
+        if signal.status in {ExposureStatus.REJECTED_PUBLIC, ExposureStatus.REJECTED_PLACEHOLDER}:
+            return _decision(ValidationStatus.REJECTED,
+                             "PUBLIC_OR_PLACEHOLDER_VALUE", checks=checks,
+                             contradicting=refs)
+        used = "APPLICATION_REQUEST_USAGE" in signal.reason_codes
+        sensitive_type = signal.credential_type in {
+            "CLIENT_SECRET", "PASSWORD", "TOKEN", "API_KEY", "CONNECTION_STRING",
+            "KNOWN_FORMAT_TOKEN", "PRIVATE_KEY", "SECRET"}
+        checks += (_check("NON_PUBLIC_CREDENTIAL", sensitive_type, refs),
+                   _check("APPLICATION_REQUEST_USAGE", used, refs),
+                   _check("TARGET_RELEVANCE", signal.service_class in {
+                       "APPLICATION", "DATABASE", "CLOUD", "GITHUB"} and used, refs))
+        if not sensitive_type or signal.status is ExposureStatus.NEEDS_RESEARCH:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "CREDENTIAL_SEMANTICS_UNPROVEN", checks=checks)
+        if not used:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "APPLICATION_USE_UNPROVEN", checks=checks)
+        root = _digest(context.run.target_id + ":" + signal.fingerprint_sha256)
+        finding = FindingSpec(
+            "CREDENTIAL_DISCLOSURE", root, _digest(candidate.location), None,
+            "Non-public application credential in current first-party asset",
+            "An anonymous visitor can retrieve a current first-party asset containing a non-public credential used in application request construction.",
+            "NON_PUBLIC_APPLICATION_CREDENTIAL_DISCLOSED", None, "MEDIUM")
+        return _decision(ValidationStatus.CONFIRMED,
+                         "CURRENT_APPLICATION_CREDENTIAL_EXPOSED", checks=checks,
+                         controls=("CURRENT_HASH", "ANONYMOUS_RETRIEVAL", "PUBLIC_IDENTIFIER_FILTER"),
+                         supporting=refs, reproductions=1,
+                         impact="NON_PUBLIC_APPLICATION_CREDENTIAL_DISCLOSED", finding=finding)
 
 
 class ExposureValidator:

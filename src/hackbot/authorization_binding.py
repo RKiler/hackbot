@@ -65,6 +65,71 @@ def reference_fingerprint(shape: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def resolve_exposure_read(shape: dict[str, str], *, package: TargetPackage,
+                          run_id: str, objects: ObjectRegistry, traffic: TrafficStore,
+                          evidence: EvidenceFactStore) -> tuple[RequestTemplate, str]:
+    """Rebuild only an exact observed owned GET; never replay captured credentials."""
+    if (set(shape) != _KEYS or shape.get("binding") != "EXPOSURE_OBJECT_PATH_V1"
+            or shape.get("authentication") != "EXECUTOR_SUPPLIED"
+            or shape.get("method") != "GET"
+            or shape.get("variant") not in {"OWNER", "ANONYMOUS", "INVALID_OBJECT"}
+            or shape.get("fingerprint") != reference_fingerprint(shape)):
+        raise ValueError("invalid exposure request reference")
+    item = objects.get(shape["test_object_id"], package.target.id)
+    if (item is None or item.package_id != package.id or item.state is not ObjectState.IN_USE
+            or not item.disposable or item.verified_at is None or not item.external_id_hash
+            or not item.external_id_evidence_id or objects.active_reservation(item.id) != run_id):
+        raise ValueError("owned exposure object reservation is missing")
+    for predicate, value in (("created_by", item.creator_identity_id),
+                             ("resource_tenant", item.tenant_id), ("disposable", "true")):
+        facts = evidence.find_facts(item.id, predicate, limit=8).items
+        if not any(fact.target_ref == package.target.id and fact.status is FactStatus.ACTIVE
+                   and fact.source != "MANUAL" and fact.confidence >= 0.9
+                   and fact.evidence_ids and fact.object == value for fact in facts):
+            raise ValueError("owned exposure object facts are missing")
+    external = evidence.read_content(item.external_id_evidence_id,
+                                     allow_sensitive=True, max_bytes=256).decode("ascii")
+    if (not external or "/" in external or "\\" in external or
+            hashlib.sha256((item.id + ":" + external).encode()).hexdigest() != item.external_id_hash):
+        raise ValueError("owned exposure object ID integrity failed")
+    exchange = traffic.get_exchange(shape["source_exchange_id"])
+    if (exchange is None or exchange.target_id != package.target.id or exchange.package_id != package.id
+            or exchange.state is not ExchangeState.COMPLETE or exchange.response is None
+            or exchange.attribution.auth_state is not AuthState.VERIFIED
+            or exchange.attribution.verified_identity_id != item.creator_identity_id
+            or exchange.scope_result is not ScopeResult.IN_SCOPE
+            or exchange.request.record.method != "GET" or
+            exchange.response.record.status_code != 200 or
+            not exchange.response.body_hash or not exchange.response.record.size_bytes or
+            exchange.response.record.content_type in {"text/html", "application/xhtml+xml"}):
+        raise ValueError("verified owned exposure baseline is missing")
+    request_ref = exchange.request.observation_evidence_id
+    record = evidence.get_evidence(request_ref) if request_ref else None
+    if record is None or record.target_ref != package.target.id:
+        raise ValueError("owned exposure request provenance is missing")
+    try:
+        observed = json.loads(evidence.read_content(record.evidence_id,
+                                                    allow_sensitive=True, max_bytes=8192))
+        url = observed["url"]
+        parsed = urlsplit(url)
+    except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+        raise ValueError("owned exposure URL is unavailable") from None
+    if (not isinstance(url, str) or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE):
+        raise ValueError("owned exposure URL is unsafe")
+    segments = parsed.path.split("/")
+    positions = [index for index, segment in enumerate(segments) if unquote(segment) == external]
+    if len(positions) != 1:
+        raise ValueError("owned exposure path lacks one exact object ID")
+    if shape["variant"] == "INVALID_OBJECT":
+        segments[positions[0]] = quote(str(uuid.uuid5(uuid.NAMESPACE_URL, run_id + ":" + item.id)), safe="")
+        url = urlunsplit((parsed.scheme, parsed.netloc, "/".join(segments), "", ""))
+        if package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE:
+            raise ValueError("invalid-object control left scope")
+    return RequestTemplate("GET", url), item.external_id_hash
+
+
 def resolve_authorization_request(shape: dict[str, str], *, package: TargetPackage,
                                   run_id: str, objects: ObjectRegistry,
                                   traffic: TrafficStore, evidence: EvidenceFactStore) -> tuple[RequestTemplate, str]:

@@ -16,6 +16,8 @@ import uuid
 from .authorization_binding import reference_fingerprint
 from .domxss_static import DOMCandidateStatus
 from .domxss_store import DOMXSSStore
+from .exposure_store import ExposureStore
+from .exposure_models import ExposureCategory, ExposureStatus
 from .postmessage_static import MessageCandidateStatus
 from .postmessage_store import PostMessageStore
 from .mutation_binding import MutationStage, STAGES, mutation_fingerprint
@@ -114,7 +116,8 @@ class SkillContextBuilder:
                  recon: ReconRepository | None = None,
                  objects: ObjectRegistry | None = None,
                  dom: DOMXSSStore | None = None,
-                 messages: PostMessageStore | None = None) -> None:
+                 messages: PostMessageStore | None = None,
+                 exposure: ExposureStore | None = None) -> None:
         self.store = store
         self.registry = registry
         self.traffic = traffic
@@ -123,6 +126,7 @@ class SkillContextBuilder:
         self.objects = objects
         self.dom = dom
         self.messages = messages
+        self.exposure = exposure
 
     def build(self, hypothesis: Hypothesis, profile: TargetProfile | None,
               package: TargetPackage | None = None,
@@ -292,6 +296,23 @@ class SkillContextBuilder:
                 }
         if "FEATURE_DOWNLOAD" in signals or "FEATURE_PII_OBJECT" in signals:
             flags.add("sensitive_artifact")  # Candidate only, never secret bytes.
+        if self.exposure is not None and hypothesis.surface_key.startswith("exposure:"):
+            candidate = self.exposure.get(hypothesis.target_id, hypothesis.surface_key[9:])
+            if candidate is not None and candidate.status not in {
+                    ExposureStatus.STALE, ExposureStatus.REJECTED_PUBLIC,
+                    ExposureStatus.REJECTED_PLACEHOLDER}:
+                flags.add("sensitive_artifact")
+                signals = tuple(dict.fromkeys((*signals, candidate.category.value)))[:8]
+                if candidate.source.value == "TRAFFIC":
+                    for link in self.exposure.source_links(hypothesis.target_id,
+                                                          candidate.candidate_id)[:8]:
+                        exchange = self.traffic.get_exchange(str(link["source_ref"]))
+                        if (exchange is not None and exchange.target_id == hypothesis.target_id
+                                and exchange.response is not None
+                                and exchange.response.record.status_code == 200
+                                and exchange.attribution.auth_state.value == "VERIFIED"):
+                            flags.update({"baseline_traffic", "authenticated_endpoint"})
+                            break
         if any(f["predicate"] == "data_classification" and f["status"] == "ACTIVE"
                for f in facts):
             flags.add("sensitive_artifact")
@@ -411,6 +432,7 @@ class InvestigationPlan:
     comparison_pairs: tuple[dict[str, int], ...] = ()
     dom_binding: dict[str, str] | None = None
     message_binding: dict[str, str] | None = None
+    exposure_binding: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
@@ -432,6 +454,7 @@ class InvestigationPlan:
                 "created_at": self.created_at, "comparison_pairs": list(self.comparison_pairs),
                 "dom_binding": self.dom_binding,
                 "message_binding": self.message_binding,
+                "exposure_binding": self.exposure_binding,
                 "execution_started": False, "finding_status": "UNVALIDATED"}
 
 
@@ -570,11 +593,166 @@ class SkillPlanner:
                  policy: PolicyEngine, store: SkillPlanStore,
                  dom: DOMXSSStore | None = None,
                  messages: PostMessageStore | None = None,
-                 objects: ObjectRegistry | None = None) -> None:
+                 objects: ObjectRegistry | None = None,
+                 exposure: ExposureStore | None = None) -> None:
         self.registry, self.checker, self.policy, self.store = registry, checker, policy, store
         self.dom = dom
         self.messages = messages
         self.objects = objects
+        self.exposure = exposure
+
+    def bind_protected_response(self, package: TargetPackage, hypothesis: Hypothesis,
+                                context: SkillContext, candidate_id: str) -> dict[str, object]:
+        if (self.exposure is None or hypothesis.target_id != package.target.id or
+                hypothesis.surface_key != "exposure:" + candidate_id or
+                context.target_id != package.target.id):
+            raise ValueError("Protected response binding target mismatch")
+        candidate = self.exposure.get(package.target.id, candidate_id)
+        link = next((item for item in self.exposure.source_links(package.target.id, candidate_id)
+                     if item["current"] and candidate is not None and
+                     item["source_ref"] == candidate.endpoint_or_asset and
+                     item["artifact_sha256"] == candidate.artifact_sha256), None)
+        if (candidate is None or candidate.source.value != "TRAFFIC" or
+                candidate.credential is None or candidate.artifact_sha256 is None or
+                candidate.status in {ExposureStatus.STALE, ExposureStatus.REJECTED_PUBLIC,
+                                     ExposureStatus.REJECTED_PLACEHOLDER} or link is None):
+            raise ValueError("Controlled protected response required")
+        skill = self.registry.select("protected-response-exposure")
+        prerequisite = self.checker.check(skill.metadata, context)
+        if prerequisite.state is not PrerequisiteState.READY:
+            raise ValueError("Protected response prerequisites unavailable")
+        frozen = {"candidate_id": candidate_id, "source_ref": candidate.endpoint_or_asset,
+                  "evidence_id": str(link["evidence_id"]),
+                  "artifact_sha256": candidate.artifact_sha256}
+        shape = {**frozen, "binding": "EXPOSURE_HTTP_V1", "method": "GET",
+                 "authentication": "EXECUTOR_SUPPLIED"}
+        shape["fingerprint"] = hashlib.sha256(json.dumps(
+            shape, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        actions = ({"category": "SAFE_READ", "actor": "ANONYMOUS", "identity_id": None,
+                    "session_id": None, "method": "GET", "role": "BOUNDARY",
+                    "vulnerability_class": "exposure",
+                    "request_template_fingerprint": shape["fingerprint"],
+                    "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True},)
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prerequisite,
+            skill.controls, tuple((StepType(kind), description)
+                                  for kind, description in skill.workflow), actions,
+            (shape,), skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, 1, skill.metadata.token_budget,
+            "READY_FOR_MANUAL_REVIEW", datetime.now(timezone.utc).isoformat(),
+            exposure_binding=frozen)
+        result = self.store.save(plan, regenerate=True)
+        self.exposure.bind_plan(package.target.id, candidate_id, hypothesis.id, result["id"])
+        return result
+
+    def bind_vhost(self, package: TargetPackage, hypothesis: Hypothesis,
+                   context: SkillContext, candidate_id: str, *,
+                   source_ref: str, host_sha256: str) -> dict[str, object]:
+        """Freeze three same-destination controls without persisting the internal hostname."""
+        if (self.exposure is None or package.rules.internal_vhost_testing_allowed is not True
+                or hypothesis.target_id != package.target.id
+                or hypothesis.surface_key != "exposure:" + candidate_id
+                or context.target_id != package.target.id
+                or not re.fullmatch(r"[0-9a-f]{64}", host_sha256)):
+            raise ValueError("Virtual-host testing is not explicitly authorized")
+        candidate = self.exposure.get(package.target.id, candidate_id)
+        source = next((item for item in self.exposure.source_links(package.target.id, candidate_id)
+                       if item["current"] and item["source_ref"] == source_ref and
+                       candidate is not None and item["artifact_sha256"] == candidate.artifact_sha256), None)
+        if (candidate is None or candidate.category is not ExposureCategory.INTERNAL_VHOST_CANDIDATE
+                or candidate.artifact_sha256 is None or source is None
+                or "_redacted_" in candidate.location or
+                package.scope.evaluate_url(candidate.location).result is not ScopeResult.IN_SCOPE):
+            raise ValueError("Current exact in-scope VHOST source is required")
+        skill = self.registry.select("internal-vhost-access")
+        prerequisite = self.checker.check(skill.metadata, context)
+        if prerequisite.state is not PrerequisiteState.READY:
+            raise ValueError("Virtual-host prerequisites are unavailable")
+        frozen = {"candidate_id": candidate_id, "source_ref": source_ref,
+                  "evidence_id": str(source["evidence_id"]),
+                  "artifact_sha256": candidate.artifact_sha256,
+                  "host_sha256": host_sha256, "url": candidate.location}
+        actions: list[dict[str, object]] = []
+        templates: list[dict[str, str]] = []
+        for role, variant in (("CONTROL", "NORMAL"), ("OTHER", "INVALID"),
+                              ("BOUNDARY", "CANDIDATE")):
+            shape = {**frozen, "binding": "EXPOSURE_VHOST_V1", "variant": variant,
+                     "method": "GET", "authentication": "EXECUTOR_SUPPLIED"}
+            shape["fingerprint"] = hashlib.sha256(json.dumps(
+                shape, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            templates.append(shape)
+            actions.append({"category": "SAFE_READ", "actor": "ANONYMOUS",
+                            "identity_id": None, "session_id": None, "method": "GET",
+                            "role": role, "control_kind": "INVALID_HOST" if variant == "INVALID" else None,
+                            "vulnerability_class": "internal_surface",
+                            "request_template_fingerprint": shape["fingerprint"],
+                            "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True})
+        steps = [(StepType.OBSERVE, "Check current source and exact destination.")]
+        steps.extend((StepType.EXECUTE_REQUEST, "Execute one policy-gated Host control.")
+                     for _ in templates)
+        steps.append((StepType.COMPARE_RESPONSE, "Compare protected candidate-only effect."))
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prerequisite,
+            skill.controls, tuple(steps), tuple(actions), tuple(templates),
+            skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, 3, skill.metadata.token_budget,
+            "READY_FOR_MANUAL_REVIEW", datetime.now(timezone.utc).isoformat(),
+            ({"control_slot": 0, "boundary_slot": 2},), exposure_binding=frozen)
+        result = self.store.save(plan, regenerate=True)
+        self.exposure.bind_plan(package.target.id, candidate_id, hypothesis.id, result["id"])
+        return result
+
+    def bind_exposure_artifact(self, package: TargetPackage, hypothesis: Hypothesis,
+                               context: SkillContext, candidate_id: str) -> dict[str, object]:
+        """Freeze an existing protected artifact; this plan cannot issue HTTP traffic."""
+        if (self.exposure is None or hypothesis.target_id != package.target.id or
+                context.target_id != package.target.id or
+                hypothesis.surface_key != "exposure:" + candidate_id):
+            raise ValueError("Exposure artifact binding is invalid")
+        candidate = self.exposure.get(package.target.id, candidate_id)
+        links = self.exposure.source_links(package.target.id, candidate_id)
+        source_link = next((link for link in links if link["current"] and
+                            candidate is not None and link["source"] == candidate.source.value and
+                            link["artifact_sha256"] == candidate.artifact_sha256), None)
+        if (candidate is None or candidate.source.value not in {"JS_ASSET", "SOURCE_MAP"}
+                or candidate.credential is None or candidate.artifact_sha256 is None
+                or candidate.status in {ExposureStatus.STALE, ExposureStatus.REJECTED_PUBLIC,
+                                        ExposureStatus.REJECTED_PLACEHOLDER}
+                or source_link is None):
+            raise ValueError("Current credential artifact candidate required")
+        skill = self.registry.select("credential-disclosure")
+        prereq = self.checker.check(skill.metadata, context)
+        if prereq.state is not PrerequisiteState.READY:
+            raise ValueError("Exposure artifact prerequisites are not current")
+        frozen = {"candidate_id": candidate_id, "source": candidate.source.value,
+                  "source_ref": str(source_link["source_ref"]),
+                  "evidence_id": str(source_link["evidence_id"]),
+                  "artifact_sha256": candidate.artifact_sha256,
+                  "credential_fingerprint": candidate.credential.fingerprint_sha256}
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prereq,
+            skill.controls,
+            tuple((StepType(kind), description) for kind, description in skill.workflow),
+            (), (), skill.positive_signals, skill.negative_signals,
+            skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, 0,
+            skill.metadata.token_budget, "READY_FOR_MANUAL_REVIEW",
+            datetime.now(timezone.utc).isoformat(), exposure_binding=frozen,
+        )
+        result = self.store.save(plan, regenerate=True)
+        self.exposure.bind_plan(package.target.id, candidate_id, hypothesis.id, result["id"])
+        return result
 
     def bind_message(self, package: TargetPackage, hypothesis: Hypothesis,
                      context: SkillContext, binding: MessagePlanBinding) -> dict[str, object]:
@@ -838,7 +1016,8 @@ class SkillPlanner:
             raise ValueError("authorization plan target mismatch")
         skill = self.registry.select(skill_id)
         if skill.metadata.category not in {"authorization", "api"} and not (
-                skill_id == "unauthenticated-sensitive-download" and
+                skill_id in {"unauthenticated-sensitive-download", "sensitive-data-exposure",
+                             "overexposed-api-response"} and
                 skill.metadata.category == "exposure"):
             raise ValueError("not an authorization skill")
         prerequisite = self.checker.check(skill.metadata, context)
@@ -849,6 +1028,19 @@ class SkillPlanner:
                 or not any(item.role == "BOUNDARY" for item in bindings)
                 or bindings[0].role != "CONTROL"):
             raise ValueError("authorization plan exceeds skill or hunt budget")
+        exposure_binding = (skill_id in {"unauthenticated-sensitive-download", "sensitive-data-exposure"}
+                            and any(item.binding == "EXPOSURE_OBJECT_PATH_V1" for item in bindings))
+        if exposure_binding and (
+                len(bindings) != 4 or
+                tuple(item.binding for item in bindings) != ("EXPOSURE_OBJECT_PATH_V1",) * 4 or
+                tuple(item.variant for item in bindings) !=
+                ("OWNER", "ANONYMOUS", "ANONYMOUS", "INVALID_OBJECT") or
+                tuple(item.role for item in bindings) !=
+                ("CONTROL", "BOUNDARY", "BOUNDARY", "OTHER") or
+                len({item.test_object_id for item in bindings}) != 1 or
+                len({item.source_exchange_id for item in bindings}) != 1 or
+                len({item.object_ref_hash for item in bindings}) != 1):
+            raise ValueError("exposure read requires owner, two anonymous, and invalid controls")
         if skill_id == "graphql-mutation-authorization" and (
                 len(bindings) != 5 or
                 tuple(item.variant for item in bindings) !=
@@ -870,7 +1062,8 @@ class SkillPlanner:
             nested = item.binding == "AUTHORIZATION_NESTED_PARENT_V1"
             batch = item.binding == "AUTHORIZATION_BATCH_PATH_V1"
             graphql = graphql_query or graphql_mutation
-            if (item.binding not in {"AUTHORIZATION_OBJECT_PATH_V1", "AUTHORIZATION_GRAPHQL_QUERY_V1",
+            if (item.binding not in {"AUTHORIZATION_OBJECT_PATH_V1", "EXPOSURE_OBJECT_PATH_V1",
+                                     "AUTHORIZATION_GRAPHQL_QUERY_V1",
                                      "AUTHORIZATION_GRAPHQL_MUTATION_V1",
                                      "AUTHORIZATION_NESTED_PARENT_V1",
                                      "AUTHORIZATION_BATCH_PATH_V1"}
@@ -887,6 +1080,10 @@ class SkillPlanner:
                                                    else "graphql-object-authorization")
                                             or not item.variable_name or not item.variable_name.isidentifier()))
                     or (not graphql and (item.method not in {"GET", "HEAD"} or item.variable_name))
+                    or (item.binding == "EXPOSURE_OBJECT_PATH_V1" and
+                        (not exposure_binding or item.method != "GET" or item.variant not in {
+                            "OWNER", "ANONYMOUS", "INVALID_OBJECT"}))
+                    or (exposure_binding and item.binding != "EXPOSURE_OBJECT_PATH_V1")
                     or item.role not in {"CONTROL", "BOUNDARY", "OTHER"}
                     or item.variant not in {"OWNER", "FOREIGN", "INVALID_OBJECT", "ANONYMOUS",
                                             "POST_READBACK"}

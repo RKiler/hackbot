@@ -324,6 +324,9 @@ class BrowserTests(unittest.TestCase):
     def test_v3_to_v4_migration_preserves_auth_metadata(self):
         identity, context = self.manual("preserved")
         with sqlite3.connect(self.store.db_path) as connection:
+            for table in ("exposure_candidate_sources", "exposure_candidate_events",
+                          "exposure_candidates"):
+                connection.execute(f"DROP TABLE {table}")
             for table in ("message_runtime_trials", "message_candidate_events",
                           "message_type_index", "message_candidate_assets",
                           "message_protocol_candidates", "message_analysis_runs",
@@ -367,7 +370,7 @@ class BrowserTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=3")
         self.store.initialize()
         with sqlite3.connect(self.store.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 21)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 22)
         self.assertEqual(self.auth.get(self.target, identity.id).id, context.id)
 
     def test_playwright_import_adapter_rejects_foreign_or_malformed_before_cookies(self):

@@ -215,12 +215,14 @@ def _labels(value: object, label: str) -> tuple[str, ...]:
 
 def _rules(data: object) -> ProgramRules:
     allowed = {"automated_testing_allowed", "account_creation_allowed",
+               "internal_vhost_testing_allowed",
                "excluded_vulnerability_classes", "forbidden_actions", "third_party_restrictions",
                "data_handling_restrictions", "special_testing_notes"}
     value = _mapping(data, allowed, "program rules")
     return ProgramRules(
         automated_testing_allowed=value.get("automated_testing_allowed"),
         account_creation_allowed=value.get("account_creation_allowed"),
+        internal_vhost_testing_allowed=value.get("internal_vhost_testing_allowed", False),
         excluded_vulnerability_classes=_labels(value.get("excluded_vulnerability_classes", []), "excluded vulnerability class"),
         forbidden_actions=_labels(value.get("forbidden_actions", []), "forbidden action"),
         third_party_restrictions=value.get("third_party_restrictions"),

@@ -27,6 +27,9 @@ from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, lo
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
 from .domxss_store import DOMXSSStore
+from .exposure import ExposureSpecialist
+from .exposure_models import ExposureCategory, ExposureStatus
+from .exposure_store import ExposureStore
 from .postmessage import PostMessageSpecialist
 from .postmessage_browser import PostMessageBrowserExperimentExecutor
 from .postmessage_store import PostMessageStore
@@ -108,6 +111,7 @@ class BugHunterRuntime:
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(self.store)
+        self.exposure_store = ExposureStore(self.store)
         self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
         self.skill_checker = PrerequisiteChecker()
@@ -122,7 +126,8 @@ class BugHunterRuntime:
         self.policy.owned_object = self.objects.owned_for_action
         self.skill_planner = SkillPlanner(self.skills, self.skill_checker, self.policy,
                                          self.skill_plans, self.domxss_store,
-                                         self.postmessage_store, self.objects)
+                                         self.postmessage_store, self.objects,
+                                         self.exposure_store)
         self.permits = PolicyPermitStore(self.store)
         self.executor = TrafficExecutor(
             targets=self.targets, policy=self.policy, permits=self.permits,
@@ -137,13 +142,16 @@ class BugHunterRuntime:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon, self.objects,
-                                                 self.domxss_store, self.postmessage_store)
+                                                 self.domxss_store, self.postmessage_store,
+                                                 self.exposure_store)
         self.domxss = (DOMXSSSpecialist(recon=self.recon, targets=self.targets,
                                        executor=self.executor, store=self.domxss_store)
                        if self.recon is not None else None)
         self.postmessage = (PostMessageSpecialist(dom=self.domxss, targets=self.targets,
                                                   store=self.postmessage_store)
                             if self.domxss is not None else None)
+        self.exposure = ExposureSpecialist(dom=self.domxss_store, store=self.exposure_store,
+                                           recon=self.recon, traffic=self.traffic)
         self.run_store = PlanRunStore(self.store)
         self.domxss_browser = DOMBrowserExperimentExecutor(
             targets=self.targets, store=self.domxss_store, browser=self.browser,
@@ -166,14 +174,15 @@ class BugHunterRuntime:
             identities=self.registry, hypotheses=self.hypotheses,
             results=self.validations, registry=self.validator_registry,
             dom=self.domxss_store, messages=self.postmessage_store,
-            targets=self.targets)
+            targets=self.targets, exposure=self.exposure)
         self.orchestrator = PlanOrchestrator(
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
             traffic=self.traffic, evidence=self.store, objects=self.objects,
             recipes=self.object_factory.recipes, mutations=self.mutation_results,
-            dom=self.domxss_browser, messages=self.postmessage_browser)
+            dom=self.domxss_browser, messages=self.postmessage_browser,
+            exposure=self.exposure)
         self.authorization_ledger = AuthorizationStore(self.store)
         self.authorization = AuthorizationSpecialist(
             identities=self.registry, browser=self.browser, objects=self.objects,
@@ -516,6 +525,171 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.get("/v1/overview")
     def overview():
         return jsonify(service.overview())
+
+    @app.get("/v1/exposure/<package_id>/candidates")
+    def exposure_candidates(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse(maximum=100)
+        category_text = request.args.get("category")
+        status_text = request.args.get("status")
+        category = ExposureCategory(category_text) if category_text else None
+        candidate_status = ExposureStatus(status_text) if status_text else None
+        result = service.exposure_store.list(package.target.id, category=category,
+                                             status=candidate_status, limit=page.limit,
+                                             cursor=page.cursor)
+        return jsonify({"items": [{**item.public_dict(), "finding_status":
+                        service.exposure_store.validation_state(package.target.id, item.candidate_id)}
+                        for item in result.items],
+                        "next_cursor": result.next_cursor})
+
+    @app.get("/v1/exposure/<package_id>/candidates/<candidate_id>")
+    def exposure_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        candidate = service.exposure_store.get(package.target.id, candidate_id)
+        if candidate is None:
+            raise LookupError("candidate not found")
+        return jsonify({"candidate": {**candidate.public_dict(), "finding_status":
+                        service.exposure_store.validation_state(package.target.id, candidate_id)},
+                        "sources": service.exposure_store.source_links(package.target.id,
+                                                                     candidate_id),
+                        "links": service.exposure_store.links(package.target.id, candidate_id)})
+
+    @app.get("/v1/exposure/<package_id>/metrics")
+    def exposure_metrics(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.exposure_store.metrics(package.target.id))
+
+    @app.get("/v1/exposure/<package_id>/artifacts")
+    def exposure_artifacts(package_id: str):
+        package = service.package(package_id)
+        items = service.domxss_store.list_current_assets(package.target.id)
+        return jsonify({"items": [{"artifact_id": item.artifact_id,
+                                  "sha256": item.artifact_sha256,
+                                  "has_source_map": service.domxss_store.get_source_map(
+                                      package.target.id, item.artifact_id) is not None,
+                                  "retrieved_at": item.retrieved_at.isoformat()}
+                                 for item in items], "bounded": True})
+
+    @app.get("/v1/exposure/<package_id>/captures")
+    def exposure_captures(package_id: str):
+        package = service.package(package_id)
+        return jsonify({"items": service.exposure.list_captured_responses(package),
+                        "bounded": True})
+
+    @app.get("/v1/exposure/<package_id>/field-exchanges")
+    def exposure_field_exchanges(package_id: str):
+        package = service.package(package_id)
+        return jsonify({"items": service.exposure.list_field_exchanges(package),
+                        "bounded": True})
+
+    @app.post("/v1/exposure/<package_id>/discover")
+    def exposure_discover(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"source"}))
+        source = data.get("source")
+        if source == "recon":
+            result = service.exposure.discover_recon(package)
+        elif source == "traffic":
+            result = service.exposure.discover_traffic(package)
+        else:
+            raise ValueError("invalid exposure discovery source")
+        return jsonify({"candidate_ids": list(result.candidate_ids),
+                        "signals": result.signals, "bytes_examined": result.bytes_examined,
+                        "truncated": result.truncated, "parse_error": result.parse_error,
+                        "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/analyze")
+    def exposure_analyze(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"kind", "artifact_id", "recent_change"}))
+        artifact_id = data.get("artifact_id")
+        recent_change = data.get("recent_change", False)
+        if not isinstance(artifact_id, str) or type(recent_change) is not bool:
+            raise ValueError("invalid exposure analysis input")
+        if data.get("kind") == "js":
+            result = service.exposure.analyze_js(package, artifact_id,
+                                                 recent_change=recent_change)
+        elif data.get("kind") == "source_map":
+            result = service.exposure.analyze_source_map(package, artifact_id,
+                                                         recent_change=recent_change)
+        else:
+            raise ValueError("invalid exposure artifact kind")
+        return jsonify({"candidate_ids": list(result.candidate_ids),
+                        "signals": result.signals, "bytes_examined": result.bytes_examined,
+                        "truncated": result.truncated, "parse_error": result.parse_error,
+                        "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/analyze-response")
+    def exposure_analyze_response(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"exchange_id", "artifact_evidence_id"}))
+        exchange_id, evidence_id = data.get("exchange_id"), data.get("artifact_evidence_id")
+        if not isinstance(exchange_id, str) or not isinstance(evidence_id, str):
+            raise ValueError("opaque capture IDs required")
+        result = service.exposure.analyze_captured_response(
+            package, exchange_id=exchange_id, artifact_evidence_id=evidence_id)
+        return jsonify({"candidate_ids": list(result.candidate_ids),
+                        "signals": result.signals, "bytes_examined": result.bytes_examined,
+                        "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/analyze-field")
+    def exposure_analyze_field(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"owner_exchange_id", "member_exchange_id"}))
+        owner, member = data.get("owner_exchange_id"), data.get("member_exchange_id")
+        if not isinstance(owner, str) or not isinstance(member, str):
+            raise ValueError("opaque exchange IDs required")
+        result = service.exposure.analyze_field_boundary(
+            package, owner_exchange_id=owner, member_exchange_id=member)
+        return jsonify({"candidate_ids": list(result.candidate_ids),
+                        "signals": result.signals, "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/candidates/<candidate_id>/prepare")
+    def exposure_prepare(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        _body(frozenset())
+        prepared = service.exposure.prepare_candidate(
+            package, candidate_id, hypotheses=service.hypotheses,
+            contexts=service.skill_context, router=service.skill_router,
+            planner=service.skill_planner)
+        return jsonify({"hypothesis_id": prepared.hypothesis_id,
+                        "plan_id": prepared.plan_id, "plan_status": prepared.plan_status,
+                        "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/candidates/<candidate_id>/bind-read")
+    def exposure_bind_read(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"test_object_id", "owner_session_id"}))
+        test_object_id, owner_session_id = data.get("test_object_id"), data.get("owner_session_id")
+        if not isinstance(test_object_id, str) or not isinstance(owner_session_id, str):
+            raise ValueError("invalid owned exposure binding")
+        prepared = service.exposure.bind_owned_read(
+            package, candidate_id, test_object_id=test_object_id,
+            owner_session_id=owner_session_id, objects=service.objects,
+            hypotheses=service.hypotheses, contexts=service.skill_context,
+            planner=service.skill_planner)
+        return jsonify({"hypothesis_id": prepared.hypothesis_id,
+                        "plan_id": prepared.plan_id, "plan_status": prepared.plan_status,
+                        "network_requests_sent": 0})
+
+    @app.post("/v1/exposure/<package_id>/candidates/<candidate_id>/bind-field")
+    def exposure_bind_field(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"test_object_id", "owner_session_id",
+                               "member_session_id"}))
+        object_id = data.get("test_object_id")
+        owner = data.get("owner_session_id")
+        member = data.get("member_session_id")
+        if not all(isinstance(item, str) for item in (object_id, owner, member)):
+            raise ValueError("owned object and verified session IDs required")
+        prepared = service.exposure.bind_field_read(
+            package, candidate_id, test_object_id=object_id,
+            owner_session_id=owner, member_session_id=member,
+            objects=service.objects, hypotheses=service.hypotheses,
+            contexts=service.skill_context, planner=service.skill_planner)
+        return jsonify({"hypothesis_id": prepared.hypothesis_id,
+                        "plan_id": prepared.plan_id, "plan_status": prepared.plan_status,
+                        "network_requests_sent": 0})
 
     @app.get("/v1/activity")
     def activity():

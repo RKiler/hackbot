@@ -8,8 +8,8 @@ prerequisites: [in_scope_target, sensitive_artifact]
 risk: LOW
 required_validators: [sensitivity_review, public_by_design_check]
 token_budget: 1500
-request_budget: 2
-version: 1.0.0
+request_budget: 4
+version: 1.1.0
 source: CORE
 execution_mode: PLAN_ONLY
 when_to_use: Use for an evidence-linked response that appears to expose non-public data or credentials.

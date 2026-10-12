@@ -81,6 +81,179 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
 
+    def test_exposure_api_is_target_scoped_and_redacted(self):
+        fixture_secret = "FixtureOnlySecret-a9Yh2Rk8bN4qP6vJ"
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        body = f'const client_secret = "{fixture_secret}";'.encode()
+        asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://app.example.test/static/exposure.js",
+            body=body, recon_asset_id=3,
+            recon_sha256=hashlib.sha256(body).hexdigest(), source="FIXTURE")
+        self.runtime.exposure.analyze_js(self.runtime.package("example"), asset.artifact_id,
+                                         fixture_url="https://app.example.test/static/exposure.js")
+        listed = self.get("/v1/exposure/example/candidates")
+        self.assertEqual(len(listed["items"]), 1)
+        candidate_id = listed["items"][0]["candidate_id"]
+        artifacts = self.get("/v1/exposure/example/artifacts")
+        self.assertEqual(artifacts["items"][0]["artifact_id"], asset.artifact_id)
+        self.assertFalse(artifacts["items"][0]["has_source_map"])
+        self.assertNotIn("asset_url", json.dumps(artifacts))
+        self.assertEqual(self.get("/v1/exposure/example/captures")["items"], [])
+        self.assertEqual(self.get("/v1/exposure/example/field-exchanges")["items"], [])
+        self.assertEqual(self.client.post("/v1/exposure/example/analyze-response", json={
+            "url": "http://127.0.0.1/internal"}).status_code, 400)
+        self.assertEqual(self.client.post("/v1/exposure/example/analyze-field", json={
+            "url": "http://127.0.0.1/internal"}).status_code, 400)
+        detail = self.get(f"/v1/exposure/example/candidates/{candidate_id}")
+        self.assertEqual(detail["candidate"]["category"], "JS_SECRET")
+        self.assertEqual(self.get("/v1/exposure/example/metrics")["candidates"], 1)
+        self.assertNotIn(fixture_secret, json.dumps(detail))
+        prepared_response = self.client.post(
+            f"/v1/exposure/example/candidates/{candidate_id}/prepare", json={})
+        self.assertEqual(prepared_response.status_code, 200,
+                         prepared_response.get_data(as_text=True))
+        prepared = prepared_response.get_json()
+        self.assertEqual(prepared["network_requests_sent"], 0)
+        self.assertTrue(prepared["plan_id"].startswith("PLAN-"))
+        self.assertEqual(self.client.get(f"/v1/exposure/unknown/candidates/{candidate_id}").status_code, 404)
+        self.assertEqual(self.client.get("/v1/exposure/example/candidates?limit=1000").status_code, 400)
+        self.assertEqual(self.client.post("/v1/exposure/example/analyze", json={
+            "kind": "js", "artifact_id": asset.artifact_id,
+            "url": "http://127.0.0.1/internal"}).status_code, 400)
+        self.assertEqual(self.client.post("/v1/exposure/example/discover", json={
+            "source": "traffic"}).get_json()["network_requests_sent"], 0)
+        self.assertEqual(self.client.post(
+            f"/v1/exposure/example/candidates/{candidate_id}/bind-field",
+            json={"host": "internal.example.test"}).status_code, 400)
+
+    def test_synthetic_current_js_credential_has_phase16_phase17_audit_chain(self):
+        from hackbot.validation_store import ValidationStatus
+
+        secret = "FixtureOnlySecret-a9Yh2Rk8bN4qP6vJ"
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        body = (f'const client_secret = "{secret}"; '
+                'fetch("/fixture-api", {headers: {Authorization: "Bearer " + client_secret}});').encode()
+        before = self.runtime.traffic.stats(self.target)["sample_count"]
+        asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://app.example.test/static/credential.js",
+            body=body, recon_asset_id=4, recon_sha256=hashlib.sha256(body).hexdigest(),
+            source="FIXTURE")
+        analysis = self.runtime.exposure.analyze_js(
+            self.runtime.package("example"), asset.artifact_id,
+            fixture_url="https://app.example.test/static/credential.js")
+        candidate_id = analysis.candidate_ids[0]
+        planned = self.runtime.exposure.prepare_candidate(
+            self.runtime.package("example"), candidate_id,
+            hypotheses=self.runtime.hypotheses, contexts=self.runtime.skill_context,
+            router=self.runtime.skill_router, planner=self.runtime.skill_planner)
+        self.assertEqual(planned.plan_status, "READY_FOR_MANUAL_REVIEW")
+        run = self.runtime.orchestrator.start(planned.plan_id, "example")
+        for _ in range(8):
+            if run["run"]["status"] == "COMPLETED":
+                break
+            run = self.runtime.orchestrator.advance(run["run"]["id"], "example")
+        self.assertEqual(run["run"]["status"], "COMPLETED")
+        validation, finding = self.runtime.validator.validate_run(run["run"]["id"], self.target)
+        self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
+        self.assertIsNotNone(finding)
+        self.assertEqual(self.runtime.exposure_store.links(self.target, candidate_id)["validation_id"],
+                         validation.id)
+        self.assertEqual(self.runtime.traffic.stats(self.target)["sample_count"], before)
+        self.assertNotIn(secret, json.dumps(finding.to_dict()))
+        self.assertNotIn(secret, json.dumps(validation.to_dict()))
+        revised = b"/* revised build */ " + body
+        next_asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://app.example.test/static/credential-v2.js",
+            body=revised, recon_asset_id=6,
+            recon_sha256=hashlib.sha256(revised).hexdigest(), source="FIXTURE")
+        repeated = self.runtime.exposure.analyze_js(
+            self.runtime.package("example"), next_asset.artifact_id,
+            fixture_url="https://app.example.test/static/credential-v2.js")
+        self.assertEqual(repeated.candidate_ids, (candidate_id,))
+        self.assertEqual(self.runtime.exposure_store.validation_state(self.target, candidate_id),
+                         "UNVALIDATED")
+        self.assertIsNone(self.runtime.exposure_store.links(self.target, candidate_id)["plan_id"])
+        self.assertEqual(self.runtime.exposure_store.get(self.target, candidate_id).artifact_sha256,
+                         next_asset.artifact_sha256)
+
+    def test_source_map_credential_validates_and_public_config_is_rejected(self):
+        from hackbot.validation_store import ValidationStatus
+
+        secret = "FixtureOnlySecret-b8Wn3Pq7mR5sT2vL"
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        js = b"console.log('fixture app')"
+        asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://app.example.test/static/mapped.js",
+            body=js, recon_asset_id=5, recon_sha256=hashlib.sha256(js).hexdigest(),
+            source="FIXTURE")
+        source = (f'const client_secret = "{secret}"; '
+                  'fetch("/fixture-api", {headers: {Authorization: "Bearer " + client_secret}}); '
+                  'const NEXT_PUBLIC_API_KEY = "pk_live_PublicClientIdentifier987";')
+        self.runtime.domxss_store.record_source_map(
+            target_id=self.target, js_artifact_id=asset.artifact_id,
+            map_url="https://app.example.test/static/mapped.js.map",
+            body=json.dumps({"version": 3, "sources": ["app.ts"],
+                             "sourcesContent": [source]}).encode(), source="FIXTURE")
+        analyzed = self.runtime.exposure.analyze_source_map(
+            self.runtime.package("example"), asset.artifact_id,
+            fixture_url="https://app.example.test/static/mapped.js")
+        self.assertEqual(analyzed.signals, 2)
+        candidates = [self.runtime.exposure_store.get(self.target, ref)
+                      for ref in analyzed.candidate_ids]
+        public = next(item for item in candidates if item.status.value == "REJECTED_PUBLIC")
+        protected = next(item for item in candidates if item.status.value == "FORMAT_VALID")
+        with self.assertRaises(ValueError):
+            self.runtime.exposure.prepare_candidate(
+                self.runtime.package("example"), public.candidate_id,
+                hypotheses=self.runtime.hypotheses, contexts=self.runtime.skill_context,
+                router=self.runtime.skill_router, planner=self.runtime.skill_planner)
+        planned = self.runtime.exposure.prepare_candidate(
+            self.runtime.package("example"), protected.candidate_id,
+            hypotheses=self.runtime.hypotheses, contexts=self.runtime.skill_context,
+            router=self.runtime.skill_router, planner=self.runtime.skill_planner)
+        run = self.runtime.orchestrator.start(planned.plan_id, "example")
+        for _ in range(8):
+            if run["run"]["status"] == "COMPLETED":
+                break
+            run = self.runtime.orchestrator.advance(run["run"]["id"], "example")
+        result, finding = self.runtime.validator.validate_run(run["run"]["id"], self.target)
+        self.assertEqual(result.status, ValidationStatus.CONFIRMED)
+        self.assertIsNotNone(finding)
+        self.assertNotIn(secret, json.dumps(self.get(
+            f"/v1/exposure/example/candidates/{protected.candidate_id}")))
+
+    def test_placeholder_and_stale_artifact_cannot_confirm(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        body = (b'const password="changeme"; const client_secret="'
+                b'FixtureOnlySecret-c6Dn4Yk9qP3sW2tM"; '
+                b'fetch("/fixture-api", {headers: {Authorization: client_secret}});')
+        asset = self.runtime.domxss_store.record_artifact(
+            target_id=self.target, asset_url="https://app.example.test/static/stale.js",
+            body=body, recon_asset_id=6, recon_sha256=hashlib.sha256(body).hexdigest(),
+            source="FIXTURE")
+        analyzed = self.runtime.exposure.analyze_js(
+            self.runtime.package("example"), asset.artifact_id,
+            fixture_url="https://app.example.test/static/stale.js")
+        candidates = [self.runtime.exposure_store.get(self.target, ref)
+                      for ref in analyzed.candidate_ids]
+        placeholder = next(item for item in candidates if item.status.value == "REJECTED_PLACEHOLDER")
+        protected = next(item for item in candidates if item.status.value == "FORMAT_VALID")
+        with self.assertRaises(ValueError):
+            self.runtime.exposure.prepare_candidate(
+                self.runtime.package("example"), placeholder.candidate_id,
+                hypotheses=self.runtime.hypotheses, contexts=self.runtime.skill_context,
+                router=self.runtime.skill_router, planner=self.runtime.skill_planner)
+        planned = self.runtime.exposure.prepare_candidate(
+            self.runtime.package("example"), protected.candidate_id,
+            hypotheses=self.runtime.hypotheses, contexts=self.runtime.skill_context,
+            router=self.runtime.skill_router, planner=self.runtime.skill_planner)
+        self.runtime.exposure_store.mark_artifact_stale(self.target, asset.artifact_id)
+        from hackbot.orchestrator import PlanRunError
+        with self.assertRaises(PlanRunError):
+            self.runtime.orchestrator.start(planned.plan_id, "example")
+        self.assertEqual(self.runtime.exposure_store.validation_state(
+            self.target, protected.candidate_id), "UNVALIDATED")
+
     def test_object_api_is_target_scoped_and_has_no_raw_request_surface(self):
         self.assertEqual(self.get("/v1/objects?target=example")["items"], [])
         self.assertEqual(self.get("/v1/objects/recipes?target=example")["items"], [])
@@ -242,7 +415,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_skill_routes_are_target_scoped_and_never_execute(self):
         catalog = self.get("/v1/skills")["items"]
-        self.assertEqual(len(catalog), 14)
+        self.assertEqual(len(catalog), 18)
         self.assertTrue(all(item["status"] == "PLAN_ONLY" for item in catalog))
         detail = self.get("/v1/skills/check-before-transform-dom-xss")
         self.assertEqual(detail["execution"], "PLAN_ONLY")

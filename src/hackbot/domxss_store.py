@@ -218,12 +218,35 @@ class DOMXSSStore:
                                      (target_id, artifact_id)).fetchone()
         return self._asset(row) if row else None
 
+    def list_current_assets(self, target_id: str, *, limit: int = 50) -> tuple[DOMAssetRecord, ...]:
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("Current asset inventory limit must be 1..50")
+        with self.evidence._connection() as connection:
+            rows = connection.execute("""SELECT * FROM dom_js_artifacts
+                WHERE target_id=? AND state='CURRENT' AND recon_sha256=artifact_sha256
+                ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?""",
+                (target_id, limit)).fetchall()
+        return tuple(self._asset(row) for row in rows)
+
     def get_source_map(self, target_id: str, js_artifact_id: str) -> DOMSourceMapRecord | None:
         with self.evidence._connection() as connection:
             row = connection.execute("""
                 SELECT * FROM dom_source_maps WHERE target_id=? AND js_artifact_id=?
                 ORDER BY retrieved_at DESC LIMIT 1
             """, (target_id, js_artifact_id)).fetchone()
+        if row is None:
+            return None
+        return DOMSourceMapRecord(
+            row["map_id"], row["target_id"], row["js_artifact_id"], row["map_url_sha256"],
+            row["map_sha256"], row["evidence_id"], row["retrieval_exchange_id"],
+            datetime.fromisoformat(row["retrieved_at"]),
+        )
+
+    def get_source_map_by_id(self, target_id: str, map_id: str) -> DOMSourceMapRecord | None:
+        with self.evidence._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM dom_source_maps WHERE target_id=? AND map_id=? LIMIT 1",
+                (target_id, map_id)).fetchone()
         if row is None:
             return None
         return DOMSourceMapRecord(

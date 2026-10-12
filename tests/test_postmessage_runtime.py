@@ -1019,6 +1019,9 @@ frame.addEventListener('load',()=>{{
             db.execute("INSERT INTO plan_message_dispatches SELECT * "
                        "FROM plan_message_dispatches_v19")
             db.execute("DROP TABLE plan_message_dispatches_v19")
+            for table in ("exposure_candidate_sources", "exposure_candidate_events",
+                          "exposure_candidates"):
+                db.execute(f"DROP TABLE {table}")
             db.execute("DROP TABLE message_runtime_trials")
             db.execute("ALTER TABLE message_analysis_runs DROP COLUMN sender_count")
             db.execute("ALTER TABLE message_analysis_runs DROP COLUMN channel_count")
@@ -1029,7 +1032,7 @@ frame.addEventListener('load',()=>{{
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 21)
+        self.assertEqual(version, 22)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)
