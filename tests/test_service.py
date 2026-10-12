@@ -96,6 +96,9 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(response.get_json()["outcome"], "MISSING_CREATION_RECIPE")
         self.assertEqual(self.get("/v1/traffic/stats?target=example"), before)
         self.assertEqual(self.get("/v1/health")["checks"]["object_factory"], "ready")
+        self.assertEqual(self.client.post("/v1/objects/TESTOBJ-" + "a" * 32 +
+                                          "/mutate", json={"field": "name", "value": "unsafe"}).status_code,
+                         404)
 
     def test_authorization_api_is_target_scoped_bounded_and_local_only(self):
         self.runtime.registry.register_target(self.runtime.package("example"))
@@ -113,6 +116,12 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(created.get_json()["hunt"]["status"], "BLOCKED")
             self.assertEqual(self.get("/v1/authorization/example/metrics?hunt_id=" +
                                       hunt_id)["candidates"], 0)
+            metrics = self.get("/v1/authorization/example/metrics")
+            self.assertEqual(metrics["mutation_candidates"], 0)
+            self.assertEqual(metrics["mutation_plans"], 0)
+            self.assertEqual(metrics["nested_candidates"], 0)
+            self.assertEqual(metrics["batch_candidates"], 0)
+            self.assertEqual(metrics["typed_mutations"]["executed"], 0)
             self.assertEqual(self.client.get("/v1/authorization/example/metrics?hunt_id=missing").status_code,
                              404)
             self.assertEqual(self.client.get("/v1/authorization/not-here/profile").status_code, 404)
@@ -121,7 +130,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_skill_routes_are_target_scoped_and_never_execute(self):
         catalog = self.get("/v1/skills")["items"]
-        self.assertEqual(len(catalog), 11)
+        self.assertEqual(len(catalog), 14)
         self.assertTrue(all(item["status"] == "PLAN_ONLY" for item in catalog))
         detail = self.get("/v1/skills/check-before-transform-dom-xss")
         self.assertEqual(detail["execution"], "PLAN_ONLY")

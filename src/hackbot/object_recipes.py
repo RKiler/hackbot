@@ -11,12 +11,14 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import ObjectSettings
+from .authorization_binding import single_rename_operation
 from .domain import validate_entity_id
 from .executor import RequestTemplate
 from .logging import SecretRedactor, is_sensitive_key
 from .policy import _strict_url_reason
 from .policy_models import SideEffect
 from .test_objects import CleanupStrategy
+from .typed_mutations import MutationType
 
 
 _LABEL = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
@@ -31,6 +33,15 @@ def _mapping(value: object, allowed: set[str], required: set[str]) -> dict[str, 
     if not isinstance(value, dict) or set(value) - allowed or required - set(value):
         raise ValueError("invalid object recipe shape")
     return value
+
+
+def unique_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("ambiguous duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def _validate_body(value: object, *, depth: int = 0) -> None:
@@ -134,6 +145,54 @@ class RecipeOperation:
 
 
 @dataclass(frozen=True, slots=True)
+class MutationRecipe:
+    mutation_type: MutationType
+    field: str
+    write: RecipeOperation
+    readback: RecipeOperation
+    readback_pointer: str
+    restore: RecipeOperation
+    side_effect: SideEffect
+    identity_requirement: str
+    csrf_header: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mutation_type is not MutationType.RENAME:
+            raise ValueError("mutation type needs a reviewed implementation")
+        if self.field != "name":
+            raise ValueError("mutation field is not allowlisted")
+        rest = (self.write.method in {"PATCH", "PUT"} and
+                self.write.body == {self.field: "$test_name"})
+        graphql = False
+        if self.write.method == "POST" and isinstance(self.write.body, dict):
+            payload = self.write.body
+            variables = payload.get("variables")
+            if (set(payload) == {"query", "variables", "operationName"} and
+                    isinstance(variables, dict) and variables == {
+                        "id": "$object_id", "name": "$test_name"} and
+                    isinstance(payload.get("query"), str) and
+                    isinstance(payload.get("operationName"), str)):
+                graphql = (single_rename_operation(payload["query"], "id", "name") ==
+                           payload["operationName"])
+        if (not (rest or graphql) or
+                self.restore.method != self.write.method or
+                self.readback.method != "GET" or
+                self.restore.body != self.write.body or
+                (not graphql and "{object_id}" not in self.write.url) or
+                (graphql and "{object_id}" in self.write.url) or
+                "{object_id}" not in self.readback.url or
+                (not graphql and "{object_id}" not in self.restore.url) or
+                (graphql and self.restore.url != self.write.url) or
+                self.side_effect is not SideEffect.SAFE_UPDATE or
+                self.identity_requirement != "VERIFIED_DISPOSABLE_OWNER_AND_BOUNDARY"):
+            raise ValueError("mutation recipe lacks a safe read-back and reversal")
+        if not _POINTER.fullmatch(self.readback_pointer):
+            raise ValueError("mutation read-back pointer is invalid")
+        if self.csrf_header not in {None, "X-CSRF-Token"}:
+            raise ValueError("unsupported mutation token header")
+
+
+@dataclass(frozen=True, slots=True)
 class ObjectRecipe:
     id: str
     target_id: str
@@ -155,6 +214,7 @@ class ObjectRecipe:
     cleanup_strategy: CleanupStrategy
     source: str
     sha256: str
+    mutations: tuple[MutationRecipe, ...] = ()
 
     @classmethod
     def from_json(cls, data: object) -> ObjectRecipe:
@@ -162,7 +222,7 @@ class ObjectRecipe:
                               "create", "verify", "cleanup", "update", "id_pointer",
                               "verify_id_pointer", "verify_name_pointer", "verify_owner_pointer",
                               "verify_tenant_pointer", "expected_owner", "expected_tenant",
-                              "parent_type", "cleanup_strategy", "source"},
+                              "parent_type", "cleanup_strategy", "source", "mutations"},
                        {"id", "target_id", "package_id", "object_type", "protocol", "create",
                         "verify", "id_pointer", "verify_id_pointer", "verify_name_pointer",
                         "verify_owner_pointer", "verify_tenant_pointer", "expected_owner",
@@ -209,11 +269,44 @@ class ObjectRecipe:
                 update is not None and "{object_id}" not in update.url or
                 cleanup is not None and "{object_id}" not in cleanup.url):
             raise ValueError("unsupported object recipe operation")
+        mutations_raw = obj.get("mutations", [])
+        if not isinstance(mutations_raw, list) or len(mutations_raw) > 4:
+            raise ValueError("invalid mutation recipe list")
+        mutations: list[MutationRecipe] = []
+        for raw in mutations_raw:
+            entry = _mapping(raw, {"type", "field", "write", "readback", "readback_pointer",
+                                   "restore", "side_effect", "identity_requirement", "csrf_header"},
+                             {"type", "field", "write", "readback", "readback_pointer",
+                              "restore", "side_effect", "identity_requirement"})
+            if not all(isinstance(entry[key], str) for key in (
+                    "type", "field", "readback_pointer", "side_effect", "identity_requirement")):
+                raise ValueError("invalid mutation recipe metadata")
+            def embedded(key: str) -> RecipeOperation:
+                spec = _mapping(entry[key], {"method", "url", "operation", "body", "side_effect"},
+                                {"method", "url", "operation"})
+                if "side_effect" in spec:
+                    spec = {**spec, "side_effect": SideEffect(spec["side_effect"])}
+                return RecipeOperation(**spec)
+            mutation = MutationRecipe(MutationType(entry["type"]), entry["field"],
+                                      embedded("write"), embedded("readback"),
+                                      entry["readback_pointer"], embedded("restore"),
+                                      SideEffect(entry["side_effect"]),
+                                      entry["identity_requirement"], entry.get("csrf_header"))
+            if (mutation.readback.url != verify.url or
+                    (mutation.write.method != "POST" and mutation.write.url != verify.url) or
+                    (mutation.restore.method != "POST" and mutation.restore.url != verify.url) or
+                    mutation.write.method != mutation.restore.method or
+                    mutation.write.body != mutation.restore.body or
+                    mutation.readback_pointer != obj["verify_name_pointer"]):
+                raise ValueError("mutation read-back must use the verified object route")
+            mutations.append(mutation)
+        if len({mutation.mutation_type for mutation in mutations}) != len(mutations):
+            raise ValueError("duplicate mutation type")
         fingerprint = hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return cls(obj["id"], obj["target_id"], obj["package_id"], obj["object_type"],
                    obj["protocol"], create, verify, cleanup, update, *pointers,
                    obj["expected_owner"], obj["expected_tenant"],
-                   parent_type, strategy, obj["source"], fingerprint)
+                   parent_type, strategy, obj["source"], fingerprint, tuple(mutations))
 
 
 class RecipeCatalog:
@@ -230,7 +323,8 @@ class RecipeCatalog:
         if path.stat().st_size > 65536:
             raise ValueError("recipe file is too large")
         try:
-            recipe = ObjectRecipe.from_json(json.loads(path.read_text(encoding="utf-8")))
+            recipe = ObjectRecipe.from_json(json.loads(path.read_text(encoding="utf-8"),
+                                                       object_pairs_hook=unique_json_pairs))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("invalid recipe file") from exc
         if recipe.package_id != package_id or recipe.id != recipe_id:

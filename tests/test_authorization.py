@@ -224,7 +224,7 @@ class AuthorizationSpecialistTests(unittest.TestCase):
         self.assertEqual(tenant.id, item.tenant_id)
         self.assertNotEqual(foreign_tenant.id, item.tenant_id)
 
-    def test_nested_parent_child_relation_creates_manual_candidate_only(self):
+    def test_nested_parent_child_relation_creates_bounded_plan(self):
         owner, owner_session, tenant, parent = self.fixture_object()
         self.fx.recipe(recipe_id="dashboard_a", tenant="tenant-a", owner="tenant_a_admin",
                        object_type="dashboard", parent_type="project")
@@ -243,6 +243,7 @@ class AuthorizationSpecialistTests(unittest.TestCase):
         self.assertEqual(foreign_parent.outcome, "READY")
         parent_external = self.specialist._external_id(parent)
         child_external = self.specialist._external_id(child)
+        self.fx.server.fixture_objects[child_external]["parentId"] = parent_external
         request = CapturedRequest(
             "GET", self.fx.base + "/fixture/tenant-a/projects/" + parent_external +
             "/dashboards/" + child_external)
@@ -262,10 +263,10 @@ class AuthorizationSpecialistTests(unittest.TestCase):
                                        candidate_limit=20)
         candidates = self.specialist.generate(hunt, self.fx.package)
         nested = next(item for item in candidates if item.boundary is Boundary.PARENT_CHILD)
-        self.assertEqual(nested.status, "NEEDS_MANUAL_REVIEW")
-        self.assertIsNotNone(nested.hypothesis_id)
-        self.assertEqual(self.specialist.prepare(nested.id, self.fx.package).status,
-                         "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(nested.status, "CANDIDATE")
+        prepared = self.specialist.prepare(nested.id, self.fx.package)
+        self.assertEqual(prepared.status, "PLANNED")
+        self.assertIsNotNone(prepared.plan_id)
         self.assertEqual(len(self.fx.server.received), before)
 
     def test_unverified_second_identity_is_only_a_lead_and_sends_no_request(self):

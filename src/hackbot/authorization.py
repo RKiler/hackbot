@@ -20,11 +20,12 @@ from .identity import IdentityStatus, MembershipStatus
 from .identity_registry import IdentityRegistry
 from .orchestrator import PlanOrchestrator
 from .object_factory import ObjectFactory
+from .object_recipes import unique_json_pairs
 from .plan_runs import RunStatus
 from .profile import TargetProfile
 from .recon import ReconRepository
 from .response_compare import ResponseComparator
-from .skill_plans import (AuthorizationPlanBinding, PrerequisiteState,
+from .skill_plans import (AuthorizationPlanBinding, TypedMutationPlanBinding, PrerequisiteState,
                           SkillContextBuilder, SkillPlanner, SkillRouter)
 from .store import EvidenceFactStore
 from .target_package import PackageStatus, TargetPackage
@@ -314,6 +315,8 @@ class AuthorizationSpecialist:
             parsed = urlsplit(url)
             method = exchange.request.record.method
             path_parts = tuple(unquote(segment) for segment in parsed.path.split("/"))
+            batch_ids = (path_parts[-1].split(",") if method == "GET" and
+                         len(path_parts) >= 3 and path_parts[-2] == "batch" else [])
             for item in objects:
                 if exchange.attribution.verified_identity_id != item.owner_identity_id:
                     continue
@@ -325,7 +328,8 @@ class AuthorizationSpecialist:
                 except (ValueError, UnicodeError, KeyError, PermissionError):
                     continue
                 graphql = self._graphql_variable(exchange, external_id)
-                if external_id not in path_parts and graphql is None:
+                if external_id not in path_parts and graphql is None and (
+                        not batch_ids or external_id != batch_ids[0]):
                     continue
                 features = self.comparator.features(exchange)
                 semantic = bool(features.status_code is not None and
@@ -336,6 +340,7 @@ class AuthorizationSpecialist:
                 tenant = self.identities.get_tenant(package.target.id, item.tenant_id)
                 tenant_segments = ({tenant.label, tenant.external_id} - {None, ""}) if tenant else set()
                 normalized_path = "/".join(
+                    "{batch}" if segment == path_parts[-1] and external_id in batch_ids else
                     "{object}" if segment == external_id else
                     "{tenant}" if segment in tenant_segments else segment for segment in path_parts)
                 key = _hash(method, exchange.request.origin, normalized_path,
@@ -344,7 +349,7 @@ class AuthorizationSpecialist:
                     key, exchange.id, item.owner_identity_id, item.id, method,
                     exchange.request.origin, exchange.request.display_path,
                     exchange.request.record.operation_id,
-                    "GRAPHQL" if graphql else "REST",
+                    "GRAPHQL" if graphql else "BATCH" if external_id in batch_ids else "REST",
                     semantic, exchange.evidence_ids[:8],
                     graphql[0] if graphql else None, graphql[1] if graphql else None))
                 if len(result) >= 40:
@@ -454,7 +459,8 @@ class AuthorizationSpecialist:
             if path_parts.count(parent_external) != 1 or path_parts.count(child_external) != 1:
                 return None
             body = json.loads(self.evidence.read_content(
-                source.response.body_evidence_id, allow_sensitive=True, max_bytes=8192))
+                source.response.body_evidence_id, allow_sensitive=True, max_bytes=8192),
+                object_pairs_hook=unique_json_pairs)
             if (not isinstance(body, dict) or body.get("id") != child_external or
                     body.get("parentId", body.get("parent_id")) != parent_external):
                 return None
@@ -518,9 +524,12 @@ class AuthorizationSpecialist:
                     protocol_boundary = (Boundary.GRAPHQL_OBJECT if operation.graphql_kind == "QUERY" else
                                          Boundary.GRAPHQL_MUTATION if operation.graphql_kind == "MUTATION" else
                                          Boundary.CROSS_TENANT)
-                    boundary, reasons, score = (protocol_boundary,
-                                                ("DISTINCT_OBSERVED_TENANTS", "VERIFIED_OBJECT_OWNERSHIP",
-                                                 "OWNER_TRAFFIC_OBSERVED"), 88)
+                    boundary, reasons, score = (
+                        protocol_boundary,
+                        ("DISTINCT_OBSERVED_TENANTS", "VERIFIED_OBJECT_OWNERSHIP",
+                         "OWNER_TRAFFIC_OBSERVED") +
+                        (("BATCH_READ_EXACT_OBSERVED",) if operation.protocol == "BATCH" else ()),
+                        88)
                 elif (obj.tenant_id in owner.observed_tenants and
                       obj.tenant_id in actor.observed_tenants and required_role and
                       required_role in owner.observed_roles and
@@ -550,10 +559,12 @@ class AuthorizationSpecialist:
                        and other.semantic_owner_success for other in surface.operations):
                     score += 8
                 if boundary is Boundary.GRAPHQL_MUTATION:
-                    score -= 35  # No durable mutation read-back contract exists yet.
+                    score -= 15  # Recipe-bound writes remain costlier than read comparisons.
+                if operation.protocol == "BATCH" and not operation.semantic_owner_success:
+                    continue
                 ranked.append((score, obj, operation, boundary, actor, reasons))
             if (operation.method in {"GET", "HEAD"} and
-                    operation.graphql_kind is None and
+                    operation.protocol == "REST" and operation.graphql_kind is None and
                     operation.semantic_owner_success and
                     self._protected_artifact_facts(surface.target_id, obj)):
                 ranked.append((70, obj, operation, Boundary.ANONYMOUS, None,
@@ -583,11 +594,6 @@ class AuthorizationSpecialist:
             seen.add(dedupe)
             candidate = self._candidate(hunt, surface, obj, operation, boundary,
                                         actor, reasons, score)
-            if boundary is Boundary.PARENT_CHILD:
-                hypothesis = self._hypothesis(candidate, operation, obj)
-                candidate = self.ledger.link_candidate(
-                    candidate.id, candidate.target_id, status="NEEDS_MANUAL_REVIEW",
-                    hypothesis_id=hypothesis.id)
             result.append(candidate)
             if len(result) >= hunt.candidate_limit:
                 break
@@ -606,14 +612,15 @@ class AuthorizationSpecialist:
                       Boundary.ANONYMOUS: "unauthenticated-sensitive-download",
                       Boundary.GRAPHQL_OBJECT: "graphql-object-authorization",
                       Boundary.GRAPHQL_MUTATION: "graphql-mutation-authorization",
-                      Boundary.PARENT_CHILD: "cross-tenant-object-authorization"}[candidate.boundary]
+                      Boundary.PARENT_CHILD: "nested-resource-authorization"}[candidate.boundary]
+        if operation.protocol == "BATCH":
+            skill_name = "batch-object-authorization"
         now = datetime.now(timezone.utc)
         statement = ("Check whether a verified foreign principal receives the same "
                      "protected owned object through the observed operation.")
         if candidate.boundary is Boundary.PARENT_CHILD:
-            statement = ("Review whether a verified foreign parent can be paired with this "
-                         "owned child; the nested request and read-back establish the relation, "
-                         "but no automatic nested-ID binding is permitted.")
+            statement = ("Check whether a foreign parent can be paired with this verified "
+                         "owned child to disclose protected child data.")
         return self.hypotheses.upsert(Hypothesis(
             "HYP-" + uuid.uuid4().hex, candidate.target_id,
             _hash("authorization", candidate.dedupe_key), candidate.boundary.value,
@@ -645,6 +652,14 @@ class AuthorizationSpecialist:
             raise LookupError("authorization candidate not found")
         if candidate.plan_id:
             return candidate
+        if candidate.boundary is Boundary.PARENT_CHILD:
+            return self._prepare_nested(candidate, package)
+        source_exchange = self.traffic.get_exchange(candidate.owner_exchange_id)
+        if (source_exchange is not None and source_exchange.request.record.method == "GET" and
+                (url := self._request_url(source_exchange, self.evidence)) and
+                "/batch/" in urlsplit(url).path and
+                "BATCH_READ_EXACT_OBSERVED" in candidate.reasons):
+            return self._prepare_batch(candidate, package)
         if candidate.boundary not in {Boundary.CROSS_TENANT, Boundary.HORIZONTAL,
                                       Boundary.VERTICAL, Boundary.HIDDEN_FUNCTION,
                                       Boundary.ANONYMOUS, Boundary.GRAPHQL_OBJECT,
@@ -671,11 +686,16 @@ class AuthorizationSpecialist:
                           (item.method in {"GET", "HEAD"} or
                            (candidate.boundary is Boundary.GRAPHQL_OBJECT and
                             item.method == "POST" and item.graphql_kind == "QUERY") or
-                           (candidate.boundary is Boundary.GRAPHQL_MUTATION and
-                            item.method == "POST" and item.graphql_kind == "MUTATION"))), None)
+                           (item.method == "POST" and item.graphql_kind == "MUTATION") or
+                           (item.method in {"PATCH", "PUT"} and item.protocol == "REST"))), None)
         if owned is None or operation is None:
             return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                               status="NEEDS_TEMPLATE")
+        if operation.method in {"PATCH", "PUT"} or (
+                operation.graphql_kind == "MUTATION" and operation.method == "POST"
+                and self.factory is not None):
+            return self._prepare_typed_mutation(candidate, hunt, package, owned,
+                                                operation, owner, foreign)
         mutation = candidate.boundary is Boundary.GRAPHQL_MUTATION
         if mutation:
             source = self.traffic.get_exchange(operation.exchange_id)
@@ -801,6 +821,261 @@ class AuthorizationSpecialist:
                 object_type=stored.object_type, recipe_id=stored.recipe_id,
                 identity_id=stored.creator_identity_id, tenant_id=stored.tenant_id,
                 parent_id=stored.parent_id, test_object_id=stored.id)
+        return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                          status="PLANNED", hypothesis_id=hypothesis.id,
+                                          plan_id=str(plan["id"]))
+
+    def _prepare_batch(self, candidate: AuthorizationCandidate,
+                       package: TargetPackage) -> AuthorizationCandidate:
+        hunt = self.ledger.get_hunt(candidate.hunt_id, candidate.target_id)
+        if (hunt is None or hunt.package_id != package.id or
+                hunt.status is not HuntStatus.READY or hunt.request_budget < 4):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW")
+        surface = self.profile(package)
+        actors = {actor.identity_id: actor for actor in surface.actors}
+        owner = actors.get(candidate.owner_identity_id)
+        actor = actors.get(candidate.boundary_identity_id or "")
+        item = next((row for row in surface.objects if row.id == candidate.test_object_id), None)
+        source = next((row for row in surface.operations if
+                       row.exchange_id == candidate.owner_exchange_id and
+                       row.object_id == candidate.test_object_id and
+                       row.protocol == "BATCH" and row.method == "GET" and
+                       row.semantic_owner_success), None)
+        if (owner is None or actor is None or item is None or source is None or
+                not owner.session_id or not actor.session_id):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        exchange = self.traffic.get_exchange(source.exchange_id)
+        url = self._request_url(exchange, self.evidence) if exchange else None
+        first = self.objects.get(item.id, candidate.target_id)
+        if url is None or first is None:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        ids = urlsplit(url).path.rsplit("/", 1)[-1].split(",")
+        if len(ids) != 2 or ids[0] != self._external_id(first):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        peer = next((row for row in surface.objects if row.id != item.id and
+                     row.owner_identity_id == owner.identity_id and
+                     row.tenant_id == item.tenant_id and
+                     self._external_id(self.objects.get(row.id, candidate.target_id)) == ids[1]), None)
+        actor_object = next((row for row in surface.objects if
+                             row.owner_identity_id == actor.identity_id and
+                             row.tenant_id in actor.observed_tenants and
+                             row.tenant_id != item.tenant_id and
+                             row.object_type == item.object_type and
+                             any(op.object_id == row.id and op.method == "GET" and
+                                 op.protocol == "REST" and op.semantic_owner_success
+                                 for op in surface.operations)), None)
+        actor_control = next((op for op in surface.operations if actor_object and
+                              op.object_id == actor_object.id and op.method == "GET" and
+                              op.protocol == "REST" and op.semantic_owner_success), None)
+        if peer is None or actor_object is None or actor_control is None:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_OBJECT")
+        hypothesis = self._hypothesis(candidate, source, item)
+        context = self.context.build(hypothesis,
+                                     self.hypotheses.latest_profile(candidate.target_id), package)
+        selection = next((row for row in self.router.route(hypothesis, context)
+                          if row["skill"]["name"] == "batch-object-authorization"), None)
+        if selection is None or selection["prerequisites"]["state"] != PrerequisiteState.READY.value:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW",
+                                              hypothesis_id=hypothesis.id)
+        def batch_binding(identity: AuthorizationActor, role: str, variant: str):
+            return AuthorizationPlanBinding(
+                source.exchange_id, item.id, item.object_type, item.external_id_hash,
+                "GET", identity.identity_id, identity.session_id, role, variant,
+                source.operation_id, "AUTHORIZATION_BATCH_PATH_V1", None,
+                None, None, peer.id, actor_object.id)
+        own = AuthorizationPlanBinding(
+            actor_control.exchange_id, actor_object.id, actor_object.object_type,
+            actor_object.external_id_hash, "GET", actor.identity_id, actor.session_id,
+            "CONTROL", "OWNER", actor_control.operation_id)
+        bindings = (batch_binding(owner, "CONTROL", "OWNER"), own,
+                    batch_binding(actor, "BOUNDARY", "FOREIGN"),
+                    batch_binding(actor, "BOUNDARY", "FOREIGN"))
+        try:
+            plan = self.planner.bind_authorization(
+                package, hypothesis, context, "batch-object-authorization",
+                bindings, request_cap=hunt.request_budget)
+        except (LookupError, ValueError):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW",
+                                              hypothesis_id=hypothesis.id)
+        for selected in (item, peer, actor_object):
+            stored = self.objects.get(selected.id, candidate.target_id)
+            if stored is None:
+                return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                                  status="BLOCKED", hypothesis_id=hypothesis.id)
+            self.objects.add_requirement(
+                plan_id=str(plan["id"]), target_id=candidate.target_id,
+                object_type=stored.object_type, recipe_id=stored.recipe_id,
+                identity_id=stored.creator_identity_id, tenant_id=stored.tenant_id,
+                parent_id=stored.parent_id, test_object_id=stored.id)
+        return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                          status="PLANNED", hypothesis_id=hypothesis.id,
+                                          plan_id=str(plan["id"]))
+
+    def _prepare_nested(self, candidate: AuthorizationCandidate,
+                        package: TargetPackage) -> AuthorizationCandidate:
+        hunt = self.ledger.get_hunt(candidate.hunt_id, candidate.target_id)
+        if (hunt is None or hunt.package_id != package.id or
+                hunt.status is not HuntStatus.READY or hunt.request_budget < 4):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW")
+        surface = self.profile(package)
+        actors = {actor.identity_id: actor for actor in surface.actors}
+        owner = actors.get(candidate.owner_identity_id)
+        foreign = actors.get(candidate.boundary_identity_id or "")
+        child = next((item for item in surface.objects if item.id == candidate.test_object_id), None)
+        operation = next((item for item in surface.operations if
+                          item.exchange_id == candidate.owner_exchange_id and
+                          item.object_id == candidate.test_object_id and
+                          item.method == "GET" and item.protocol == "REST" and
+                          item.semantic_owner_success), None)
+        parent = self._observed_parent_child(surface, child, operation) if child and operation else None
+        foreign_parent = next((item for item in surface.objects if parent and foreign and
+                               item.object_type == parent.object_type and
+                               item.owner_identity_id == foreign.identity_id and
+                               item.tenant_id in foreign.observed_tenants and
+                               item.tenant_id != child.tenant_id), None)
+        if (owner is None or foreign is None or not owner.session_id or
+                not foreign.session_id or child is None or operation is None or
+                parent is None or foreign_parent is None):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_OBJECT")
+        hypothesis = self._hypothesis(candidate, operation, child)
+        context = self.context.build(hypothesis,
+                                     self.hypotheses.latest_profile(candidate.target_id), package)
+        selection = next((item for item in self.router.route(hypothesis, context)
+                          if item["skill"]["name"] == "nested-resource-authorization"), None)
+        if selection is None or selection["prerequisites"]["state"] != PrerequisiteState.READY.value:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW",
+                                              hypothesis_id=hypothesis.id)
+        def bind(actor: AuthorizationActor, role: str, variant: str) -> AuthorizationPlanBinding:
+            nested = role == "BOUNDARY"
+            return AuthorizationPlanBinding(
+                operation.exchange_id, child.id, child.object_type, child.external_id_hash,
+                "GET", actor.identity_id, actor.session_id, role, variant,
+                operation.operation_id,
+                "AUTHORIZATION_NESTED_PARENT_V1" if nested else
+                "AUTHORIZATION_OBJECT_PATH_V1", None,
+                parent.id if nested else None,
+                foreign_parent.id if nested else None)
+        bindings = (bind(owner, "CONTROL", "OWNER"),
+                    bind(owner, "OTHER", "INVALID_OBJECT"),
+                    bind(foreign, "BOUNDARY", "FOREIGN"),
+                    bind(foreign, "BOUNDARY", "FOREIGN"))
+        try:
+            plan = self.planner.bind_authorization(
+                package, hypothesis, context, "nested-resource-authorization",
+                bindings, request_cap=hunt.request_budget)
+        except (LookupError, ValueError):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW",
+                                              hypothesis_id=hypothesis.id)
+        for item in (child, parent, foreign_parent):
+            stored = self.objects.get(item.id, candidate.target_id)
+            if stored is None:
+                return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                                  status="BLOCKED", hypothesis_id=hypothesis.id)
+            self.objects.add_requirement(
+                plan_id=str(plan["id"]), target_id=candidate.target_id,
+                object_type=stored.object_type, recipe_id=stored.recipe_id,
+                identity_id=stored.creator_identity_id, tenant_id=stored.tenant_id,
+                parent_id=stored.parent_id, test_object_id=stored.id)
+        return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                          status="PLANNED", hypothesis_id=hypothesis.id,
+                                          plan_id=str(plan["id"]))
+
+    def _prepare_typed_mutation(self, candidate: AuthorizationCandidate,
+                                hunt: AuthorizationHunt, package: TargetPackage,
+                                owned: AuthorizationObject,
+                                operation: AuthorizationOperation,
+                                owner: AuthorizationActor,
+                                foreign: AuthorizationActor | None) -> AuthorizationCandidate:
+        if (self.factory is None or foreign is None or not foreign.session_id or
+                candidate.boundary not in {Boundary.CROSS_TENANT, Boundary.HORIZONTAL,
+                                            Boundary.VERTICAL, Boundary.HIDDEN_FUNCTION,
+                                            Boundary.GRAPHQL_MUTATION} or
+                hunt.request_budget < 7):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW")
+        item = self.objects.get(owned.id, candidate.target_id)
+        recipe = self.factory.recipes.get(package.id, item.recipe_id) if item else None
+        if (item is None or recipe is None or recipe.sha256 != item.recipe_hash or
+                not item.disposable or item.state is not ObjectState.READY or
+                item.verified_at is None):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_OBJECT")
+        mutation = next((entry for entry in recipe.mutations if
+                         entry.mutation_type.value == "RENAME" and
+                         entry.write.method == operation.method), None)
+        if mutation is None:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        source = self.traffic.get_exchange(operation.exchange_id)
+        if source is None or source.request.body_evidence_id is None:
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        try:
+            external = self._external_id(item)
+            expected_url = mutation.write.template(test_name=item.test_name,
+                                                   object_id=external).url
+            observed_url = self._request_url(source, self.evidence)
+            raw = self.evidence.read_content(
+                source.request.body_evidence_id, allow_sensitive=True, max_bytes=8192)
+            if hashlib.sha256(raw).hexdigest() != source.request.body_hash:
+                raise ValueError
+            body = json.loads(raw, object_pairs_hook=unique_json_pairs)
+            if observed_url != expected_url or not isinstance(body, dict):
+                raise ValueError
+            if mutation.write.method == "POST":
+                expected = mutation.write.template(test_name="hackbot-test-control",
+                                                   object_id=external)
+                expected_body = json.loads(expected.body or b"{}")
+                variables = body.get("variables")
+                if (set(body) != set(expected_body) or
+                        body.get("query") != expected_body["query"] or
+                        body.get("operationName") != expected_body["operationName"] or
+                        not isinstance(variables, dict) or
+                        set(variables) != {"id", "name"} or
+                        variables.get("id") != external or
+                        not isinstance(variables.get("name"), str) or
+                        not variables["name"].startswith("hackbot-test-")):
+                    raise ValueError
+            elif (set(body) != {mutation.field} or
+                  not isinstance(body[mutation.field], str) or
+                  not body[mutation.field].startswith("hackbot-test-")):
+                raise ValueError
+        except (ValueError, TypeError, UnicodeError, PermissionError):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_TEMPLATE")
+        hypothesis = self._hypothesis(candidate, operation, owned)
+        context = self.context.build(hypothesis,
+                                     self.hypotheses.latest_profile(candidate.target_id),
+                                     package)
+        try:
+            plan = self.planner.bind_typed_mutation(
+                package, hypothesis, context,
+                TypedMutationPlanBinding(
+                    item.id, item.object_type, item.external_id_hash or "",
+                    item.recipe_id, item.recipe_hash, mutation.mutation_type.value,
+                    mutation.write.method, mutation.readback.operation,
+                    mutation.write.operation, owner.identity_id, owner.session_id or "",
+                    foreign.identity_id, foreign.session_id, candidate.boundary.value))
+        except (LookupError, ValueError):
+            return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                              status="NEEDS_MANUAL_REVIEW",
+                                              hypothesis_id=hypothesis.id)
+        self.objects.add_requirement(
+            plan_id=str(plan["id"]), target_id=candidate.target_id,
+            object_type=item.object_type, recipe_id=item.recipe_id,
+            identity_id=item.creator_identity_id, tenant_id=item.tenant_id,
+            parent_id=item.parent_id, test_object_id=item.id)
         return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                           status="PLANNED", hypothesis_id=hypothesis.id,
                                           plan_id=str(plan["id"]))

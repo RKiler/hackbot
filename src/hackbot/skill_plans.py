@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from .authorization_binding import reference_fingerprint
+from .mutation_binding import MutationStage, STAGES, mutation_fingerprint
 from .executor import RequestTemplate
 from .hypotheses import Hypothesis
 from .identity_registry import IdentityRegistry
@@ -375,6 +376,28 @@ class AuthorizationPlanBinding:
     operation: str | None = None
     binding: str = "AUTHORIZATION_OBJECT_PATH_V1"
     variable_name: str | None = None
+    parent_object_id: str | None = None
+    foreign_parent_object_id: str | None = None
+    owner_peer_object_id: str | None = None
+    actor_object_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedMutationPlanBinding:
+    test_object_id: str
+    object_type: str
+    object_ref_hash: str
+    recipe_id: str
+    recipe_hash: str
+    mutation_type: str
+    write_method: str
+    read_operation: str
+    write_operation: str
+    owner_identity_id: str
+    owner_session_id: str
+    boundary_identity_id: str
+    boundary_session_id: str
+    boundary: str
 
 
 class SkillPlanStore:
@@ -559,9 +582,21 @@ class SkillPlanner:
         for item in bindings:
             graphql_query = item.binding == "AUTHORIZATION_GRAPHQL_QUERY_V1"
             graphql_mutation = item.binding == "AUTHORIZATION_GRAPHQL_MUTATION_V1"
+            nested = item.binding == "AUTHORIZATION_NESTED_PARENT_V1"
+            batch = item.binding == "AUTHORIZATION_BATCH_PATH_V1"
             graphql = graphql_query or graphql_mutation
             if (item.binding not in {"AUTHORIZATION_OBJECT_PATH_V1", "AUTHORIZATION_GRAPHQL_QUERY_V1",
-                                     "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+                                     "AUTHORIZATION_GRAPHQL_MUTATION_V1",
+                                     "AUTHORIZATION_NESTED_PARENT_V1",
+                                     "AUTHORIZATION_BATCH_PATH_V1"}
+                    or (nested and (skill_id != "nested-resource-authorization" or
+                                    item.method != "GET" or item.variant != "FOREIGN" or
+                                    not item.parent_object_id or not item.foreign_parent_object_id))
+                    or (not nested and (item.parent_object_id or item.foreign_parent_object_id))
+                    or (batch and (skill_id != "batch-object-authorization" or
+                                   item.method != "GET" or item.variant not in {"OWNER", "FOREIGN"} or
+                                   not item.owner_peer_object_id or not item.actor_object_id))
+                    or (not batch and (item.owner_peer_object_id or item.actor_object_id))
                     or (graphql and (item.method != "POST" or
                                       skill_id != ("graphql-mutation-authorization" if graphql_mutation
                                                    else "graphql-object-authorization")
@@ -586,6 +621,12 @@ class SkillPlanner:
                      "authentication": "EXECUTOR_SUPPLIED"}
             if graphql:
                 shape["variable_name"] = item.variable_name
+            if nested:
+                shape["parent_object_id"] = item.parent_object_id
+                shape["foreign_parent_object_id"] = item.foreign_parent_object_id
+            if batch:
+                shape["owner_peer_object_id"] = item.owner_peer_object_id
+                shape["actor_object_id"] = item.actor_object_id
             shape["fingerprint"] = reference_fingerprint(shape)
             templates.append(shape)
             actions.append({"category": ("AUTHORIZATION_TEST" if item.role == "BOUNDARY" or
@@ -619,4 +660,70 @@ class SkillPlanner:
             skill.metadata.token_budget, "READY_FOR_MANUAL_REVIEW",
             datetime.now(timezone.utc).isoformat(),
             ({"control_slot": 0, "boundary_slot": boundary_slot},))
+        return self.store.save(plan, regenerate=True)
+
+    def bind_typed_mutation(self, package: TargetPackage, hypothesis: Hypothesis,
+                            context: SkillContext,
+                            binding: TypedMutationPlanBinding) -> dict[str, object]:
+        """Freeze only opaque references; current recipe and ownership are rechecked per step."""
+        if hypothesis.target_id != package.target.id or context.target_id != package.target.id:
+            raise ValueError("typed mutation plan target mismatch")
+        skill = self.registry.select("typed-authorization-mutation")
+        prerequisite = self.checker.check(skill.metadata, context)
+        if prerequisite.state is not PrerequisiteState.READY:
+            raise ValueError("typed mutation prerequisites are not ready")
+        if (binding.mutation_type != "RENAME" or binding.write_method not in {"PATCH", "PUT", "POST"}
+                or binding.boundary not in {"CROSS_TENANT", "HORIZONTAL", "VERTICAL",
+                                             "HIDDEN_FUNCTION", "GRAPHQL_MUTATION"}
+                or binding.owner_identity_id == binding.boundary_identity_id
+                or not re.fullmatch(r"[0-9a-f]{64}", binding.object_ref_hash)
+                or not re.fullmatch(r"[0-9a-f]{64}", binding.recipe_hash)
+                or len(STAGES) != skill.metadata.request_budget):
+            raise ValueError("typed mutation plan binding is unsafe")
+        actions: list[dict[str, object]] = []
+        templates: list[dict[str, str]] = []
+        for stage in STAGES:
+            boundary = stage is MutationStage.BOUNDARY_MUTATE
+            mutating = stage in {MutationStage.OWNER_MUTATE,
+                                 MutationStage.BOUNDARY_MUTATE, MutationStage.RESTORE}
+            shape = {"binding": "AUTHORIZATION_RECIPE_MUTATION_V1",
+                     "recipe_id": binding.recipe_id, "recipe_hash": binding.recipe_hash,
+                     "test_object_id": binding.test_object_id,
+                     "mutation_type": binding.mutation_type, "stage": stage.value,
+                     "method": binding.write_method if mutating else "GET",
+                     "authentication": "EXECUTOR_SUPPLIED"}
+            shape["fingerprint"] = mutation_fingerprint(shape)
+            templates.append(shape)
+            actions.append({"category": "OBJECT_UPDATE" if mutating else "SAFE_READ",
+                            "actor": "AUTHENTICATED",
+                            "identity_id": (binding.boundary_identity_id if boundary else
+                                            binding.owner_identity_id),
+                            "session_id": (binding.boundary_session_id if boundary else
+                                           binding.owner_session_id),
+                            "method": shape["method"],
+                            "operation": binding.write_operation if mutating else binding.read_operation,
+                            "object_type": binding.object_type,
+                            "object_ref_hash": binding.object_ref_hash,
+                            "disposable_intent": True, "cross_identity": boundary,
+                            "role": ("BOUNDARY" if boundary else "CONTROL" if stage in {
+                                MutationStage.BEFORE_READ, MutationStage.OWNER_MUTATE,
+                                MutationStage.OWNER_READBACK} else "OTHER"),
+                            "control_kind": stage.value, "vulnerability_class": "bola",
+                            "request_template_fingerprint": shape["fingerprint"],
+                            "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True})
+        steps = [(StepType.OBSERVE, "Verify owned disposable object and permission boundary.")]
+        steps.extend((StepType.EXECUTE_REQUEST, "Execute one recipe-bound mutation or read-back.")
+                     for _ in STAGES)
+        steps.append((StepType.COMPARE_RESPONSE, "Compare independently verified object state."))
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prerequisite,
+            skill.controls, tuple(steps), tuple(actions), tuple(templates),
+            skill.positive_signals, skill.negative_signals, skill.evidence_requirements,
+            skill.confirmation_requirements, skill.rejection_conditions,
+            skill.metadata.risk, len(STAGES), skill.metadata.token_budget,
+            "READY_FOR_MANUAL_REVIEW", datetime.now(timezone.utc).isoformat(),
+            ({"control_slot": 2, "boundary_slot": 4},))
         return self.store.save(plan, regenerate=True)

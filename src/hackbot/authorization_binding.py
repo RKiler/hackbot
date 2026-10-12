@@ -21,11 +21,14 @@ from .target_package import TargetPackage
 from .target_scope import ScopeResult
 from .test_objects import ObjectRegistry, ObjectState
 from .traffic import AuthState, ExchangeState, TrafficStore
+from .typed_mutations import BatchBinding, NestedBinding
 
 
 _KEYS = frozenset({"binding", "method", "source_exchange_id", "test_object_id",
                    "variant", "fingerprint", "authentication"})
 _GRAPHQL_KEYS = _KEYS | {"variable_name"}
+_NESTED_KEYS = _KEYS | {"parent_object_id", "foreign_parent_object_id"}
+_BATCH_KEYS = _KEYS | {"owner_peer_object_id", "actor_object_id"}
 _VARIANTS = frozenset({"OWNER", "FOREIGN", "INVALID_OBJECT", "ANONYMOUS",
                        "POST_READBACK"})
 
@@ -54,7 +57,9 @@ def single_rename_operation(query: str, id_variable: str, name_variable: str) ->
 
 
 def reference_fingerprint(shape: dict[str, str]) -> str:
-    keys = (_GRAPHQL_KEYS if shape.get("binding") in {
+    keys = (_BATCH_KEYS if shape.get("binding") == "AUTHORIZATION_BATCH_PATH_V1" else
+            _NESTED_KEYS if shape.get("binding") == "AUTHORIZATION_NESTED_PARENT_V1" else
+            _GRAPHQL_KEYS if shape.get("binding") in {
         "AUTHORIZATION_GRAPHQL_QUERY_V1", "AUTHORIZATION_GRAPHQL_MUTATION_V1"} else _KEYS)
     payload = {key: shape[key] for key in sorted(keys - {"fingerprint"})}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -66,11 +71,16 @@ def resolve_authorization_request(shape: dict[str, str], *, package: TargetPacka
     """Return a single exact-path request and its salted owned-object hash."""
     graphql = shape.get("binding") in {"AUTHORIZATION_GRAPHQL_QUERY_V1",
                                        "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+    nested = shape.get("binding") == "AUTHORIZATION_NESTED_PARENT_V1"
+    batch = shape.get("binding") == "AUTHORIZATION_BATCH_PATH_V1"
     mutation = shape.get("binding") == "AUTHORIZATION_GRAPHQL_MUTATION_V1"
-    if (set(shape) != (_GRAPHQL_KEYS if graphql else _KEYS) or
+    if (set(shape) != (_BATCH_KEYS if batch else _NESTED_KEYS if nested else
+                       _GRAPHQL_KEYS if graphql else _KEYS) or
             shape.get("binding") not in {"AUTHORIZATION_OBJECT_PATH_V1",
                                           "AUTHORIZATION_GRAPHQL_QUERY_V1",
-                                          "AUTHORIZATION_GRAPHQL_MUTATION_V1"}
+                                          "AUTHORIZATION_GRAPHQL_MUTATION_V1",
+                                          "AUTHORIZATION_NESTED_PARENT_V1",
+                                          "AUTHORIZATION_BATCH_PATH_V1"}
             or shape.get("authentication") != "EXECUTOR_SUPPLIED"
             or shape.get("variant") not in _VARIANTS
             or (graphql and (shape.get("method") != "POST" or
@@ -79,6 +89,9 @@ def resolve_authorization_request(shape: dict[str, str], *, package: TargetPacka
                              not shape["variable_name"].isidentifier()))
             or (mutation and shape.get("variant") not in {"FOREIGN", "INVALID_OBJECT"})
             or (not graphql and shape.get("method") not in {"GET", "HEAD"})
+            or (nested and (shape.get("method") != "GET" or shape.get("variant") != "FOREIGN"))
+            or (batch and (shape.get("method") != "GET" or
+                           shape.get("variant") not in {"OWNER", "FOREIGN"}))
             or (shape.get("variant") == "POST_READBACK" and graphql)
             or shape.get("fingerprint") != reference_fingerprint(shape)):
         raise ValueError("invalid authorization request reference")
@@ -181,9 +194,107 @@ def resolve_authorization_request(shape: dict[str, str], *, package: TargetPacka
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return RequestTemplate("POST", url, (("Content-Type", "application/json"),), body), item.external_id_hash
     segments = parsed.path.split("/")
+    if batch:
+        peer = objects.get(shape["owner_peer_object_id"], package.target.id)
+        actor_object = objects.get(shape["actor_object_id"], package.target.id)
+        if (peer is None or actor_object is None or
+                item.id in {peer.id, actor_object.id} or peer.id == actor_object.id or
+                peer.tenant_id != item.tenant_id or
+                peer.creator_identity_id != item.creator_identity_id or
+                actor_object.tenant_id == item.tenant_id or
+                peer.object_type != item.object_type or
+                actor_object.object_type != item.object_type):
+            raise ValueError("batch ownership relation is invalid")
+        BatchBinding(exchange.request.record.operation_id or "batchRead",
+                     (item.id, peer.id, actor_object.id), actor_object.creator_identity_id,
+                     (actor_object.id,), 4)
+        for entry in (peer, actor_object):
+            if (entry.package_id != package.id or entry.state is not ObjectState.IN_USE or
+                    not entry.disposable or not entry.verified_at or
+                    objects.active_reservation(entry.id) != run_id or
+                    not entry.external_id_evidence_id or not entry.external_id_hash):
+                raise ValueError("batch object reservation is missing")
+            for predicate, value in (("created_by", entry.creator_identity_id),
+                                     ("resource_tenant", entry.tenant_id), ("disposable", "true")):
+                facts = evidence.find_facts(entry.id, predicate, limit=8).items
+                if not any(fact.target_ref == package.target.id and fact.status is FactStatus.ACTIVE
+                           and fact.source != "MANUAL" and fact.confidence >= 0.9 and
+                           fact.evidence_ids and fact.object == value for fact in facts):
+                    raise ValueError("batch ownership facts are missing")
+        def batch_external(entry) -> str:
+            value = evidence.read_content(entry.external_id_evidence_id,
+                                          allow_sensitive=True, max_bytes=256).decode("ascii")
+            if hashlib.sha256((entry.id + ":" + value).encode()).hexdigest() != entry.external_id_hash:
+                raise ValueError("batch ID integrity failed")
+            return value
+        peer_external = batch_external(peer)
+        actor_external = batch_external(actor_object)
+        if (len(segments) < 2 or segments[-2] != "batch" or
+                segments[-1].split(",") != [external, peer_external] or
+                hashlib.sha256(peer_external.encode()).hexdigest() not in
+                features.object_id_hashes):
+            raise ValueError("observed batch is not exactly two owned objects")
+        if shape["variant"] == "FOREIGN":
+            segments[-1] = quote(actor_external, safe="") + "," + quote(external, safe="")
+        resolved = urlunsplit((parsed.scheme, parsed.netloc, "/".join(segments), "", ""))
+        if package.scope.evaluate_url(resolved).result is not ScopeResult.IN_SCOPE:
+            raise ValueError("batch request is outside scope")
+        return RequestTemplate("GET", resolved), item.external_id_hash
     positions = [index for index, segment in enumerate(segments) if unquote(segment) == external]
     if len(positions) != 1:
         raise ValueError("object ID path binding is ambiguous")
+    if nested:
+        parent = objects.get(shape["parent_object_id"], package.target.id)
+        foreign_parent = objects.get(shape["foreign_parent_object_id"], package.target.id)
+        if (parent is None or foreign_parent is None or item.parent_id != parent.id or
+                parent.id == foreign_parent.id or parent.tenant_id != item.tenant_id or
+                foreign_parent.tenant_id == item.tenant_id or
+                parent.object_type != foreign_parent.object_type or
+                any(entry.package_id != package.id or entry.state is not ObjectState.IN_USE or
+                    not entry.disposable or not entry.verified_at or
+                    objects.active_reservation(entry.id) != run_id or
+                    not entry.external_id_evidence_id or not entry.external_id_hash
+                    for entry in (parent, foreign_parent))):
+            raise ValueError("nested object reservations or relation missing")
+        for entry in (parent, foreign_parent):
+            for predicate, value in (("created_by", entry.creator_identity_id),
+                                     ("resource_tenant", entry.tenant_id), ("disposable", "true")):
+                facts = evidence.find_facts(entry.id, predicate, limit=8).items
+                if not any(fact.target_ref == package.target.id and fact.status is FactStatus.ACTIVE
+                           and fact.source != "MANUAL" and fact.confidence >= 0.9 and
+                           fact.evidence_ids and fact.object == value for fact in facts):
+                    raise ValueError("nested ownership facts missing")
+        def parent_external(entry) -> str:
+            value = evidence.read_content(entry.external_id_evidence_id,
+                                          allow_sensitive=True, max_bytes=256).decode("ascii")
+            if hashlib.sha256((entry.id + ":" + value).encode()).hexdigest() != entry.external_id_hash:
+                raise ValueError("nested parent ID integrity failed")
+            return value
+        original_parent = parent_external(parent)
+        replacement_parent = parent_external(foreign_parent)
+        parent_positions = [index for index, segment in enumerate(segments)
+                            if unquote(segment) == original_parent]
+        if len(parent_positions) != 1 or parent_positions[0] == positions[0]:
+            raise ValueError("observed nested URL is ambiguous")
+        response_ref = exchange.response.body_evidence_id if exchange.response else None
+        if not response_ref:
+            raise ValueError("nested relation read-back missing")
+        response_item = evidence.get_evidence(response_ref)
+        if (response_item is None or response_item.target_ref != package.target.id or
+                response_item.redaction_status.value != "ORIGINAL" or
+                response_item.content_size > 8192):
+            raise ValueError("nested relation evidence is unavailable")
+        content = evidence.read_content(response_ref, allow_sensitive=True, max_bytes=8192)
+        if hashlib.sha256(content).hexdigest() != exchange.response.body_hash:
+            raise ValueError("nested relation evidence changed")
+        response = json.loads(content)
+        if (not isinstance(response, dict) or response.get("id") != external or
+                response.get("parentId", response.get("parent_id")) != original_parent):
+            raise ValueError("nested relation response changed")
+        NestedBinding(parent.id, item.id, parent.tenant_id, item.tenant_id,
+                      exchange.request.record.operation_id or "nestedRead",
+                      (response_ref,))
+        segments[parent_positions[0]] = quote(replacement_parent, safe="")
     if shape["variant"] == "INVALID_OBJECT":
         replacement = str(uuid.uuid5(uuid.NAMESPACE_URL, run_id + ":" + item.id))
         segments[positions[0]] = quote(replacement, safe="")

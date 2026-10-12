@@ -51,6 +51,7 @@ class ExecutionError(StrEnum):
     CONNECTION_ERROR = "CONNECTION_ERROR"
     REDIRECT_DENIED = "REDIRECT_DENIED"
     AUTH_UNAVAILABLE = "AUTH_UNAVAILABLE"
+    TOKEN_REQUIRED = "TOKEN_REQUIRED"
     IDENTITY_UNVERIFIED = "IDENTITY_UNVERIFIED"
     BODY_LIMIT_EXCEEDED = "BODY_LIMIT_EXCEEDED"
     PROXY_UNAVAILABLE = "PROXY_UNAVAILABLE"
@@ -122,6 +123,12 @@ class ProxyRoute:
 
 class ExecutionProxyProvider(Protocol):
     def route(self, action: ProposedAction) -> ProxyRoute | None: ...
+
+
+class TokenResolver(Protocol):
+    """Trusted per-request token source; values never enter plan snapshots."""
+
+    def resolve(self, action: ProposedAction, header_name: str) -> str | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +219,8 @@ class TrafficExecutor:
                  permits: PolicyPermitStore, rate: RateLimiter, traffic: TrafficStore,
                  auth: AuthContextManager, secrets: SecretProvider,
                  settings: ExecutorSettings, proxy: ExecutionProxyProvider | None = None,
-                 browser: object | None = None) -> None:
+                 browser: object | None = None,
+                 token_resolver: TokenResolver | None = None) -> None:
         self.targets = targets
         self.policy = policy
         self.permits = permits
@@ -223,6 +231,7 @@ class TrafficExecutor:
         self.settings = settings
         self.proxy = proxy
         self.browser = browser
+        self.token_resolver = token_resolver
 
     def authorize(self, action: ProposedAction, template: RequestTemplate) -> PolicyPermit:
         """Trusted, local-only permit issuance; never exposed as raw URL API."""
@@ -299,7 +308,8 @@ class TrafficExecutor:
                 max_dispatches: int | None = None,
                 execution_id: str | None = None,
                 continue_dispatch: Callable[[], bool] | None = None,
-                on_dispatch: Callable[[str], bool] | None = None) -> ExecutionResult:
+                on_dispatch: Callable[[str], bool] | None = None,
+                token_header: str | None = None) -> ExecutionResult:
         start = datetime.now(timezone.utc)
         execution_id = execution_id or "EXEC-" + uuid.uuid4().hex
         exchange_ids: list[str] = []
@@ -329,6 +339,10 @@ class TrafficExecutor:
                                                not 1 <= max_dispatches <= 10000):
                 raise _Stop(ExecutionError.INVALID_REQUEST)
             if not isinstance(execution_id, str) or not re.fullmatch(r"EXEC-[0-9a-f]{32}", execution_id):
+                raise _Stop(ExecutionError.INVALID_REQUEST)
+            if token_header is not None and (token_header != "X-CSRF-Token" or
+                                             template.method not in {"POST", "PUT", "PATCH", "DELETE"} or
+                                             action.actor is not ActorMode.AUTHENTICATED):
                 raise _Stop(ExecutionError.INVALID_REQUEST)
             current_action, current_template, current_permit = action, template, initial
             hop_limit = min(self.settings.max_redirects + 1, max_dispatches or self.settings.max_redirects + 1)
@@ -369,6 +383,17 @@ class TrafficExecutor:
                     headers["Accept-Encoding"] = "gzip, deflate"
                     if auth_header:
                         headers[auth_header[0]] = auth_header[1]
+                    if token_header is not None:
+                        if self.token_resolver is None:
+                            raise _Stop(ExecutionError.TOKEN_REQUIRED)
+                        try:
+                            token = self.token_resolver.resolve(current_action, token_header)
+                        except Exception:
+                            raise _Stop(ExecutionError.TOKEN_REQUIRED) from None
+                        if (not isinstance(token, str) or not 1 <= len(token) <= 8192 or
+                                any(ord(char) < 33 or ord(char) > 126 for char in token)):
+                            raise _Stop(ExecutionError.TOKEN_REQUIRED)
+                        headers[token_header] = token
                     captured = CapturedRequest(
                         method=current_template.method, url=current_template.url,
                         headers=tuple(headers.items()), body=current_template.body,

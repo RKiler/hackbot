@@ -294,6 +294,7 @@ class AuthManagerTests(unittest.TestCase):
     def test_schema_migrates_v2_and_has_only_opaque_references(self):
         identity = self._identity("preserved")
         with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE authorization_mutation_results")
             for table in ("authorization_hunt_objects", "authorization_observations",
                           "authorization_hunt_candidates",
                           "authorization_candidates", "authorization_hunts"):
@@ -330,7 +331,7 @@ class AuthManagerTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=2")
         self.store.initialize()
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 16)
             names = {row[1] for row in connection.execute("PRAGMA table_info(auth_contexts)")}
         self.assertIn("secret_ref", names)
         self.assertEqual(self.registry.get_identity(self.target_id, identity.id), identity)

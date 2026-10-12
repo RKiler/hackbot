@@ -214,3 +214,13 @@ integration decisions, not silent defaults.
 | D-099 | Expose target-scoped authorization metadata and controls only through the existing authenticated dashboard gateway, with no raw request or Evidence-body endpoint. | Reuses the private service and browser/CSRF boundary without creating a second public API. |
 | D-100 | Attribute only newly created specialist control objects to their hunt and attempt policy-gated automatic cleanup after terminal/cancelled runs; preserve pending and failed outcomes. | A reusable operator fixture must never be deleted because a hunt happened to use it, while objects the specialist creates need accountable cleanup. |
 | D-101 | Surface nested parent-child mismatches only as manual-review candidates when an observed owner request and response prove both IDs and their relationship; defer active nested-ID substitution. | A local parent pointer or route shape alone does not establish application semantics, and Phase 19 has no exact, policy-gated parent-child binder. |
+
+## Phase 20
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-102 | Execute only recipe-pinned `RENAME(name)` for verified, reserved disposable objects; model other mutation types but do not dispatch them. | A narrow field allowlist and exact reversal/read-back contract are safer than a general JSON write surface. |
+| D-103 | Require separate owner read-back after each write and after restore; persist secret-free hashes and traffic/evidence references. Never retry an ambiguous write. | Mutation response status does not prove durable effect, while replay after a lost response could duplicate a side effect. |
+| D-104 | Bind nested and mixed-batch tests only to exact observed read-only operations and known, Fact-backed ObjectRegistry IDs; keep the executable batch to two IDs. | This expands Phase 19's manual-only nested lead without enabling ID guessing or mass batch mutation. |
+| D-105 | Inject only recipe-declared CSRF headers via a trusted executor-side resolver; do not put token values into plans, skill context, results, or dashboard metadata. | Captured tokens can be stale, and token resolution is a trusted execution capability, not reasoning input. |
+| D-106 | Expose Phase 20 metadata through the private BugHunter API and render only redacted summaries in the existing authenticated recon dashboard gateway; keep gateway routes and service configuration unchanged. | The Phase 20 dashboard requirement is an explicit integration task, while the security controls and persistence remain BugHunter-owned. |

@@ -34,7 +34,10 @@ from .permit_store import PolicyPermitStore
 from .plan_runs import PlanRunStore, RunStatus
 from .orchestrator import PlanOrchestrator
 from .object_factory import ObjectFactory
+from .mutation_results import MutationResultStore
+from .mutation_results import value_hash
 from .object_recipes import RecipeCatalog
+from .typed_mutations import MutationPhase, TypedMutation
 from .test_objects import ObjectRegistry, ObjectState
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
@@ -127,6 +130,7 @@ class BugHunterRuntime:
             objects=self.objects, recipes=RecipeCatalog(object_settings), policy=self.policy,
             executor=self.executor, targets=self.targets, traffic=self.traffic,
             settings=object_settings)
+        self.mutation_results = MutationResultStore(self.store)
         self.validations = ValidationStore(self.store)
         self.validator_registry = ValidatorRegistry()
         self.validator = DeterministicValidatorEngine(
@@ -137,7 +141,8 @@ class BugHunterRuntime:
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
             policy=self.policy, approvals=self.policy_store, executor=self.executor,
-            traffic=self.traffic, evidence=self.store, objects=self.objects)
+            traffic=self.traffic, evidence=self.store, objects=self.objects,
+            recipes=self.object_factory.recipes, mutations=self.mutation_results)
         self.authorization_ledger = AuthorizationStore(self.store)
         self.authorization = AuthorizationSpecialist(
             identities=self.registry, browser=self.browser, objects=self.objects,
@@ -152,6 +157,8 @@ class BugHunterRuntime:
             pass
         self.reconcile_on_startup()
         while self.run_store.reconcile():
+            pass
+        while self.mutation_results.reconcile():
             pass
         while self.authorization_ledger.reconcile_runs():
             pass
@@ -450,8 +457,20 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         item = service.objects.get(object_id, package.target.id)
         if item is None:
             raise LookupError("object not found")
+        mutations = service.mutation_results.list_for_object(item.id, item.target_id)
+        latest = mutations[0].run_id if mutations else None
+        current = [entry for entry in mutations if entry.run_id == latest]
+        restored = any(entry.phase.value == "RESTORE" and entry.verified_effect
+                       for entry in current)
+        mutated = any(entry.phase.value in {"OWNER_CONTROL", "BOUNDARY"} and
+                      entry.verified_effect for entry in current)
+        state = "RESTORED" if restored else "MUTATED_REVIEW_REQUIRED" if mutated else "UNCHANGED_OR_UNVERIFIED"
         return jsonify({"object": item.to_dict(), "events": service.objects.events(item.id, item.target_id),
-                        "active_reservation_run": service.objects.active_reservation(item.id)})
+                        "active_reservation_run": service.objects.active_reservation(item.id),
+                        "mutation_state": state,
+                        "latest_readback": next((entry.to_dict() for entry in current
+                                                 if entry.readback_exchange_id), None),
+                        "mutation_history": [entry.to_dict() for entry in mutations]})
 
     @app.post("/v1/objects")
     def create_object():
@@ -617,6 +636,21 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             exchange = service.traffic.get_exchange(item.owner_exchange_id)
             row["evidence_ids"] = (list(exchange.evidence_ids[:4]) if exchange is not None and
                                    exchange.target_id == package.target.id else [])
+            method = exchange.request.record.method if exchange is not None else None
+            row["test_type"] = (
+                "NESTED_READ" if item.boundary.value == "PARENT_CHILD" else
+                "BATCH_READ" if "BATCH_READ_EXACT_OBSERVED" in item.reasons else
+                "TYPED_MUTATION" if method in {"PATCH", "PUT"} or
+                item.boundary.value == "GRAPHQL_MUTATION" else "SINGLE_OBJECT_READ")
+            records = (service.mutation_results.list_for_run(item.run_id, package.target.id)
+                       if item.run_id else ())
+            phases = {entry.phase: entry for entry in records}
+            row["owner_readback_status"] = (phases[MutationPhase.OWNER_CONTROL].status.value
+                                            if MutationPhase.OWNER_CONTROL in phases else None)
+            row["readback_status"] = (phases[MutationPhase.BOUNDARY].status.value
+                                      if MutationPhase.BOUNDARY in phases else None)
+            row["restore_status"] = (phases[MutationPhase.RESTORE].status.value
+                                     if MutationPhase.RESTORE in phases else None)
             items.append(row)
         return jsonify({"items": items})
 
@@ -630,8 +664,31 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.get("/v1/authorization/<package_id>/metrics")
     def authorization_metrics(package_id: str):
         package = service.package(package_id)
-        return jsonify(service.authorization_ledger.stats(
-            package.target.id, hunt_id=request.args.get("hunt_id") or None))
+        metrics = service.authorization_ledger.stats(
+            package.target.id, hunt_id=request.args.get("hunt_id") or None)
+        metrics["typed_mutations"] = service.mutation_results.stats(package.target.id)
+        with service.store._connection() as db:
+            rows = db.execute("SELECT sum(boundary='PARENT_CHILD') AS nested,"
+                              "sum(reasons_json LIKE '%BATCH_READ_EXACT_OBSERVED%') AS batch "
+                              "FROM authorization_candidates WHERE target_id=?",
+                              (package.target.id,)).fetchone()
+            mutation_candidates = db.execute(
+                "SELECT count(*) FROM authorization_candidates c "
+                "JOIN traffic_exchanges e ON e.exchange_id=c.owner_exchange_id "
+                "JOIN traffic_requests r ON r.request_id=e.request_id "
+                "WHERE c.target_id=? AND (r.method IN ('PATCH','PUT') OR "
+                "c.boundary='GRAPHQL_MUTATION')",
+                (package.target.id,)).fetchone()[0]
+            mutation_plans = db.execute(
+                "SELECT count(*) FROM authorization_candidates c JOIN skill_plans p "
+                "ON p.plan_id=c.plan_id WHERE c.target_id=? AND "
+                "p.skill_id='typed-authorization-mutation'",
+                (package.target.id,)).fetchone()[0]
+        metrics["nested_candidates"] = rows["nested"] or 0
+        metrics["batch_candidates"] = rows["batch"] or 0
+        metrics["mutation_candidates"] = mutation_candidates
+        metrics["mutation_plans"] = mutation_plans
+        return jsonify(metrics)
 
     @app.post("/v1/authorization/<package_id>/candidates/<candidate_id>/prepare")
     def prepare_authorization_candidate(package_id: str, candidate_id: str):
@@ -833,6 +890,38 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         detail["run"]["finding_status"] = (latest.status.value if latest else
                                                "READY_FOR_VALIDATION" if detail["run"]["status"] == "COMPLETED"
                                                else "UNVALIDATED")
+        records = service.mutation_results.list_for_run(run_id, package.target.id)
+        detail["mutation_results"] = [item.to_dict() for item in records]
+        detail["mutation_cleanup_status"] = (
+            "RESTORED" if any(item.phase.value == "RESTORE" and item.verified_effect
+                              for item in records) else
+            "REVIEW_REQUIRED" if any(item.verified_effect for item in records) else
+            "NOT_APPLICABLE")
+        detail["mutation_approval"] = None
+        if detail["run"]["skill_id"] == "typed-authorization-mutation":
+            plan = service.run_store.snapshot(detail["run"]["plan_id"], package.target.id).data
+            shapes = plan.get("request_templates", [])
+            actions = plan.get("proposed_actions", [])
+            if len(shapes) == 7 and len(actions) == 7:
+                shape = shapes[0]
+                item = service.objects.get(shape.get("test_object_id", ""), package.target.id)
+                recipe = (service.object_factory.recipes.get(package.id, item.recipe_id)
+                          if item is not None else None)
+                mutation = (next((entry for entry in recipe.mutations
+                                  if entry.mutation_type.value == shape.get("mutation_type")), None)
+                            if recipe is not None and recipe.sha256 == item.recipe_hash else None)
+                if item is not None and mutation is not None:
+                    next_value = TypedMutation.test_value(run_id, item.id, MutationPhase.BOUNDARY)
+                    detail["mutation_approval"] = {
+                        "object_id": item.id, "object_type": item.object_type,
+                        "disposable": item.disposable, "object_state": item.state.value,
+                        "field": mutation.field, "action": mutation.mutation_type.value,
+                        "old_summary": "sha256:" + value_hash(item.test_name)[:12],
+                        "new_summary": "sha256:" + value_hash(next_value)[:12],
+                        "acting_identity_id": actions[3].get("identity_id"),
+                        "risk": plan.get("risk"), "cleanup_strategy": "RESTORE",
+                        "recipe_current": recipe.sha256 == shape.get("recipe_hash"),
+                    }
         return jsonify(detail)
 
     @app.post("/v1/runs/<run_id>/validate")

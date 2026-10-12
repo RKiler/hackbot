@@ -37,8 +37,8 @@ class SkillRegistryTests(unittest.TestCase):
         registry = SkillRegistry(CATALOG)
         with patch.object(Path, "read_bytes", side_effect=AssertionError("body read during discovery")):
             entries = registry.discover()
-        self.assertEqual(len(entries), 11)
-        self.assertEqual(len({entry.name for entry in entries}), 11)
+        self.assertEqual(len(entries), 14)
+        self.assertEqual(len({entry.name for entry in entries}), 14)
         selected = registry.select("cross-tenant-object-authorization")
         self.assertEqual(len(selected.content_hash), 64)
         self.assertTrue(selected.controls)
