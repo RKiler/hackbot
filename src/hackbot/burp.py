@@ -75,7 +75,7 @@ class BurpProxyProvider:
             return BurpAvailability.BURP_NOT_INSTALLED
         if not self.settings.enabled or self.settings.bridge_secret_ref is None:
             return BurpAvailability.BURP_REQUIRES_OPERATOR_SETUP
-        return BurpAvailability.BURP_PRESENT_BUT_NOT_AUTOMATABLE
+        return BurpAvailability.BURP_AVAILABLE
 
     def _project_path(self, target_id: str) -> Path:
         validate_entity_id(target_id, "TARGET")
@@ -226,7 +226,21 @@ class BurpProxyProvider:
         with self.traffic.evidence._connection() as connection:
             row = connection.execute("SELECT last_seen_at FROM burp_bridge_health WHERE target_id=?",
                                      (target_id,)).fetchone()
-        return row is not None and datetime.fromisoformat(row["last_seen_at"]) >= datetime.now(timezone.utc) - timedelta(seconds=90)
+        if row is None or datetime.fromisoformat(row["last_seen_at"]) < datetime.now(timezone.utc) - timedelta(seconds=90):
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", self.settings.bridge_port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+    def reconcile_cold_start(self) -> None:
+        """Discard process-local capture claims after the browser owner restarts."""
+        with self.traffic.evidence._connection() as connection:
+            connection.execute("DELETE FROM burp_bridge_health")
+            connection.execute("""UPDATE burp_listener_bindings
+                SET state='RELEASED',updated_at=? WHERE state='ACTIVE'""",
+                (datetime.now(timezone.utc).isoformat(),))
 
     def listener_reachable(self, port: int) -> bool:
         if type(port) is not int or not self.settings.listener_start <= port <= self.settings.listener_end:
@@ -256,7 +270,15 @@ class BurpProxyProvider:
         available = self.availability()
         connected = self.bridge_connected(target_id) if target_id is not None else False
         bindings = self.list_bindings(target_id) if target_id is not None else ()
-        reachable = sum(self.listener_reachable(item.proxy_port) for item in bindings if item.state == "ACTIVE")
+        active = tuple(item for item in bindings if item.state == "ACTIVE")
+        listener_ports = range(self.settings.listener_start, self.settings.listener_end + 1)
+        live_ports = {port for port in listener_ports if self.listener_reachable(port)}
+        reachable = sum(item.proxy_port in live_ports for item in active)
+        installed_version = None
+        if self.settings.installation_jar is not None:
+            match = re.fullmatch(r"burpsuite_desktop_v([0-9][0-9A-Za-z.-]*)\.jar",
+                                 self.settings.installation_jar.name)
+            installed_version = match.group(1) if match else None
         captured = None
         last_capture_at = None
         if target_id is not None:
@@ -280,10 +302,14 @@ class BurpProxyProvider:
         state = (CaptureStatus.BURP_UNAVAILABLE if available is BurpAvailability.BURP_NOT_INSTALLED
                  else CaptureStatus.BRIDGE_CONNECTED if connected and reachable
                  else CaptureStatus.BRIDGE_DISCONNECTED if connected or reachable
+                 else CaptureStatus.BURP_RUNNING if live_ports
                  else CaptureStatus.BURP_STOPPED)
         return {"availability": available.value, "status": state.value,
-                "bridge_connected": connected, "configured_listeners": len(bindings),
+                "bridge_connected": connected, "configured_listeners": len(active),
                 "reachable_listeners": reachable, "target_id": target_id,
+                "proxy_listener_capacity": len(listener_ports),
+                "proxy_listeners_reachable": len(live_ports),
+                "installed_version": installed_version,
                 "captured_exchanges": captured, "last_capture_at": last_capture_at,
                 "dropped_events": dropped_events, "last_heartbeat_at": last_heartbeat_at}
 

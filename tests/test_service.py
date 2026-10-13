@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
+import os
 from pathlib import Path
 import shutil
+import socket
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -13,7 +17,8 @@ import uuid
 from unittest.mock import Mock, patch
 
 from hackbot.browser import IdentityObservation
-from hackbot.config import BrowserSettings, TargetSettings, load_config
+from hackbot.config import (BrowserSettings, BurpSettings, SecretBindingConfig,
+                            SecretSettings, TargetSettings, load_config)
 from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
 from hackbot.postmessage_static import PostMessageStaticAnalyzer
@@ -80,6 +85,55 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets?limit=999").status_code, 400)
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
+
+    def test_burp_session_requires_bridge_and_listener_before_browser_start(self):
+        root = Path(self.temp.name)
+        jar = root / "burpsuite_desktop_v2026.9.2.jar"
+        jar.write_bytes(b"fixture")
+        with socket.socket() as bridge_socket, socket.socket() as listener_socket:
+            bridge_socket.bind(("127.0.0.1", 0))
+            listener_socket.bind(("127.0.0.1", 0))
+            bridge_port = bridge_socket.getsockname()[1]
+            listener_port = listener_socket.getsockname()[1]
+        settings = BurpSettings(True, root / "burp-projects", installation_jar=jar,
+                                listener_start=listener_port, listener_end=listener_port,
+                                bridge_port=bridge_port, bridge_secret_ref="ref:burp_bridge")
+        secrets = SecretSettings(bindings=(SecretBindingConfig(
+            "ref:burp_bridge", "env:HACKBOT_SECRET_BURP_BRIDGE", "API_TOKEN"),))
+        config = replace(self.config, burp=settings, secrets=secrets)
+        token = "fixture-bridge-token-with-at-least-32-characters"
+        with patch.dict(os.environ, {"HACKBOT_SECRET_BURP_BRIDGE": token}):
+            runtime = BugHunterRuntime(config, driver=FakeDriver(), vnc_ready=lambda: True)
+            self.addCleanup(runtime.close_burp_bridge)
+            runtime.registry.register_target(runtime.package("example"))
+            client = create_app(runtime=runtime).test_client()
+            response = client.post("/v1/browser/sessions", json={
+                "target": "example", "anonymous": True, "capture_provider": "BURP"})
+            self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+            session = response.get_json()
+            self.assertEqual(session["capture_provider"], "BURP")
+            self.assertEqual(session["capture_listener"], f"127.0.0.1:{listener_port}")
+            with closing(http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=2)) as connection:
+                connection.request("GET", "/v1/health")
+                self.assertEqual(connection.getresponse().status, 401)
+            with closing(http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=2)) as connection:
+                connection.request("GET", "/v1/health", headers={"X-Hackbot-Bridge-Token": token})
+                self.assertEqual(connection.getresponse().status, 200)
+            start_path = f"/v1/browser/sessions/{session['id']}/start?target=example"
+            self.assertEqual(client.post(start_path, json={}).status_code, 400)
+            self.assertFalse(runtime.driver.is_running(session["id"]))
+            runtime.burp.heartbeat(runtime.package("example").target.id, "1.0")
+            with patch.object(runtime.burp, "listener_reachable", return_value=True):
+                started = client.post(start_path, json={})
+            self.assertEqual(started.status_code, 200, started.get_data(as_text=True))
+            self.assertTrue(runtime.driver.is_running(session["id"]))
+            self.assertEqual(started.get_json()["capture_provider"], "BURP")
+            runtime.browser.stop(session["id"])
+            runtime.close_burp_bridge()
+            restarted = BugHunterRuntime(config, driver=FakeDriver(), vnc_ready=lambda: True)
+            self.addCleanup(restarted.close_burp_bridge)
+            self.assertEqual(restarted.burp.binding_for_session(session["id"]).state, "RELEASED")
+            self.assertFalse(restarted.burp.bridge_connected(restarted.package("example").target.id))
 
     def test_exposure_api_is_target_scoped_and_redacted(self):
         fixture_secret = "FixtureOnlySecret-a9Yh2Rk8bN4qP6vJ"

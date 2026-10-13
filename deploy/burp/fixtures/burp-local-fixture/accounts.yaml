@@ -1,0 +1,7 @@
+accounts:
+  fixture_a:
+    role: tester
+    tenant: local-fixture
+  fixture_b:
+    role: tester
+    tenant: local-fixture

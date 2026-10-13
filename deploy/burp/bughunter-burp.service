@@ -1,0 +1,29 @@
+[Unit]
+Description=BugHunter Burp Community capture proxy
+After=network.target
+RequiresMountsFor=/mnt/volume_sfo2_1788290659423/codex_artifacts/bughunter-agent/burp-runtime
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=bughunter-burp
+Group=bughunter-burp
+WorkingDirectory=/opt/bughunter/burp
+Environment=HOME=/mnt/volume_sfo2_1788290659423/codex_artifacts/bughunter-agent/burp-runtime
+Environment=HACKBOT_BURP_BRIDGE_URL=http://127.0.0.1:38777
+Environment=HACKBOT_BURP_LISTENERS=127.0.0.1:38080,127.0.0.1:38081,127.0.0.1:38082,127.0.0.1:38083
+LoadCredential=burp_bridge:/root/.config/bughunter-agent/burp-bridge.token
+UMask=0077
+ExecStart=/opt/bughunter/burp/with-bridge-secret.sh /usr/bin/xvfb-run -n 902 -f /mnt/volume_sfo2_1788290659423/codex_artifacts/bughunter-agent/burp-runtime/Xauthority -s "-screen 0 1280x800x24 -nolisten tcp" /usr/bin/python3 /opt/bughunter/burp/run_community.py --jar /opt/bughunter/burp/burpsuite_desktop_v2026.9.2.jar --runtime-root /mnt/volume_sfo2_1788290659423/codex_artifacts/bughunter-agent/burp-runtime --project-config /opt/bughunter/burp/project-config.json --user-config /opt/bughunter/burp/user-config.json --listener-port 38080
+Restart=on-failure
+RestartSec=20
+TimeoutStartSec=360
+TimeoutStopSec=30
+MemoryMax=1600M
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

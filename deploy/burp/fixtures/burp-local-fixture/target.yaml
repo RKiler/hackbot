@@ -1,0 +1,60 @@
+version: 1
+id: burp-local-fixture
+target_id: TARGET-33333333333343338333333333333333
+name: Burp Loopback Fixture
+primary_domain: localhost
+status: TRACKED
+configured_at: "2026-10-13T12:00:00+00:00"
+updated_at: "2026-10-13T12:00:00+00:00"
+source:
+  kind: RESEARCHER
+  reference: local-burp-operator-check
+  operator: bughunter-operator
+scope:
+  include:
+    - 127.0.0.1
+    - localhost
+  exclude: []
+  schemes:
+    - http
+    - https
+  ports:
+    - 39800
+    - 39801
+  exclude_paths: []
+rules:
+  automated_testing_allowed: true
+  account_creation_allowed: false
+  excluded_vulnerability_classes: []
+  forbidden_actions: []
+  third_party_restrictions: Loopback fixture only
+  data_handling_restrictions: Synthetic data only
+autonomy:
+  passive: ALLOW
+  safe_read: ALLOW
+  bounded_active: REQUIRE_APPROVAL
+  state_changing: DENY
+  destructive: DENY
+  create_disposable_objects: DENY
+  modify_disposable_objects: DENY
+  delete_disposable_objects: DENY
+  cross_identity_testing: ALLOW
+  owned_test_objects_only: true
+  account_creation: DENY
+  external_side_effects: DENY
+  permission_changes: DENY
+  financial: DENY
+rate:
+  requests_per_second: 3
+  requests_per_minute: 30
+  max_concurrency: 3
+  burst: 3
+context:
+  description: Local synthetic HTTP and HTTPS capture fixture only.
+  known_features:
+    - identity attribution
+    - proxy capture
+  terminology: {}
+  research_priorities: []
+  known_limitations:
+    - not a bounty target

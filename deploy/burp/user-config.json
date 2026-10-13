@@ -1,0 +1,21 @@
+{
+  "user_options": {
+    "extender": {
+      "extensions": [
+        {
+          "errors": "ui",
+          "extension_file": "/opt/bughunter/burp/hackbot-burp-bridge.jar",
+          "extension_type": "java",
+          "loaded": true,
+          "name": "BugHunter Capture Bridge",
+          "output": "ui"
+        }
+      ],
+      "settings": {
+        "automatically_reload_extensions_on_startup": true,
+        "automatically_update_bapps_on_startup": false,
+        "suppress_extension_loaded_popup": true
+      }
+    }
+  }
+}

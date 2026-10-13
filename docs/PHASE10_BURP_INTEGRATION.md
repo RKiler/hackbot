@@ -1,5 +1,9 @@
 # Phase 10: Burp Capture And Identity-Aware Proxy Routing
 
+This document records the Phase 10 design and its pre-installation snapshot.
+For the current Community Edition service and verified operator configuration,
+see [`OPERATOR_BURP_COMMUNITY.md`](OPERATOR_BURP_COMMUNITY.md).
+
 This phase adds a Burp capture adapter, not a hunting engine or traffic executor.
 The operator's Phase 10 request overrides the older blueprint's Phase 10 label.
 Phase 9 `TrafficStore`, `CapturedRequest`, `CapturedResponse`, `RequestRecord`,

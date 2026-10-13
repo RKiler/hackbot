@@ -1,0 +1,14 @@
+{
+  "fixture_a": {
+    "user_id_selector": "#user",
+    "tenant_selector": "#tenant",
+    "expected_user_id": "fixture-a",
+    "expected_tenant_id": "local-fixture"
+  },
+  "fixture_b": {
+    "user_id_selector": "#user",
+    "tenant_selector": "#tenant",
+    "expected_user_id": "fixture-b",
+    "expected_tenant_id": "local-fixture"
+  }
+}

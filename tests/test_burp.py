@@ -327,6 +327,30 @@ class BurpTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             BurpSettings(True, Path("relative/projects"))
 
+    def test_bridge_requires_live_socket_and_cold_start_releases_wrong_identity(self) -> None:
+        _, session, _ = self.session("fixture_a", 38080, actual_user="wrong-user")
+        self.assertEqual(self.browser.get(session.id).status.value, "REAUTH_REQUIRED")
+        with socket.socket() as endpoint:
+            endpoint.bind(("127.0.0.1", 0))
+            self.proxy.settings = replace(self.settings, bridge_port=endpoint.getsockname()[1])
+            self.proxy.heartbeat(self.target, "1.0")
+            self.assertFalse(self.proxy.bridge_connected(self.target))
+            endpoint.listen(1)
+            self.assertTrue(self.proxy.bridge_connected(self.target))
+            self.driver.running.clear()
+            self.proxy.reconcile_cold_start()
+            self.assertFalse(self.proxy.bridge_connected(self.target))
+        self.assertEqual(self.proxy.binding_for_session(session.id).state, "RELEASED")
+        self.assertEqual(self.proxy.status(self.target)["configured_listeners"], 0)
+
+    def test_status_separates_proxy_listeners_from_session_assignments(self) -> None:
+        with patch.object(self.proxy, "listener_reachable", side_effect=lambda port: port in {38080, 38083}):
+            status = self.proxy.status(self.target)
+        self.assertEqual(status["proxy_listener_capacity"], 11)
+        self.assertEqual(status["proxy_listeners_reachable"], 2)
+        self.assertEqual(status["configured_listeners"], 0)
+        self.assertEqual(status["reachable_listeners"], 0)
+
     def test_bridge_http_auth_size_and_heartbeat(self) -> None:
         _, _, binding = self.session(None, 38080)
         with socket.socket() as sock:

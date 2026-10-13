@@ -9,7 +9,7 @@ import importlib.util
 import json
 import socket
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -26,7 +26,8 @@ from .browser_playwright import PlaywrightBrowserDriver
 from .bootstrap import TargetBootstrapper
 from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, BootstrapStatus,
                               BootstrapStore)
-from .burp import BurpExecutionProxyAdapter, BurpProxyProvider
+from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
+from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
 from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
@@ -112,6 +113,10 @@ class BugHunterRuntime:
         self.browser = BrowserSessionManager(self.registry, self.auth, self.driver, config.browser)
         self.traffic = TrafficStore(self.store, self.registry)
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
+        self._burp_bridge_lock = Lock()
+        self._burp_bridge: BurpBridgeServer | None = None
+        self._burp_bridge_target: str | None = None
+        self._burp_bridge_thread: Thread | None = None
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(self.store)
@@ -228,6 +233,7 @@ class BugHunterRuntime:
 
     def reconcile_on_startup(self) -> int:
         """Fail closed after process restart; never reuse an unowned browser handle."""
+        self.burp.reconcile_cold_start()
         changed = 0
         marker = ""
         while True:
@@ -249,6 +255,43 @@ class BugHunterRuntime:
             if len(rows) < 100:
                 break
         return changed
+
+    def ensure_burp_bridge(self, package: TargetPackage) -> None:
+        """Start one target-scoped, authenticated loopback bridge in this browser owner."""
+        if not self.config.burp.enabled or self.config.burp.installation_jar is None:
+            raise BurpError("Burp capture is not configured")
+        if package.status is not PackageStatus.TRACKED:
+            raise BurpError("Burp target is not active")
+        with self._burp_bridge_lock:
+            if self._burp_bridge is not None:
+                if self._burp_bridge_target != package.target.id:
+                    raise BurpError("Burp bridge is already assigned to another target")
+                if self._burp_bridge_thread is None or not self._burp_bridge_thread.is_alive():
+                    raise BurpError("Burp bridge is unavailable")
+                return
+            provider = BurpCaptureProvider(package, self.burp, self.traffic)
+            server = BurpBridgeServer.from_secret_provider(self.config.burp, provider, self.auth.secrets)
+            thread = Thread(target=server.serve_forever, name="hackbot-burp-bridge", daemon=True)
+            thread.start()
+            if not thread.is_alive():
+                server.server_close()
+                raise BurpError("Burp bridge failed to start")
+            self._burp_bridge = server
+            self._burp_bridge_target = package.target.id
+            self._burp_bridge_thread = thread
+
+    def close_burp_bridge(self) -> None:
+        with self._burp_bridge_lock:
+            server = self._burp_bridge
+            thread = self._burp_bridge_thread
+            self._burp_bridge = None
+            self._burp_bridge_target = None
+            self._burp_bridge_thread = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2)
 
     def package(self, package_id: str) -> TargetPackage:
         package = self.targets.get_target_package(package_id)
@@ -367,6 +410,9 @@ class BugHunterRuntime:
 
     def session_summary(self, session: BrowserSession) -> dict[str, object]:
         result = session.to_dict()
+        binding = self.burp.binding_for_session(session.id)
+        result["capture_provider"] = "BURP" if binding is not None else "DIRECT"
+        result["capture_listener"] = binding.listener_key if binding is not None else None
         result["browser_running"] = self.driver.is_running(session.id)
         result["vnc_available"] = bool(session.status is BrowserStatus.WAITING_LOGIN and self._vnc_ready())
         result["vnc_url"] = (self.config.browser.vnc_url if result["vnc_available"] else None)
@@ -1834,7 +1880,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
 
     @app.post("/v1/browser/sessions")
     def create_session():
-        body = _body(frozenset({"target", "identity_id", "anonymous"}))
+        body = _body(frozenset({"target", "identity_id", "anonymous", "capture_provider"}))
         package = service.package(body.get("target", ""))
         if package.status is not PackageStatus.TRACKED:
             raise ValueError("target is not active")
@@ -1842,7 +1888,15 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         identity_id = body.get("identity_id")
         if type(anonymous) is not bool or anonymous == bool(identity_id):
             raise ValueError("invalid session identity")
-        session = service.browser.create(package.target.id, None if anonymous else identity_id)
+        capture_provider = body.get("capture_provider", "DIRECT")
+        if capture_provider == "BURP":
+            service.ensure_burp_bridge(package)
+            session, _ = service.burp.provision_session(
+                package, None if anonymous else identity_id)
+        elif capture_provider == "DIRECT":
+            session = service.browser.create(package.target.id, None if anonymous else identity_id)
+        else:
+            raise ValueError("invalid capture provider")
         service.audit("browser_created", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(session)), 201
@@ -1869,7 +1923,14 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             return jsonify(error="vnc_not_ready"), 409
         service.audit("browser_start_requested", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
-        updated = service.browser.start(session.id, package=package)
+        binding = service.burp.binding_for_session(session.id)
+        if binding is not None:
+            if binding.state != "ACTIVE":
+                raise BurpError("Burp listener is no longer active")
+            service.ensure_burp_bridge(package)
+            updated = service.burp.start_browser(session.id, package=package)
+        else:
+            updated = service.browser.start(session.id, package=package)
         service.audit("browser_started", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(updated))
