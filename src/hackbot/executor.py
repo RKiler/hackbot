@@ -321,7 +321,8 @@ class TrafficExecutor:
                 continue_dispatch: Callable[[], bool] | None = None,
                 on_dispatch: Callable[[str], bool] | None = None,
                 token_header: str | None = None,
-                artifact_capture_kind: str | None = None) -> ExecutionResult:
+                artifact_capture_kind: str | None = None,
+                redirect_guard: Callable[[str], bool] | None = None) -> ExecutionResult:
         start = datetime.now(timezone.utc)
         execution_id = execution_id or "EXEC-" + uuid.uuid4().hex
         exchange_ids: list[str] = []
@@ -542,6 +543,15 @@ class TrafficExecutor:
                 if current_action.actor is ActorMode.AUTHENTICATED:
                     old, new = urlsplit(current_template.url), urlsplit(destination)
                     if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+                        redirects.append(RedirectHop(status, destination_hash, False))
+                        self.permits.record(current_permit, "REDIRECT_EVALUATED", "REDIRECT_DENIED", exchange.id)
+                        raise _Stop(ExecutionError.REDIRECT_DENIED)
+                if redirect_guard is not None:
+                    try:
+                        allowed_redirect = redirect_guard(destination) is True
+                    except Exception:
+                        allowed_redirect = False
+                    if not allowed_redirect:
                         redirects.append(RedirectHop(status, destination_hash, False))
                         self.permits.record(current_permit, "REDIRECT_EVALUATED", "REDIRECT_DENIED", exchange.id)
                         raise _Stop(ExecutionError.REDIRECT_DENIED)

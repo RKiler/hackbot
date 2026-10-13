@@ -17,6 +17,10 @@ from .target_scope import ScopeResult
 from .traffic import TrafficStore
 from .identity_registry import IdentityRegistry
 from .store import EvidenceFactStore
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .bootstrap_store import BootstrapStore
 
 
 class SignalSource(StrEnum):
@@ -28,6 +32,9 @@ class SignalSource(StrEnum):
     IDENTITY_REGISTRY = "IDENTITY_REGISTRY"
     FACT = "FACT"
     EVIDENCE = "EVIDENCE"
+    COLD_START_BROWSER = "COLD_START_BROWSER"
+    COLD_START_TRAFFIC = "COLD_START_TRAFFIC"
+    COLD_START_JS = "COLD_START_JS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,12 +223,14 @@ class AttackSurfaceProfiler:
 
     def __init__(self, registry: IdentityRegistry, evidence: EvidenceFactStore,
                  traffic: TrafficStore, recon: ReconRepository | None = None,
-                 limits: ProfileLimits = ProfileLimits()) -> None:
+                 limits: ProfileLimits = ProfileLimits(),
+                 bootstrap: BootstrapStore | None = None) -> None:
         self.registry = registry
         self.evidence = evidence
         self.traffic = traffic
         self.recon = recon
         self.limits = limits
+        self.bootstrap = bootstrap
 
     def profile(self, package: TargetPackage) -> TargetProfile:
         if not isinstance(package, TargetPackage):
@@ -236,6 +245,7 @@ class AttackSurfaceProfiler:
             "endpoint_reference_pages": 0,
             "evidence_examined": 0, "events_examined": 0,
             "signals_truncated": False, "sampled_recon": False,
+            "bootstrap_examined": 0,
         }
         gaps: set[str] = set()
 
@@ -249,9 +259,27 @@ class AttackSurfaceProfiler:
             seen.add(identity)
             signals.append(item)
 
+        if self.bootstrap is not None:
+            bootstrap_seen: set[tuple[str, str, str]] = set()
+            for item in self.bootstrap.list_observations(target_id, limit=100):
+                coverage["bootstrap_examined"] += 1
+                identity = (item.source, item.code, item.surface_key)
+                if identity in bootstrap_seen:
+                    continue
+                bootstrap_seen.add(identity)
+                if len(bootstrap_seen) > self.limits.signals // 2:
+                    gaps.add("BOOTSTRAP_SIGNALS_SAMPLED")
+                    break
+                feature = item.display if item.code.startswith("FEATURE_") else None
+                add(SurfaceSignal(item.code, SignalSource(item.source), item.surface_key,
+                                  item.display, "bootstrap_observations", item.observation_id,
+                                  item.observed_at, 0.65, feature=feature,
+                                  evidence_ids=(item.evidence_id,)))
         self._local(package, add, coverage, gaps)
         recon_id = self._recon(package, add, coverage, gaps)
         technologies = {item.display for item in signals if item.code == "TECHNOLOGY"}
+        technologies.update(item.code.removeprefix("TECHNOLOGY_") for item in signals
+                            if item.code.startswith("TECHNOLOGY_"))
         api_styles = {item.code.removeprefix("API_") for item in signals if item.code.startswith("API_")}
         features = {item.feature for item in signals if item.feature}
         objects = {item.object_type for item in signals if item.object_type}

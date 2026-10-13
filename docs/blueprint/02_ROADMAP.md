@@ -1,130 +1,97 @@
 # Implementation Roadmap
 
-Codex must implement these phases sequentially. Do not jump to autonomous hunting before foundations work.
+This is the authoritative phase numbering after the Phase 23 roadmap review. Phases 0-24 are complete. The original blueprint labels are historical where they conflict with this document; use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
-## Phase 0 - VPS and recon discovery
+## Completed phases (0-24)
 
-Inspect `/root/enhanced_recon_framework`, Docker, DB schema/access code, target/scope storage, JS/endpoints/history, notifications and any saved HTTP traffic.
+| Phase | Delivered focus |
+| --- | --- |
+| 0 | VPS and production recon discovery |
+| 1 | Standalone project foundation |
+| 2 | Read-only recon adapter |
+| 3 | Evidence and fact store |
+| 4 | Core domain model |
+| 5 | Target Package and scope model |
+| 6 | Identity registry |
+| 7 | SecretProvider and AuthContext |
+| 8 | Browser and session manager |
+| 9 | Vendor-neutral Traffic Store |
+| 10 | Burp capture integration |
+| 11 | Private service and dashboard control plane |
+| 12 | Bounded passive target profiles and hypotheses |
+| 13 | Deterministic scope, risk, and rate policy |
+| 14 | Policy-gated traffic executor |
+| 15 | Skill registry and bounded plans |
+| 16 | Single-plan Investigation Orchestrator |
+| 17 | Deterministic Validator Engine |
+| 18 | Object Factory and disposable-object ledger |
+| 19 | Authorization specialist |
+| 20 | Typed authorization mutations |
+| 21 | DOM XSS specialist |
+| 22 | postMessage / MessagePort specialist |
+| 23 | Sensitive exposure specialist |
+| 24 | Cold-start bootstrap for tracked Target Packages without recon history |
 
-Deliver:
-- `docs/EXISTING_INFRASTRUCTURE.md`
-- `docs/RECON_INTEGRATION.md`
-- `docs/PHASE0_RECOMMENDATIONS.md`
+Completion of a phase does not imply complete coverage of its bug class. In particular, Phase 12 profiling is passive and bounded; Phase 16 orchestrates one plan, not cross-specialist campaigns; and Phases 19-20 support only narrow, observed GraphQL authorization cases.
 
-No production modifications.
+Phase 24 uses the existing scope and traffic policy gates for bounded discovery. See `docs/PHASE24_COLD_START_BOOTSTRAP.md` for its implementation and limitations.
 
-## Phase 1 - Project foundation
+## Remaining phases (25-33)
 
-Implement config, logging, CLI skeleton, testing, persistence conventions and health/status commands.
+Implement in this order. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
 
-## Phase 2 - Read-only recon adapter
+### Phase 25 - Target/normal-behaviour learning
 
-Expose stable interfaces for targets, hosts, endpoints, parameters, JS, JS analysis, source maps, GraphQL evidence and deltas.
+Build on Phase 12's passive profile with observed product workflows, roles, legitimate request patterns, object ownership, and expected permission boundaries. Keep learned expectations evidence-linked and distinct from confirmed security facts.
 
-## Phase 3 - Evidence and fact store
+### Phase 26 - GraphQL/API specialist expansion
 
-Immutable evidence IDs, content hashes, references and normalized facts with confidence/evidence links.
+Expand beyond the existing narrow single-ID GraphQL query and typed rename mutation. Use observed operations and schemas to cover operation, field, nested-object, mutation, bulk, and API authorization boundaries with owned controls and independent validation.
 
-## Phase 4 - Core domain model
+### Phase 27 - ResearchCoordinator
 
-Target, Host, Endpoint, Parameter, Principal, Role, Tenant, ObjectReference, RequestRecord and ResponseRecord.
+Research specific knowledge gaps using bounded, source-backed retrieval. Cache concise ResearchBriefs, attribute sources, and keep outside material advisory rather than authoritative for scope, execution, or findings.
 
-## Phase 5 - Identity registry
+### Phase 28 - Cross-specialist planner
 
-Account metadata, roles, tenant relationships and secret references.
+Select minimal evidence context, rank hypotheses, route specialists and skills, manage request/token budgets and backtracking, and invoke existing validators. This is distinct from the completed Phase 16 single-plan orchestrator.
 
-## Phase 6 - SecretProvider + AuthContext
+### Phase 29 - Notifications/reports
 
-Secrets remain outside model prompts. AuthContext represents complete request identity.
+Add deduplicated notifications for confirmed findings and explicitly labeled high-value manual-review leads. Generate reports from validated evidence and preserve the distinction between leads and confirmed findings.
 
-## Phase 7 - Browser/session manager
+### Phase 30 - Production hardening
 
-Imported sessions, browser-assisted login, isolated contexts, session health and reauth-required state. Never bypass MFA/CAPTCHA.
+Define retention and backup/recovery, observability, resource controls, operational safeguards, and failure handling before long-running autonomous campaigns.
 
-## Phase 8 - Authenticated traffic attribution
+### Phase 31 - Campaign coordination
 
-Associate traffic with principal, role, tenant, endpoint and object where inferable.
+Coordinate bounded, resumable multi-hypothesis campaigns across specialists with explicit limits, state, pause/resume, and evidence-aware deduplication. Do not treat a campaign as authority to bypass per-action policy.
 
-## Phase 9 - Target profiler and normal-behaviour learner
+### Phase 32 - Continuous delta hunting
 
-Learn technologies, features, UI/API capabilities, legitimate workflows, roles, object ownership and trust boundaries.
+Use new or changed recon observations to trigger only relevant, deduplicated campaign work after the planner and campaign controls are stable. Do not replay the entire recon corpus or treat delta presence as active-testing authorization.
 
-## Phase 10 - Target ontology + object registry
+### Phase 33 - Evaluation/benchmarking
 
-Represent application objects and relationships: organization -> project -> dashboard, etc.
+Evaluate against local or recorded cases and measure precision, false positives, coverage, requests per useful result, token use, manual interventions, recovery, and confirmed-finding yield. Keep this last so it measures the completed pipeline.
 
-## Phase 11 - Hypothesis engine
+## Superseded blueprint labels
 
-Structured lifecycle: NEW, ENRICHING, READY, TESTING, VALIDATING, CONFIRMED, REJECTED, NEEDS_MANUAL_REVIEW, BLOCKED.
+The original roadmap's labels and any phase-specific next-step recommendations that conflict with the sequence above are superseded. In particular:
 
-## Phase 12 - Task dependency graph
-
-Persist prerequisites, branches, retries, backtracking and resumable research tasks.
-
-## Phase 13 - Scope/risk/rate policy
-
-ScopeGuard, RiskPolicy, RatePolicy, MethodPolicy, TargetPolicy. Return ALLOW, DENY or REQUIRE_APPROVAL.
-
-## Phase 14 - Traffic executor
-
-Controlled `search/get/replay/mutate/compare/batch_compare` APIs. Identity resolution happens below the LLM layer.
-
-## Phase 15 - Skill engine
-
-Implement SkillRegistry, metadata-only discovery, router, prerequisite checker, scorer, loader, context builder and metrics.
-
-Skill sources:
-- `skills/core/` custom high-quality bounty skills;
-- `skills/imported/` curated public skills;
-- `skills/personal/` generalized methods learned from successful research.
-
-## Phase 16 - ResearchCoordinator
-
-Trigger research only for knowledge gaps. Produce cached, source-backed ResearchBriefs and optional target-specific ephemeral skills.
-
-## Phase 17 - Static-analysis layer
-
-Deterministically index JS/source maps/traffic for APIs, GraphQL operations, message handlers, sources, sinks, decoders, configs and interesting strings.
-
-## Phase 18 - ObjectFactory + side-effect classifier
-
-Find or safely create disposable owned test objects. Track creator, tenant, purpose and cleanup. Classify operations by side effect.
-
-## Phase 19 - Authorization specialist + validator
-
-First real hunting specialist. Use known principals, roles, tenants, objects and controls for BAC/BOLA/IDOR/BFLA tests.
-
-## Phase 20 - GraphQL authorization capability
-
-Mine operations from JS/traffic, correlate hidden operations, construct requests, resolve prerequisites and test object/field/mutation/nested authorization.
-
-## Phase 21 - DOM XSS specialist
-
-Check-before-transform source -> validation -> transformation -> sink methodology, with browser execution proof.
-
-## Phase 22 - postMessage / MessagePort specialist
-
-Model full cross-origin protocols, origin/source checks, transferred ports, RPC methods and unauthorized capabilities.
-
-## Phase 23 - Sensitive exposure specialist
-
-Identify and safely verify secrets, internal surface, debug/admin endpoints and source-map/config disclosures.
-
-## Phase 24 - Planner / orchestrator
-
-Retrieve minimal context, rank hypotheses, route skills, budget tokens/requests, dispatch agents, backtrack and invoke validators.
-
-## Phase 25 - Notifications and reporting
-
-Notify on confirmed findings and high-value manual-review candidates. Generate reports only from evidence.
-
-## Phase 26 - Delta hunter / campaign mode
-
-Watch recon changes and analyze only new/changed hosts, endpoints, parameters, JS, GraphQL operations and permission behaviour.
-
-## Phase 27 - Evaluation harness
-
-Use local/recorded vulnerable cases. Measure precision, recall, false-positive rate, requests/finding, tokens/hypothesis, manual interventions and confirmed-findings yield.
+| Older label or recommendation | Authoritative disposition |
+| --- | --- |
+| Original Phase 5-12 planning labels | Use the completed-phase table above and the implementation decisions, not those original labels, for delivered work. |
+| Phase 9 target profiler / normal-behaviour learner | Phase 9 delivered Traffic Store; Phase 12 delivered bounded passive profiles; full learning is Phase 25. |
+| Phase 16 ResearchCoordinator | Phase 16 delivered the single-plan Investigation Orchestrator; ResearchCoordinator is Phase 27. |
+| Phase 17 static-analysis layer | Phase 17 delivered the Validator Engine; static analysis is embedded in relevant specialists, not a pending Phase 17. |
+| Phase 20 GraphQL authorization capability | Phase 20 delivered typed authorization mutations; broader GraphQL/API work is Phase 26. |
+| Phase 23 recommendation to make the planner Phase 24 | Phase 24 is cold-start bootstrap; the cross-specialist planner is Phase 28. |
+| Phase 24 planner / orchestrator | Phase 28 cross-specialist planner; Phase 16 single-plan orchestration is already complete. |
+| Phase 25 notifications and reporting | Phase 29 notifications/reports. |
+| Phase 26 delta hunter / campaign mode | Split into Phase 31 campaign coordination and Phase 32 continuous delta hunting. |
+| Phase 27 evaluation harness | Phase 33 evaluation/benchmarking. |
 
 ## V1 completion gate
 

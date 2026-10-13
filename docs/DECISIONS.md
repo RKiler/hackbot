@@ -268,3 +268,21 @@ integration decisions, not silent defaults.
 | D-133 | Deduplicate repeated credential fingerprints across current artifacts, but clear the candidate's active plan/validation link when its representative body hash changes. | Historical findings remain auditable while a new bundle cannot inherit a stale confirmed state. |
 | D-134 | Reuse an unchanged target-scoped recon pointer Evidence row on repeated exposure discovery. | Recon data stays owned by recon, while repeated dashboard reviews do not multiply identical BugHunter metadata. |
 | D-135 | Preserve the Phase 14 fingerprint format for ordinary requests; include Host override only when it is actually set. | Existing saved plans and permits should not change identity merely because the optional VHOST field was added. |
+
+## Roadmap reconciliation after Phase 23
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-136 | Treat Phases 0-23 as complete and `docs/blueprint/02_ROADMAP.md` as the authoritative remaining sequence: 24 Cold-start bootstrap, 25 Target/normal-behaviour learning, 26 GraphQL/API specialist expansion, 27 ResearchCoordinator, 28 Cross-specialist planner, 29 Notifications/reports, 30 Production hardening, 31 Campaign coordination, 32 Continuous delta hunting, 33 Evaluation/benchmarking. | The original blueprint phase labels no longer match delivered Phases 5-23 or the dependencies of the remaining work. |
+| D-137 | Supersede the original Phase 16 ResearchCoordinator, Phase 17 static-analysis layer, Phase 20 broad GraphQL authorization, Phase 24 planner, Phase 25 notifications, Phase 26 combined delta/campaign, and Phase 27 evaluation labels; supersede the Phase 23 recommendation to build the planner as Phase 24. | Phase 16 is the completed single-plan orchestrator, Phase 17 the validator, and Phase 20 typed mutations; cold start and target learning must precede the Phase 28 planner, while hardening and campaign controls precede continuous delta hunting. |
+
+## Phase 24
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-138 | Treat an absent or unavailable recon target as cold-start discovery for an existing tracked Target Package; never derive scope or a new Target Package from recon. | Recon is an optional read-only accelerator, and Phase 5 scope must remain authoritative for every Phase 13/14 network action. |
+| D-139 | Persist one active bounded bootstrap run per target in BugHunter SQLite, keep source-linked compact observations, and finalize interrupted runs as partial without automatic replay. | Request and browser side effects cannot be reconstructed safely after a crash; provenance and budgets must survive service restarts. |
+| D-140 | Use the Phase 21 content-addressed JS cache and explicit refresh for cold-start assets; preserve old hashes and source observations when current JS or recon later changes. | Recon does not retain raw historical JS, and silently replacing a body or reusing a stale candidate would invalidate evidence. |
+| D-141 | Observe only an already-open verified primary browser page in Phase 24; consume existing captured traffic, but do not synthesize browser requests or add unrestricted navigation/clicks. | Browser-side execution needs a policy-gated request path before it can safely expand; Phase 24 is bounded discovery, not behaviour learning or active testing. |
+| D-142 | Serve bootstrap controls through the existing authenticated, CSRF-protected dashboard gateway, with target-scoped APIs and no arbitrary URL input. | The private service must not become a public active-request surface; operator-selected identity is limited to a currently verified session. |
+| D-143 | Add an optional, fail-closed redirect destination guard to Phase 14 and use it only for cold-start bootstrap. | Phase 13 scope checks alone cannot distinguish an in-scope safe page from an in-scope logout or credential-bearing redirect; all other executor callers retain their existing behavior. |

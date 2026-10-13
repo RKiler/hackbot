@@ -105,7 +105,7 @@ class DOMXSSStore:
 
     def current_asset(self, target_id: str, asset_url: str,
                       recon_sha256: str | None) -> DOMAssetRecord | None:
-        """Reuse only an intact artifact matching the current recon hash."""
+        """Reuse an intact hash-matched artifact; no-recon reuse is explicit below."""
         if recon_sha256 is None or not _HASH.fullmatch(recon_sha256):
             return None
         url_hash = hashlib.sha256(asset_url.encode()).hexdigest()
@@ -115,6 +115,21 @@ class DOMXSSStore:
                   AND artifact_sha256=? AND state='CURRENT'
                 ORDER BY retrieved_at DESC LIMIT 1
             """, (target_id, url_hash, recon_sha256)).fetchone()
+        if row is None:
+            return None
+        asset = self._asset(row)
+        self.evidence.artifacts.get_bytes(asset.artifact_sha256, max_bytes=MAX_ASSET_BYTES)
+        return asset
+
+    def cached_cold_start_asset(self, target_id: str, asset_url: str) -> DOMAssetRecord | None:
+        """Reuse a controlled current body until an explicit refresh is requested."""
+        url_hash = hashlib.sha256(asset_url.encode()).hexdigest()
+        with self.evidence._connection() as connection:
+            row = connection.execute("""
+                SELECT * FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
+                  AND source='CONTROLLED_HTTP' AND state='CURRENT'
+                ORDER BY retrieved_at DESC LIMIT 1
+            """, (target_id, url_hash)).fetchone()
         if row is None:
             return None
         asset = self._asset(row)
@@ -177,7 +192,8 @@ class DOMXSSStore:
                 target_ref=target_id, sensitivity=Sensitivity.SENSITIVE,
                 metadata={"asset_url_sha256": url_hash, "recon_asset_id": recon_asset_id},
             )
-        state = ("UNVERIFIED_CURRENT" if recon_sha256 is None else
+        state = ("CURRENT" if recon_sha256 is None and source == "CONTROLLED_HTTP" else
+                 "UNVERIFIED_CURRENT" if recon_sha256 is None else
                  "CURRENT" if recon_sha256 == digest else "RECON_HASH_DRIFT")
         now = datetime.now(timezone.utc)
         artifact_id = "DOMART-" + uuid.uuid4().hex
@@ -223,7 +239,8 @@ class DOMXSSStore:
             raise ValueError("Current asset inventory limit must be 1..50")
         with self.evidence._connection() as connection:
             rows = connection.execute("""SELECT * FROM dom_js_artifacts
-                WHERE target_id=? AND state='CURRENT' AND recon_sha256=artifact_sha256
+                WHERE target_id=? AND state='CURRENT' AND (recon_sha256=artifact_sha256
+                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))
                 ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?""",
                 (target_id, limit)).fetchall()
         return tuple(self._asset(row) for row in rows)

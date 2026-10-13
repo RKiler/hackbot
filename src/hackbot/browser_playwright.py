@@ -147,6 +147,26 @@ class PlaywrightBrowserDriver:
             tenant_id=read(rule.tenant_selector),
         )
 
+    def observe_current_page(self, session_id: str) -> dict[str, object] | None:
+        """Read bounded DOM metadata from an already open page; never navigate or evaluate JS."""
+        context = self._contexts.get(session_id)
+        if context is None or not context.pages:
+            return None
+        page = context.pages[-1]
+        try:
+            scripts = tuple((item.get_attribute("src", timeout=500) or "")
+                            for item in page.locator("script[src]").all()[:20])
+            links = tuple((item.get_attribute("href", timeout=500) or "")
+                          for item in page.locator("a[href]").all()[:20])
+            forms = tuple((item.get_attribute("action", timeout=500) or "")
+                          for item in page.locator("form[action]").all()[:10])
+            return {"url": page.url, "title_present": bool(page.title()),
+                    "scripts": tuple(value for value in scripts if value),
+                    "links": tuple(value for value in links if value),
+                    "forms": tuple(value for value in forms if value)}
+        except Exception:
+            return None
+
     def execute_dom_variant(self, session_id: str, url: str, marker: str,
                             expected_asset_url: str,
                             gate: Callable[[str, str, bool], bool], *,

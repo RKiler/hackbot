@@ -9,6 +9,7 @@ import importlib.util
 import json
 import socket
 from pathlib import Path
+from threading import Thread
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -22,6 +23,9 @@ from .authorization_store import AuthorizationMode, AuthorizationStore, HuntStat
 from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
+from .bootstrap import TargetBootstrapper
+from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, BootstrapStatus,
+                              BootstrapStore)
 from .burp import BurpExecutionProxyAdapter, BurpProxyProvider
 from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
 from .domxss import DOMXSSSpecialist
@@ -111,6 +115,7 @@ class BugHunterRuntime:
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(self.store)
+        self.bootstrap_store = BootstrapStore(self.store)
         self.exposure_store = ExposureStore(self.store)
         self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
@@ -140,6 +145,15 @@ class BugHunterRuntime:
             self.recon = PostgresReconRepository.from_config(config)
         except ConfigError:
             pass  # Local-only service stays usable; profile records the recon gap.
+        self.exposure = ExposureSpecialist(dom=self.domxss_store, store=self.exposure_store,
+                                           recon=self.recon, traffic=self.traffic)
+        self.bootstrap = TargetBootstrapper(
+            targets=self.targets, recon=self.recon, ledger=self.bootstrap_store,
+            evidence=self.store, traffic=self.traffic, browser=self.browser,
+            driver=self.driver, executor=self.executor, js=self.domxss_store,
+            postmessage=self.postmessage_store, exposure=self.exposure,
+            profiles=self.hypotheses, registry=self.registry)
+        self._bootstrap_threads: dict[str, Thread] = {}
         self.skill_context = SkillContextBuilder(self.store, self.registry, self.traffic,
                                                  self.browser, self.recon, self.objects,
                                                  self.domxss_store, self.postmessage_store,
@@ -150,8 +164,6 @@ class BugHunterRuntime:
         self.postmessage = (PostMessageSpecialist(dom=self.domxss, targets=self.targets,
                                                   store=self.postmessage_store)
                             if self.domxss is not None else None)
-        self.exposure = ExposureSpecialist(dom=self.domxss_store, store=self.exposure_store,
-                                           recon=self.recon, traffic=self.traffic)
         self.run_store = PlanRunStore(self.store)
         self.domxss_browser = DOMBrowserExperimentExecutor(
             targets=self.targets, store=self.domxss_store, browser=self.browser,
@@ -196,6 +208,7 @@ class BugHunterRuntime:
         while self.objects.reconcile():
             pass
         self.reconcile_on_startup()
+        self.bootstrap_store.reconcile()
         while self.run_store.reconcile():
             pass
         while self.mutation_results.reconcile():
@@ -323,8 +336,10 @@ class BugHunterRuntime:
                     "AND status NOT IN ('STALE','REJECTED')",
                     (package.target.id,)).fetchone()[0],
             }
+        discovery = self.bootstrap_store.discovery_state(package.target.id)
         return {"id": package.id, "target_id": package.target.id, "name": package.to_dict()["name"],
                 "primary_domain": package.primary_domain, "status": package.status.value,
+                "discovery_state": discovery["state"] if discovery else "UNBOOTSTRAPPED",
                 "scope_summary": {"included_hosts": len(package.scope.include_hosts),
                                   "excluded_hosts": len(package.scope.exclude_hosts)},
                 "counts": counts, "authority": "TARGET_PACKAGE"}
@@ -705,6 +720,88 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.get("/v1/targets/<package_id>")
     def target(package_id: str):
         return jsonify(service.target_summary(service.package(package_id)))
+
+    @app.get("/v1/targets/<package_id>/bootstrap")
+    def bootstrap_status(package_id: str):
+        package = service.package(package_id)
+        _, recon_status = service.bootstrap.recon_provider.lookup(package)
+        state = service.bootstrap_store.discovery_state(package.target.id)
+        runs = service.bootstrap_store.list_runs(package.target.id, limit=10)
+        return jsonify({"target_id": package.target.id,
+                        "recon_availability": recon_status,
+                        "discovery_state": state["state"] if state else (
+                            "RECON_BACKED" if recon_status == "RECON_BACKED" else "COLD_START"),
+                        "latest": runs[0].to_dict() if runs else None,
+                        "history": [run.to_dict() for run in runs]})
+
+    @app.post("/v1/targets/<package_id>/bootstrap")
+    def bootstrap_start(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"identity_policy", "identity_id", "limits", "refresh"}))
+        try:
+            policy = BootstrapIdentityPolicy(data.get("identity_policy", "anonymous_plus_primary"))
+        except ValueError:
+            raise ValueError("invalid identity policy") from None
+        values = data.get("limits", {})
+        if not isinstance(values, dict) or set(values) - set(BootstrapLimits.__dataclass_fields__):
+            raise ValueError("invalid bootstrap limits")
+        limits = BootstrapLimits(**values)
+        identity_id = data.get("identity_id")
+        if identity_id is not None and not isinstance(identity_id, str):
+            raise ValueError("invalid bootstrap identity")
+        refresh = data.get("refresh", False)
+        if type(refresh) is not bool:
+            raise ValueError("invalid refresh flag")
+        run = service.bootstrap.create(package.id, limits=limits, identity_policy=policy,
+                                       identity_id=identity_id)
+        try:
+            browser_signals = service.bootstrap.capture_browser_signals(package, run)
+        except Exception:
+            service.logger.warning("bootstrap_browser_observation_unavailable", extra={"context": {
+                "target_id": package.target.id, "run_id": run.bootstrap_id}})
+            browser_signals = ()
+
+        def work() -> None:
+            try:
+                service.bootstrap.run(run.bootstrap_id, package.id, refresh=refresh,
+                                      browser_signals=browser_signals)
+            except Exception:
+                service.logger.error("bootstrap_run_failed", extra={"context": {
+                    "target_id": package.target.id, "run_id": run.bootstrap_id}})
+            finally:
+                service._bootstrap_threads.pop(run.bootstrap_id, None)
+
+        thread = Thread(target=work, name="bootstrap-" + run.bootstrap_id[-8:], daemon=True)
+        service._bootstrap_threads[run.bootstrap_id] = thread
+        try:
+            thread.start()
+        except RuntimeError:
+            service._bootstrap_threads.pop(run.bootstrap_id, None)
+            service.bootstrap_store.transition(
+                run.bootstrap_id, run.target_id, BootstrapStatus.FAILED,
+                limitations=("WORKER_START_FAILED",), stop_reason="WORKER_START_FAILED")
+            raise
+        return jsonify(run.to_dict()), 201
+
+    @app.get("/v1/targets/<package_id>/bootstrap/<run_id>")
+    def bootstrap_detail(package_id: str, run_id: str):
+        package = service.package(package_id)
+        run = service.bootstrap_store.get(run_id, package.target.id)
+        if run is None:
+            raise LookupError("bootstrap run not found")
+        observations = service.bootstrap_store.list_observations(package.target.id,
+                                                                  run_id=run_id, limit=80)
+        return jsonify({"run": run.to_dict(),
+                        "observations": [item.to_dict() for item in observations],
+                        "observations_truncated": len(observations) == 80})
+
+    @app.post("/v1/targets/<package_id>/bootstrap/<run_id>/cancel")
+    def bootstrap_cancel(package_id: str, run_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        if not service.bootstrap_store.request_cancel(run_id, package.target.id):
+            raise ValueError("bootstrap run is not active")
+        return jsonify({"bootstrap_id": run_id, "cancel_requested": True})
 
     @app.get("/v1/targets/<package_id>/scope")
     def scope(package_id: str):
@@ -1381,7 +1478,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         _body(frozenset())
         package = service.package(package_id)
         profile = AttackSurfaceProfiler(service.registry, service.store, service.traffic,
-                                        service.recon).profile(package)
+                                        service.recon, bootstrap=service.bootstrap_store).profile(package)
         service.hypotheses.save_profile(profile)
         generated = HypothesisGenerator(service.hypotheses).generate(profile)
         service.logger.info("passive_profile_completed", extra={"context": {
