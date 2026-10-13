@@ -156,13 +156,15 @@ class AuthorizationSpecialist:
                  planner: SkillPlanner | None = None,
                  orchestrator: PlanOrchestrator | None = None,
                  validator: DeterministicValidatorEngine | None = None,
-                 factory: ObjectFactory | None = None) -> None:
+                 factory: ObjectFactory | None = None,
+                 behaviour: "BehaviourStore | None" = None) -> None:
         self.identities, self.browser, self.objects = identities, browser, objects
         self.traffic, self.evidence, self.hypotheses = traffic, evidence, hypotheses
         self.ledger, self.recon = ledger, recon
         self.context, self.router, self.planner = context, router, planner
         self.orchestrator, self.validator = orchestrator, validator
         self.factory = factory
+        self.behaviour = behaviour
         self.comparator = ResponseComparator(evidence)
 
     def _actors(self, target_id: str) -> tuple[AuthorizationActor, ...]:
@@ -493,6 +495,9 @@ class AuthorizationSpecialist:
             raise ValueError("authorization hunt already started")
         self.ledger.transition(hunt.id, hunt.target_id, HuntStatus.CREATED, HuntStatus.PROFILING)
         surface = self.profile(package)
+        learned = self.behaviour.profile(package.target.id) if self.behaviour else None
+        learned_by_exchange = ({exchange_id: item for item in learned.operations
+                                for exchange_id in item["exchange_ids"]} if learned else {})
         self.ledger.transition(hunt.id, hunt.target_id, HuntStatus.PROFILING, HuntStatus.GENERATING)
         actors = {actor.identity_id: actor for actor in surface.actors}
         ranked: list[tuple[int, AuthorizationObject, AuthorizationOperation, Boundary,
@@ -562,6 +567,15 @@ class AuthorizationSpecialist:
                     score -= 15  # Recipe-bound writes remain costlier than read comparisons.
                 if operation.protocol == "BATCH" and not operation.semantic_owner_success:
                     continue
+                learned_operation = learned_by_exchange.get(operation.exchange_id)
+                if learned_operation and learned:
+                    role_gap = any(row["operation_key"] == learned_operation["key"] and
+                                   row["role_id"] in actor.observed_roles and
+                                   row["state"] == "NOT_OBSERVED"
+                                   for row in learned.role_operation_matrix)
+                    if role_gap:
+                        score += 3
+                        reasons += ("LEARNED_ROLE_OPERATION_GAP_NOT_DENIAL",)
                 ranked.append((score, obj, operation, boundary, actor, reasons))
             if (operation.method in {"GET", "HEAD"} and
                     operation.protocol == "REST" and operation.graphql_kind is None and

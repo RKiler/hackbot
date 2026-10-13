@@ -26,6 +26,7 @@ from .browser_playwright import PlaywrightBrowserDriver
 from .bootstrap import TargetBootstrapper
 from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, BootstrapStatus,
                               BootstrapStore)
+from .behaviour import BehaviourStore, LearningLimits, LearningStatus, NormalBehaviourLearner
 from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
 from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
 from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
@@ -121,6 +122,7 @@ class BugHunterRuntime:
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(self.store)
         self.bootstrap_store = BootstrapStore(self.store)
+        self.behaviour_store = BehaviourStore(self.store)
         self.exposure_store = ExposureStore(self.store)
         self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
@@ -151,7 +153,8 @@ class BugHunterRuntime:
         except ConfigError:
             pass  # Local-only service stays usable; profile records the recon gap.
         self.exposure = ExposureSpecialist(dom=self.domxss_store, store=self.exposure_store,
-                                           recon=self.recon, traffic=self.traffic)
+                                           recon=self.recon, traffic=self.traffic,
+                                           behaviour=self.behaviour_store)
         self.bootstrap = TargetBootstrapper(
             targets=self.targets, recon=self.recon, ledger=self.bootstrap_store,
             evidence=self.store, traffic=self.traffic, browser=self.browser,
@@ -183,6 +186,10 @@ class BugHunterRuntime:
             objects=self.objects, recipes=RecipeCatalog(object_settings), policy=self.policy,
             executor=self.executor, targets=self.targets, traffic=self.traffic,
             settings=object_settings)
+        self.behaviour = NormalBehaviourLearner(
+            self.behaviour_store, self.traffic, self.registry, self.browser,
+            self.objects, self.store, self.recon)
+        self._behaviour_threads: dict[str, Thread] = {}
         self.mutation_results = MutationResultStore(self.store)
         self.validations = ValidationStore(self.store)
         self.validator_registry = ValidatorRegistry()
@@ -207,13 +214,14 @@ class BugHunterRuntime:
             ledger=self.authorization_ledger, recon=self.recon, context=self.skill_context,
             router=self.skill_router, planner=self.skill_planner,
             orchestrator=self.orchestrator, validator=self.validator,
-            factory=self.object_factory)
+            factory=self.object_factory, behaviour=self.behaviour_store)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         while self.objects.reconcile():
             pass
         self.reconcile_on_startup()
         self.bootstrap_store.reconcile()
+        self.behaviour_store.reconcile()
         while self.run_store.reconcile():
             pass
         while self.mutation_results.reconcile():
@@ -1384,6 +1392,110 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         profile = service.hypotheses.latest_profile(package.target.id)
         return jsonify({"profile": profile.to_dict() if profile else None,
                         "message": "Profile Target to generate a passive snapshot" if profile is None else None})
+
+    @app.get("/v1/targets/<package_id>/behaviour")
+    def behaviour_profile(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"profile": profile.to_dict() if profile else None,
+                        "runs": [item.to_dict() for item in service.behaviour_store.list_runs(package.target.id)],
+                        "message": "Start learning from existing traffic" if profile is None else None})
+
+    @app.get("/v1/targets/<package_id>/behaviour/coverage")
+    def behaviour_coverage(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"coverage": profile.coverage if profile else {"state": "NONE"},
+                        "gaps": list(profile.gaps) if profile else []})
+
+    @app.get("/v1/targets/<package_id>/behaviour/features")
+    def behaviour_features(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"items": list(profile.features) if profile else []})
+
+    @app.get("/v1/targets/<package_id>/behaviour/workflows")
+    def behaviour_workflows(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"items": list(profile.workflows) if profile else []})
+
+    @app.get("/v1/targets/<package_id>/behaviour/matrix")
+    def behaviour_matrix(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"role_feature": list(profile.role_feature_matrix) if profile else [],
+                        "role_operation": list(profile.role_operation_matrix) if profile else [],
+                        "expectations": list(profile.expected_access) if profile else []})
+
+    @app.get("/v1/targets/<package_id>/behaviour/gaps")
+    def behaviour_gaps(package_id: str):
+        package = service.package(package_id)
+        profile = service.behaviour_store.profile(package.target.id)
+        return jsonify({"items": list(profile.gaps) if profile else []})
+
+    @app.get("/v1/targets/<package_id>/behaviour/runs/<run_id>")
+    def behaviour_run(package_id: str, run_id: str):
+        package = service.package(package_id)
+        run = service.behaviour_store.get_run(package.target.id, run_id)
+        if run is None:
+            raise LookupError("Learning run not found")
+        return jsonify(run.to_dict())
+
+    @app.post("/v1/targets/<package_id>/behaviour")
+    @app.post("/v1/targets/<package_id>/behaviour/refresh")
+    def behaviour_start(package_id: str):
+        package = service.package(package_id)
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or set(data) - {"limits"}:
+            raise ValueError("Invalid learning request")
+        raw_limits = data.get("limits") or {}
+        if not isinstance(raw_limits, dict) or set(raw_limits) - set(LearningLimits.__dataclass_fields__):
+            raise ValueError("Invalid learning limits")
+        limits = LearningLimits(**raw_limits)
+        run = service.behaviour.create(package, limits)
+
+        def work() -> None:
+            try:
+                source = service.hypotheses.latest_profile(package.target.id)
+                if source is None:
+                    source = AttackSurfaceProfiler(service.registry, service.store, service.traffic,
+                                                    service.recon, bootstrap=service.bootstrap_store).profile(package)
+                service.behaviour.run(package, run.run_id, target_profile=source)
+            except Exception:
+                current = service.behaviour_store.get_run(package.target.id, run.run_id)
+                if current and current.status in {LearningStatus.CREATED, LearningStatus.READY,
+                                                  LearningStatus.RUNNING}:
+                    service.behaviour_store.transition(package.target.id, run.run_id,
+                                                       LearningStatus.FAILED, reason="LEARNING_FAILED")
+                service.logger.error("behaviour_learning_failed", extra={"context": {
+                    "target_id": package.target.id, "run_id": run.run_id}})
+            finally:
+                service._behaviour_threads.pop(run.run_id, None)
+
+        thread = Thread(target=work, name="behaviour-" + run.run_id[-8:], daemon=True)
+        service._behaviour_threads[run.run_id] = thread
+        thread.start()
+        return jsonify(run.to_dict()), 202
+
+    @app.post("/v1/targets/<package_id>/behaviour/runs/<run_id>/cancel")
+    def behaviour_cancel(package_id: str, run_id: str):
+        package = service.package(package_id)
+        if not service.behaviour_store.request_cancel(package.target.id, run_id):
+            raise ValueError("Learning run is not active")
+        return jsonify({"run_id": run_id, "cancel_requested": True})
+
+    @app.post("/v1/targets/<package_id>/behaviour/expectations")
+    def behaviour_expectation(package_id: str):
+        package = service.package(package_id)
+        service.registry.register_target(package)
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or set(data) - {"role_id", "feature", "action", "expected_access", "provenance"}:
+            raise ValueError("Invalid expectation request")
+        service.behaviour_store.set_expectation(package.target.id, role_id=data.get("role_id"),
+            feature=data["feature"], action=data.get("action"), expected_access=data["expected_access"],
+            provenance=data.get("provenance", "RESEARCHER"))
+        return jsonify({"saved": True}), 201
 
     @app.get("/v1/authorization/<package_id>/profile")
     def authorization_profile(package_id: str):

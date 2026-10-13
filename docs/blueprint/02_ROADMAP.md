@@ -1,8 +1,8 @@
 # Implementation Roadmap
 
-This is the authoritative phase numbering after the Phase 23 roadmap review. Phases 0-23 are complete; Phases 24-33 remain in the order below. Earlier blueprint labels and phase-specific next-step recommendations are historical where they conflict with this sequence. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
+This is the authoritative phase numbering after the Phase 23 roadmap review. Phases 0-25 are complete; Phases 26-33 remain in the order below. Earlier blueprint labels and phase-specific next-step recommendations are historical where they conflict with this sequence. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
-## Completed phases (0-23)
+## Completed phases (0-25)
 
 | Phase | Delivered focus |
 | --- | --- |
@@ -30,20 +30,14 @@ This is the authoritative phase numbering after the Phase 23 roadmap review. Pha
 | 21 | DOM XSS specialist |
 | 22 | postMessage / MessagePort specialist |
 | 23 | Sensitive exposure specialist |
+| 24 | Cold-start bootstrap |
+| 25 | Target and normal-behaviour learning |
 
 Completion of a phase does not imply complete coverage of its bug class. In particular, Phase 12 profiling is passive and bounded; Phase 16 orchestrates one plan, not cross-specialist campaigns; and Phases 19-20 support only narrow, observed GraphQL authorization cases.
 
-## Remaining phases (24-33)
+## Remaining phases (26-33)
 
 Implement in this order. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
-
-### Phase 24 - Cold-start bootstrap
-
-Provide bounded discovery for tracked Target Packages without recon history, using the existing scope and traffic policy gates. See `docs/PHASE24_COLD_START_BOOTSTRAP.md` for the phase-specific design and limitations.
-
-### Phase 25 - Target/normal-behaviour learning
-
-Build on Phase 12's passive profile with observed product workflows, roles, legitimate request patterns, object ownership, and expected permission boundaries. Keep learned expectations evidence-linked and distinct from confirmed security facts.
 
 ### Phase 26 - GraphQL/API specialist expansion
 

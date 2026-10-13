@@ -286,3 +286,13 @@ integration decisions, not silent defaults.
 | D-141 | Observe only an already-open verified primary browser page in Phase 24; consume existing captured traffic, but do not synthesize browser requests or add unrestricted navigation/clicks. | Browser-side execution needs a policy-gated request path before it can safely expand; Phase 24 is bounded discovery, not behaviour learning or active testing. |
 | D-142 | Serve bootstrap controls through the existing authenticated, CSRF-protected dashboard gateway, with target-scoped APIs and no arbitrary URL input. | The private service must not become a public active-request surface; operator-selected identity is limited to a currently verified session. |
 | D-143 | Add an optional, fail-closed redirect destination guard to Phase 14 and use it only for cold-start bootstrap. | Phase 13 scope checks alone cannot distinguish an in-scope safe page from an in-scope logout or credential-bearing redirect; all other executor callers retain their existing behavior. |
+
+## Phase 25
+
+| ID | Decision | Reason / evidence |
+| --- | --- | --- |
+| D-144 | Persist bounded BehaviourProfile, workflow, operation, matrix, expectation, and run records in BugHunter SQLite, referencing TrafficExchange and Evidence rather than copying raw traffic. | The recon and traffic stores retain their separate ownership; later specialists need durable, inspectable context without another raw request archive. |
+| D-145 | Use only verified-at-capture identity attribution for trusted behavior; keep anonymous separate and never treat `NOT_OBSERVED` as denial or observed behavior as product policy. | Session confusion, UI omissions, and HTTP 200 GraphQL errors otherwise create false authorization claims. |
+| D-146 | Create ownership/parent Facts only for read-back-verified disposable ObjectFactory records with matching evidence-backed creator and tenant Facts. | Path IDs and successful reads identify possible objects but cannot establish ownership or parent scope. |
+| D-147 | Keep Phase 25 passive and existing-data-first; an expired account waits for the existing VNC/Burp workflow, and refresh consumes newly captured normal traffic rather than navigating or clicking automatically. | Safe browser action planning, capture policy, and state-changing setup are separate capabilities; no live target request is necessary to accept the learning model. |
+| D-148 | Feed learned role-operation gaps and authenticated export controls into Phase 19/23 as bounded ranking/context only, while preserving their existing prerequisites and Phase 17 confirmation gates. | A learned normal pattern is useful prioritization, not a security finding or permission source of truth. |

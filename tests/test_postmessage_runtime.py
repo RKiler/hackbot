@@ -1006,7 +1006,9 @@ frame.addEventListener('load',()=>{{
         orchestrator, run_id, _, _ = self._build(mode="foreign")
         self._finish(orchestrator, run_id)
         with sqlite3.connect(self.evidence.db_path) as db:
-            for table in ("bootstrap_observations", "bootstrap_discovery_states", "bootstrap_runs"):
+            for table in ("behaviour_observations", "behaviour_workflows", "behaviour_expectations",
+                          "behaviour_profiles", "behaviour_runs", "bootstrap_observations",
+                          "bootstrap_discovery_states", "bootstrap_runs"):
                 db.execute(f"DROP TABLE {table}")
             before = db.execute("SELECT run_id,step_id,variant,accounted_at "
                                 "FROM plan_message_dispatches ORDER BY variant").fetchall()
@@ -1034,7 +1036,7 @@ frame.addEventListener('load',()=>{{
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)

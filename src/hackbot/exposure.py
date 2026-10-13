@@ -194,9 +194,11 @@ class ExposureSpecialist:
     def __init__(self, *, dom: DOMXSSStore, store: ExposureStore,
                  recon: ReconRepository | None = None,
                  traffic: TrafficStore | None = None,
-                 analyzer: ExposureStaticAnalyzer | None = None) -> None:
+                 analyzer: ExposureStaticAnalyzer | None = None,
+                 behaviour: "BehaviourStore | None" = None) -> None:
         self.dom, self.store, self.recon, self.traffic = dom, store, recon, traffic
         self.analyzer = analyzer or ExposureStaticAnalyzer()
+        self.behaviour = behaviour
 
     def _asset_url(self, package: TargetPackage, asset: DOMAssetRecord,
                    fixture_url: str | None) -> str:
@@ -497,6 +499,10 @@ class ExposureSpecialist:
             return ExposureAnalysisResult((), 0, 0, False, False)
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Traffic inspection limit must be 1..100")
+        learned = self.behaviour.profile(package.target.id) if self.behaviour else None
+        learned_exports = ({exchange_id for operation in learned.operations
+                            if operation["action"] == "EXPORT"
+                            for exchange_id in operation["exchange_ids"]} if learned else set())
         exchanges = []
         cursor = None
         while len(exchanges) < limit:
@@ -583,14 +589,18 @@ class ExposureSpecialist:
                         identity_context="ANONYMOUS", source=ExposureSource.TRAFFIC,
                         evidence_ids=evidence_ids, sensitivity=(
                             Sensitivity.SENSITIVE if categories else Sensitivity.INTERNAL),
-                        confidence=70 if categories else 55, priority=80 if categories else 65,
+                        confidence=70 if categories else 55,
+                        priority=min(100, (80 if categories else 65) +
+                                     (5 if owner.id in learned_exports else 0)),
                         verification_requirements=("OWNED_CONTROL", "PRIVACY_EXPECTATION",
                                                    "INVALID_OBJECT_CONTROL", "FRESH_REPRODUCTION",
                                                    "PHASE17_VALIDATION"),
                         status=ExposureStatus.NEEDS_MANUAL_REVIEW,
                         created_at=now, updated_at=now,
                         reason_codes=("OWNER_ANONYMOUS_BODY_HASH_EQUAL",
-                                      "PRIVACY_NOT_YET_PROVEN"),
+                                      "PRIVACY_NOT_YET_PROVEN") +
+                                     (("LEARNED_AUTHENTICATED_EXPORT_CONTROL",)
+                                      if owner.id in learned_exports else ()),
                         pii_categories=categories,
                     )
                     self.store.save(candidate, source_ref=boundary.id,

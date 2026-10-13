@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import socket
 from tempfile import TemporaryDirectory
+from threading import Event
 from types import SimpleNamespace
 import unittest
 import uuid
@@ -85,6 +86,47 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets?limit=999").status_code, 400)
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
+
+    def test_behaviour_read_api_and_expectation_validation(self):
+        base = "/v1/targets/example/behaviour"
+        self.assertIsNone(self.get(base)["profile"])
+        self.assertEqual(self.get(base + "/coverage")["coverage"]["state"], "NONE")
+        for suffix in ("/features", "/workflows", "/gaps"):
+            self.assertEqual(self.get(base + suffix)["items"], [])
+        self.assertEqual(self.get(base + "/matrix")["role_feature"], [])
+        self.assertEqual(self.client.post(base + "/expectations", json={
+            "feature": "projects", "expected_access": "ALLOW", "provenance": "RESEARCHER"}).status_code, 201)
+        self.assertEqual(len(self.runtime.behaviour_store.expectations(self.target)), 1)
+        self.assertEqual(self.client.post(base + "/expectations", json={
+            "feature": "projects", "expected_access": "SUPERADMIN"}).status_code, 400)
+        self.assertEqual(self.client.post(base, json={"limits": {"max_traffic_records": 501}}).status_code, 400)
+
+    def test_behaviour_start_and_cancel_run(self):
+        base = "/v1/targets/example/behaviour"
+        started, release = Event(), Event()
+        actual_run = self.runtime.behaviour.run
+
+        def delayed_run(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return actual_run(*args, **kwargs)
+
+        try:
+            with patch.object(self.runtime.hypotheses, "latest_profile", return_value=None), \
+                    patch("hackbot.service.AttackSurfaceProfiler.profile", return_value=None), \
+                    patch.object(self.runtime.behaviour, "run", side_effect=delayed_run):
+                response = self.client.post(base, json={"limits": {"max_traffic_records": 5}})
+                self.assertEqual(response.status_code, 202, response.get_data(as_text=True))
+                run_id = response.get_json()["run_id"]
+                self.assertTrue(started.wait(3))
+                self.assertEqual(self.client.post(f"{base}/runs/{run_id}/cancel", json={}).status_code, 200)
+                release.set()
+                thread = self.runtime._behaviour_threads.get(run_id)
+                if thread:
+                    thread.join(5)
+                self.assertEqual(self.get(f"{base}/runs/{run_id}")["status"], "CANCELLED")
+        finally:
+            release.set()
 
     def test_burp_session_requires_bridge_and_listener_before_browser_start(self):
         root = Path(self.temp.name)
