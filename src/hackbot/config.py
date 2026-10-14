@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import ipaddress
 import re
 import tomllib
 from typing import Mapping
@@ -54,6 +55,36 @@ class AppConfig:
     executor: ExecutorSettings | None = None
     skills: SkillSettings | None = None
     objects: ObjectSettings | None = None
+    research: ResearchSettings | None = None
+
+
+@dataclass(frozen=True)
+class ResearchSettings:
+    enabled: bool = False
+    search_secret_ref: str | None = None
+    allowed_source_hosts: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("Invalid research configuration")
+        if self.search_secret_ref is not None and not re.fullmatch(
+            r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?", self.search_secret_ref
+        ):
+            raise ConfigError("Invalid research secret reference")
+        if len(self.allowed_source_hosts) > 30 or any(
+            not re.fullmatch(r"[a-z0-9.-]{4,120}", host) or ".." in host
+            for host in self.allowed_source_hosts
+        ):
+            raise ConfigError("Invalid research source host")
+        for host in self.allowed_source_hosts:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                if "." not in host or host.endswith((".localhost", ".local", ".internal",
+                                                     ".test", ".invalid", ".example", ".onion")):
+                    raise ConfigError("Invalid research source host") from None
+            else:
+                raise ConfigError("Invalid research source host")
 
 
 @dataclass(frozen=True)
@@ -308,7 +339,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects", "research"}), "top-level")
     skills_table = _table(top.get("skills", {}), frozenset({"root"}), "skills")
     objects_table = _table(top.get("objects", {}), frozenset({"recipe_root", "name_prefix",
         "max_creation_depth", "max_objects_per_plan", "max_objects_per_target_hour",
@@ -327,6 +358,7 @@ def load_config(
     )
     targets_table = _table(top.get("targets", {}), frozenset({"root"}), "targets")
     secrets_table = _table(top.get("secrets", {}), frozenset({"allowed_env_prefixes", "references"}), "secrets")
+    research_table = _table(top.get("research", {}), frozenset({"enabled", "search_secret_ref", "allowed_source_hosts"}), "research")
     browser_table = _table(top.get("browser", {}),
                            frozenset({"profile_root", "display", "vnc_url", "chromium_executable",
                                       "max_sessions", "max_page_size"}),
@@ -490,5 +522,10 @@ def load_config(
             max_objects_per_target_hour=objects_table.get("max_objects_per_target_hour", 20),
             setup_request_budget=objects_table.get("setup_request_budget", 4),
             cleanup_request_budget=objects_table.get("cleanup_request_budget", 3),
+        ),
+        research=ResearchSettings(
+            enabled=research_table.get("enabled", False),
+            search_secret_ref=research_table.get("search_secret_ref"),
+            allowed_source_hosts=tuple(research_table.get("allowed_source_hosts", ())),
         ),
     )

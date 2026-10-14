@@ -59,7 +59,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 33)
+        self.assertEqual(version, 34)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -77,6 +77,23 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(StoreSchemaError):
             self.store.initialize()
 
+    def test_phase27_research_schema_upgrades_existing_version_33_store(self):
+        self.store.initialize()
+        original = self._evidence(content=b"preserved-phase27-evidence")
+        with sqlite3.connect(self.db_path) as connection:
+            for table in ("research_hypothesis_links", "research_skill_proposals",
+                          "research_brief_sources", "research_sources", "research_briefs",
+                          "research_requests"):
+                connection.execute(f"DROP TABLE {table}")
+            connection.execute("PRAGMA user_version=33")
+        self.store.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE "
+                "type='table' AND name='research_briefs'").fetchone())
+            self.assertEqual(connection.execute("SELECT count(*) FROM evidence WHERE evidence_id=?",
+                (original.evidence_id,)).fetchone()[0], 1)
+
     def test_phase26_js_index_upgrades_existing_version_29_store(self):
         self.store.initialize()
         original = self._evidence(content=b"preserved-phase26-evidence")
@@ -86,7 +103,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=29")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' "
                 "AND name='api_js_artifacts_target_hash_state'").fetchone())
@@ -103,7 +120,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=30")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='api_inventory_progress'").fetchone())
@@ -143,7 +160,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=14")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)
@@ -161,7 +178,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=31")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
             schema = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='authorization_mutation_results'").fetchone()[0]
@@ -176,7 +193,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=32")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
             names = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'")}
             self.assertIn("authorization_mutations_delete_exchange", names)

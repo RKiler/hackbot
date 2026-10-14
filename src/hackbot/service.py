@@ -59,6 +59,8 @@ from .typed_mutations import MutationPhase, TypedMutation
 from .test_objects import ObjectRegistry, ObjectState
 from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
+from .research import ResearchBudget, ResearchCoordinator, ResearchStatus, ResearchStore
+from .research_sources import BraveWebResearchProvider, FindingKnowledgeProvider, SkillKnowledgeProvider
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
@@ -129,6 +131,21 @@ class BugHunterRuntime:
         self.api_operations = APIOperationRegistry(self.store)
         self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
+        self.research_store = ResearchStore(self.store)
+        self.research_store.reconcile_interrupted()
+        web_research = None
+        if config.research and config.research.enabled and config.research.search_secret_ref:
+            web_research = BraveWebResearchProvider(
+                self.auth.secrets, config.research.search_secret_ref,
+                allowed_hosts=config.research.allowed_source_hosts,
+                forbidden_host=self._is_target_host)
+        self.research = ResearchCoordinator(
+            self.research_store,
+            local_providers=(SkillKnowledgeProvider(self.skills), FindingKnowledgeProvider(self.store)),
+            web_provider=web_research,
+            skill_names=tuple(item.name for item in self.skills.discover()))
+        self._research_threads: dict[str, Thread] = {}
+        self._research_lock = Lock()
         self.skill_checker = PrerequisiteChecker()
         self.skill_plans = SkillPlanStore(self.store)
         self.skill_router = SkillRouter(self.skills, self.skill_checker,
@@ -314,6 +331,20 @@ class BugHunterRuntime:
         if package is None:
             raise LookupError("target not found")
         return package
+
+    def _is_target_host(self, host: str) -> bool:
+        cursor = None
+        for _ in range(10):
+            page = self.targets.list_target_packages(limit=100, cursor=cursor)
+            if any(host == package.target.root_domain or
+                   host.endswith("." + package.target.root_domain) or any(
+                rule.matches_host(host) for rule in package.scope.include_hosts
+            ) for package in page.items):
+                return True
+            cursor = page.next_cursor
+            if cursor is None:
+                return False
+        return True  # Fail closed when the package inventory exceeds the bound.
 
     def audit(self, event_type: str, *, target_id: str | None = None,
               identity_id: str | None = None, session_id: str | None = None) -> None:
@@ -1504,6 +1535,114 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             feature=data["feature"], action=data.get("action"), expected_access=data["expected_access"],
             provenance=data.get("provenance", "RESEARCHER"))
         return jsonify({"saved": True}), 201
+
+    @app.get("/v1/research/<package_id>/gaps")
+    def research_gaps(package_id: str):
+        package = service.package(package_id)
+        limit = PageRequest.parse(maximum=100).limit
+        return jsonify({"items": [gap.to_dict() for gap in service.research_store.gaps(
+            package.target.id, limit=limit)]})
+
+    @app.get("/v1/research/<package_id>/requests")
+    def research_requests(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.research_store.list(
+            package.target.id, limit=PageRequest.parse(maximum=100).limit))
+
+    @app.get("/v1/research/<package_id>/metrics")
+    def research_metrics(package_id: str):
+        package = service.package(package_id)
+        return jsonify(service.research_store.metrics(package.target.id))
+
+    @app.get("/v1/research/<package_id>/requests/<request_id>")
+    def research_request(package_id: str, request_id: str):
+        package = service.package(package_id)
+        item = service.research_store.request(package.target.id, request_id)
+        if item is None:
+            raise LookupError("research request not found")
+        return jsonify({key: item[key] for key in
+                        ("request_id", "gap_ref", "gap_type", "topic", "specialist",
+                         "hypothesis_id", "status", "brief_id", "error_code", "created_at", "updated_at")})
+
+    @app.get("/v1/research/<package_id>/briefs/<brief_id>")
+    def research_brief(package_id: str, brief_id: str):
+        package = service.package(package_id)
+        item = service.research_store.brief(package.target.id, brief_id)
+        if item is None:
+            raise LookupError("research brief not found")
+        return jsonify(item)
+
+    def _start_research(package_id: str, gap_ref: str, *, refresh: bool,
+                        external: bool, budget: ResearchBudget):
+        package = service.package(package_id)
+        gap = service.research_store.find_gap(package.target.id, gap_ref)
+        with service._research_lock:
+            if len(service._research_threads) >= 2:
+                return jsonify(error="research_capacity_reached"), 429
+            result = service.research.submit(gap, budget=budget, external=external,
+                                             private_target=True, refresh=refresh)
+            if result["status"] != "PENDING" or result["request_id"] in service._research_threads:
+                return jsonify(result), 200
+
+            def work() -> None:
+                try:
+                    service.research.run(gap, result["request_id"])
+                except Exception:
+                    service.research_store.transition(result["request_id"],
+                                                      ResearchStatus.FAILED,
+                                                      error_code="RESEARCH_FAILED")
+                    service.logger.error("research_failed")
+                finally:
+                    with service._research_lock:
+                        service._research_threads.pop(result["request_id"], None)
+
+            thread = Thread(target=work, name="research-" + result["request_id"][-8:], daemon=True)
+            service._research_threads[result["request_id"]] = thread
+            thread.start()
+        return jsonify(result), 202
+
+    @app.post("/v1/research/<package_id>/requests")
+    def research_start(package_id: str):
+        data = _body(frozenset({"gap_ref", "external", "budget"}))
+        gap_ref = data.get("gap_ref")
+        if not isinstance(gap_ref, str):
+            raise ValueError("invalid gap reference")
+        external = data.get("external", False)
+        if type(external) is not bool:
+            raise ValueError("invalid external flag")
+        raw_budget = data.get("budget", {})
+        if not isinstance(raw_budget, dict):
+            raise ValueError("invalid research budget")
+        if set(raw_budget) - set(ResearchBudget.__dataclass_fields__):
+            raise ValueError("invalid research budget")
+        budget = ResearchBudget(**raw_budget)
+        return _start_research(package_id, gap_ref, refresh=False, external=external, budget=budget)
+
+    @app.post("/v1/research/<package_id>/briefs/<brief_id>/refresh")
+    def research_refresh(package_id: str, brief_id: str):
+        data = _body(frozenset({"external"}))
+        if type(data.get("external", False)) is not bool:
+            raise ValueError("invalid external flag")
+        package = service.package(package_id)
+        brief = service.research_store.brief(package.target.id, brief_id)
+        if brief is None:
+            raise LookupError("research brief not found")
+        if brief["freshness"] == "FRESH":
+            raise ValueError("only stale research may be refreshed")
+        previous = service.research_store.request(package.target.id, brief["request_id"])
+        if previous is None:
+            raise LookupError("research request not found")
+        return _start_research(package_id, previous["gap_ref"], refresh=True,
+                               external=data.get("external", False),
+                               budget=ResearchBudget())
+
+    @app.post("/v1/research/<package_id>/requests/<request_id>/cancel")
+    def research_cancel(package_id: str, request_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        if not service.research_store.cancel(package.target.id, request_id):
+            raise LookupError("active research request not found")
+        return jsonify({"request_id": request_id, "status": "CANCELLED"})
 
     @app.get("/v1/api/<package_id>/coverage")
     def api_coverage(package_id: str):

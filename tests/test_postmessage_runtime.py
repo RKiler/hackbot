@@ -1039,7 +1039,7 @@ frame.addEventListener('load',()=>{{
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 33)
+        self.assertEqual(version, 34)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)
