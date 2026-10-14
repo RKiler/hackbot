@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 from .evidence import RedactionStatus
+from .api_graphql import GraphQLResult, classify_result
 from .store import EvidenceFactStore
 from .traffic import TrafficExchange
 
@@ -67,6 +68,11 @@ class ResponseFeatures:
     request_path_fingerprint: str
     request_structural_fingerprint: str
     request_method: str
+    graphql_result: str = GraphQLResult.AMBIGUOUS.value
+    graphql_data_paths: tuple[str, ...] = ()
+    graphql_error_paths: tuple[str, ...] = ()
+    graphql_error_codes: tuple[str, ...] = ()
+    graphql_value_hashes: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {"status_code": self.status_code, "content_type": self.content_type,
@@ -79,7 +85,55 @@ class ResponseFeatures:
                 "tenant_id_hashes": list(self.tenant_id_hashes),
                 "request_path_fingerprint": self.request_path_fingerprint,
                 "request_structural_fingerprint": self.request_structural_fingerprint,
-                "request_method": self.request_method}
+                "request_method": self.request_method,
+                "graphql_result": self.graphql_result,
+                "graphql_data_paths": list(self.graphql_data_paths),
+                "graphql_error_paths": list(self.graphql_error_paths),
+                "graphql_error_codes": list(self.graphql_error_codes),
+                "graphql_value_hashes": [list(item) for item in self.graphql_value_hashes]}
+
+    def graphql_value(self, path: str) -> str | None:
+        return next((value for key, value in self.graphql_value_hashes if key == path), None)
+
+
+def _graphql_paths(payload: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...],
+                                                    tuple[str, ...], tuple[tuple[str, str], ...]]:
+    present: set[str] = set()
+    values: dict[str, str] = {}
+
+    def visit(value: Any, path: str, depth: int) -> None:
+        if depth > 10 or len(present) >= 160 or value is None:
+            return
+        present.add(path)
+        if isinstance(value, dict):
+            for name, item in value.items():
+                visit(item, path + "/" + name.replace("~", "~0").replace("/", "~1"), depth + 1)
+        elif isinstance(value, list):
+            for index, item in enumerate(value[:16]):
+                visit(item, path + "/" + str(index), depth + 1)
+        else:
+            values[path] = _hash(json.dumps(value, sort_keys=True, ensure_ascii=True))
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key, value in data.items():
+            visit(value, "/" + key.replace("~", "~0").replace("/", "~1"), 0)
+    errors: set[str] = set()
+    codes: set[str] = set()
+    if isinstance(payload.get("errors"), list):
+        for error in payload["errors"][:16]:
+            if not isinstance(error, dict):
+                continue
+            path = error.get("path")
+            if (isinstance(path, list) and len(path) <= 12 and
+                    all(isinstance(part, (str, int)) and len(str(part)) <= 64 for part in path)):
+                errors.add("/" + "/".join(str(part).replace("~", "~0").replace("/", "~1")
+                                           for part in path))
+            extensions = error.get("extensions")
+            code = extensions.get("code") if isinstance(extensions, dict) else None
+            if isinstance(code, str) and len(code) <= 64 and code.replace("_", "").isalnum():
+                codes.add(code.upper())
+    return tuple(sorted(present)), tuple(sorted(errors)), tuple(sorted(codes)), tuple(sorted(values.items()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,21 +164,24 @@ class ResponseComparator:
         self.volatile_json_paths = volatile_json_paths
 
     def _json(self, exchange: TrafficExchange) -> tuple[str | None, str | None, bool, bool,
-                                                        tuple[str, ...], tuple[str, ...]]:
+                                                        tuple[str, ...], tuple[str, ...],
+                                                        str, tuple[str, ...], tuple[str, ...],
+                                                        tuple[str, ...], tuple[tuple[str, str], ...]]:
+        empty = (None, None, False, False, (), (), GraphQLResult.AMBIGUOUS.value, (), (), (), ())
         response = exchange.response
         if (response is None or response.body_evidence_id is None or
                 response.record.content_type not in {"application/json", "application/graphql-response+json"}):
-            return None, None, False, False, (), ()
+            return empty
         evidence = self.evidence.get_evidence(response.body_evidence_id)
         if (evidence is None or evidence.target_ref != exchange.target_id or
                 evidence.redaction_status is not RedactionStatus.ORIGINAL or
                 evidence.content_size > self.max_json_bytes):
-            return None, None, False, False, (), ()
+            return empty
         try:
             raw = self.evidence.read_content(evidence.evidence_id, allow_sensitive=True,
                                              max_bytes=self.max_json_bytes)
             if response.body_hash != _hash(raw):
-                return None, None, False, False, (), ()
+                return empty
             parsed = json.loads(raw, object_pairs_hook=_unique_pairs)
             objects: set[str] = set()
             tenants: set[str] = set()
@@ -137,13 +194,21 @@ class ResponseComparator:
             graphql_errors = bool(normalized.get("errors")) if isinstance(normalized, dict) else False
             data_hash = (_hash(json.dumps(data, sort_keys=True, separators=(",", ":"),
                                           ensure_ascii=True)) if graphql_present else None)
+            paths, error_paths, error_codes, value_hashes = (
+                _graphql_paths(normalized) if isinstance(normalized, dict) and
+                ("data" in normalized or "errors" in normalized) else ((), (), (), ()))
             return (digest, data_hash, graphql_present, graphql_errors,
-                    tuple(sorted(objects)), tuple(sorted(tenants)))
+                    tuple(sorted(objects)), tuple(sorted(tenants)),
+                    classify_result(normalized).value if paths or error_paths or error_codes or
+                    isinstance(normalized, dict) and ("data" in normalized or "errors" in normalized)
+                    else GraphQLResult.AMBIGUOUS.value,
+                    paths, error_paths, error_codes, value_hashes)
         except (UnicodeDecodeError, ValueError, TypeError, KeyError, PermissionError):
-            return None, None, False, False, (), ()
+            return empty
 
     def features(self, exchange: TrafficExchange) -> ResponseFeatures:
-        normalized, graphql_hash, graphql_present, graphql_errors, objects, tenants = self._json(exchange)
+        (normalized, graphql_hash, graphql_present, graphql_errors, objects, tenants,
+         graphql_result, paths, error_paths, error_codes, value_hashes) = self._json(exchange)
         response = exchange.response
         return ResponseFeatures(
             response.record.status_code if response else None,
@@ -152,7 +217,8 @@ class ResponseComparator:
             response.record.size_bytes if response else None,
             normalized, graphql_hash, graphql_present, graphql_errors,
             objects, tenants, exchange.request.path_fingerprint,
-            exchange.request.structural_fingerprint, exchange.request.record.method)
+            exchange.request.structural_fingerprint, exchange.request.record.method,
+            graphql_result, paths, error_paths, error_codes, value_hashes)
 
     @staticmethod
     def compare(control: ResponseFeatures, test: ResponseFeatures) -> ResponseComparison:

@@ -12,8 +12,12 @@ from typing import Protocol
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .domain import ObservationState
-from .evidence import EvidenceType, Fact, FactStatus, Retention
+from .evidence import EvidenceType, Fact, FactStatus, RedactionStatus, Retention
 from .domxss_static import DOMCandidateStatus
+from .api_registry import APICandidate, APIOperation, APIOperationRegistry, APIOperationType
+from .api_graphql import (encode_observed_global_id, graphql_batch_values,
+                          observed_field_selection_pair,
+                          nested_child_values)
 from .domxss_store import DOMXSSStore
 from .exposure import ExposureSpecialist
 from .exposure_models import ExposureSource, ExposureStatus
@@ -33,7 +37,7 @@ from .store import EvidenceFactStore
 from .target_loader import TargetPackageRepository
 from .target_scope import ScopeResult
 from .traffic import AuthState, ExchangeState, TrafficExchange, TrafficStore
-from .test_objects import ObjectRegistry
+from .test_objects import ObjectRegistry, ObjectState
 from .validation_store import (CheckOutcome, FindingSpec, ValidationCheck,
                                ValidationResult, ValidationStatus, ValidationStore)
 
@@ -58,6 +62,7 @@ _KINDS = {**{skill: "AUTHORIZATION" for skill in _AUTH_SKILLS},
           **{skill: "CLIENT_SIDE" for skill in _CLIENT_SKILLS},
           "internal-surface-candidate": "INTERNAL_SURFACE"}
 _KINDS["batch-object-authorization"] = "AUTHORIZATION"
+_KINDS["api-observed-read"] = "API"
 _EXPECTED_VALIDATORS = {
     "cross-tenant-object-authorization": {"ownership_matrix", "response_diff", "protected_content"},
     "nested-resource-authorization": {"ownership_matrix", "response_diff", "protected_content"},
@@ -78,6 +83,7 @@ _EXPECTED_VALIDATORS = {
     "postmessage-trust-analysis": {"origin_control", "capability_proof"},
     "internal-surface-candidate": {"scope_review", "current_reachability"},
     "typed-authorization-mutation": {"ownership_matrix", "state_readback", "restore_readback"},
+    "api-observed-read": {"api_semantic_data", "ownership_matrix", "negative_control"},
 }
 _DENIED = {401, 403, 404}
 _VALIDATOR_VERSION = "1.0.0"
@@ -171,6 +177,7 @@ class ValidatorRegistry:
         self._items["internal-surface-candidate"] = InternalSurfaceValidator()
         self._items["typed-authorization-mutation"] = TypedMutationValidator()
         self._items["batch-object-authorization"] = BatchReadValidator()
+        self._items["api-observed-read"] = APIReadValidator()
 
     def select(self, skill_id: str) -> Validator | None:
         return self._items.get(skill_id)
@@ -187,7 +194,8 @@ class DeterministicValidatorEngine:
                  dom: DOMXSSStore | None = None,
                  messages: PostMessageStore | None = None,
                  targets: TargetPackageRepository | None = None,
-                 exposure: ExposureSpecialist | None = None) -> None:
+                 exposure: ExposureSpecialist | None = None,
+                 api_operations: APIOperationRegistry | None = None) -> None:
         self.runs, self.traffic, self.evidence = runs, traffic, evidence
         self.identities, self.hypotheses, self.results = identities, hypotheses, results
         self.registry = registry or ValidatorRegistry()
@@ -196,6 +204,7 @@ class DeterministicValidatorEngine:
         self.messages = messages
         self.targets = targets
         self.exposure = exposure
+        self.api_operations = api_operations
 
     def _semantic_object_hash(self, run: PlanRun, salted_hash: str | None,
                               object_type: str | None) -> str | None:
@@ -464,6 +473,18 @@ class DeterministicValidatorEngine:
              "INSUFFICIENT_EVIDENCE": "Required protected evidence is missing."}[decision.status.value],
             _now())
         recorded, finding = self.results.record(result, decision.finding)
+        if self.api_operations is not None and run.skill_id == "api-observed-read":
+            frozen = context.plan.get("api_binding")
+            candidate = (self.api_operations.get_candidate(
+                run.target_id, frozen["candidate_id"]) if
+                isinstance(frozen, dict) and isinstance(frozen.get("candidate_id"), str)
+                else None)
+            if candidate is not None and candidate.plan_id == run.plan_id:
+                self.api_operations.link_candidate(
+                    run.target_id, candidate.id,
+                    status="VALIDATED" if recorded.status is ValidationStatus.CONFIRMED else
+                    "REJECTED" if recorded.status is ValidationStatus.REJECTED else "REVIEW",
+                    run_id=run.id, validation_id=recorded.id)
         if self.dom is not None and run.skill_id == "check-before-transform-dom-xss":
             binding = context.plan.get("dom_binding")
             if isinstance(binding, dict) and isinstance(binding.get("candidate_id"), str):
@@ -803,6 +824,9 @@ class TypedMutationValidator:
 
     def evaluate(self, context: ValidationContext, engine: DeterministicValidatorEngine) -> ValidatorDecision:
         run, target = context.run, context.run.target_id
+        if (context.plan.get("request_templates") and
+                context.plan["request_templates"][0].get("mutation_type") == "DELETE_DISPOSABLE"):
+            return self._evaluate_delete(context, engine)
         if len(context.plan.get("request_templates", [])) != 7:
             return _decision(ValidationStatus.INVALID_TEST, "MUTATION_PLAN_SHAPE_INVALID")
         stages = ("BEFORE_READ", "OWNER_MUTATE", "OWNER_READBACK", "BOUNDARY_MUTATE",
@@ -826,12 +850,86 @@ class TypedMutationValidator:
             return _decision(ValidationStatus.INVALID_TEST, "MUTATION_ACTORS_OR_READBACK_INVALID")
         item_id = templates[0]["test_object_id"]
         with engine.evidence._connection() as db:
-            row = db.execute("SELECT test_name,disposable,verified_at,creator_identity_id,"
-                             "tenant_id,external_id_hash,object_type FROM test_objects "
+            row = db.execute("SELECT test_object_id,test_name,disposable,verified_at,creator_identity_id,"
+                             "tenant_id,external_id_hash,external_id_evidence_id,object_type,"
+                             "parent_test_object_id FROM test_objects "
                              "WHERE test_object_id=? AND target_id=?", (item_id, target)).fetchone()
         if (row is None or not row["disposable"] or not row["verified_at"] or
                 row["creator_identity_id"] != first.identity_id):
             return _decision(ValidationStatus.INVALID_TEST, "DISPOSABLE_OWNERSHIP_INVALID")
+        nested_refs: tuple[str, ...] = ()
+        if "parent_object_id" in templates[0]:
+            parent_id = templates[0].get("parent_object_id")
+            foreign_parent_id = templates[0].get("foreign_parent_object_id")
+            if (not isinstance(parent_id, str) or not isinstance(foreign_parent_id, str) or
+                    len({item_id, parent_id, foreign_parent_id}) != 3 or
+                    any(item.get("parent_object_id") != parent_id or
+                        item.get("foreign_parent_object_id") != foreign_parent_id
+                        for item in templates) or row["parent_test_object_id"] != parent_id):
+                return _decision(ValidationStatus.INVALID_TEST, "NESTED_MUTATION_SHAPE_INVALID")
+            with engine.evidence._connection() as db:
+                parents = [db.execute(
+                    "SELECT test_object_id,target_id,tenant_id,creator_identity_id,"
+                    "object_type,disposable,verified_at,external_id_hash,"
+                    "external_id_evidence_id FROM test_objects WHERE test_object_id=?",
+                    (parent_ref,)).fetchone() for parent_ref in (parent_id, foreign_parent_id)]
+            if (any(parent is None for parent in parents) or
+                    any(parent["target_id"] != target or
+                        not parent["disposable"] or not parent["verified_at"] or
+                        parent["object_type"] != parents[0]["object_type"]
+                        for parent in parents) or
+                    parents[0]["tenant_id"] != row["tenant_id"] or
+                    parents[0]["creator_identity_id"] != first.identity_id or
+                    parents[1]["tenant_id"] == row["tenant_id"] or
+                    parents[1]["creator_identity_id"] != foreign_write.identity_id):
+                return _decision(ValidationStatus.INVALID_TEST, "NESTED_MUTATION_PARENTS_INVALID")
+            refs: list[str] = []
+            for parent in parents:
+                for predicate, value in (("created_by", parent["creator_identity_id"]),
+                                         ("resource_tenant", parent["tenant_id"]),
+                                         ("disposable", "true")):
+                    facts = engine.evidence.find_facts(parent["test_object_id"],
+                                                       predicate, limit=8).items
+                    trusted = next((fact for fact in facts if fact.target_ref == target and
+                                    fact.status is FactStatus.ACTIVE and fact.source != "MANUAL" and
+                                    fact.confidence >= 0.9 and fact.object == value and
+                                    fact.evidence_ids), None)
+                    if trusted is None:
+                        return _decision(ValidationStatus.INVALID_TEST,
+                                         "NESTED_MUTATION_PARENT_FACTS_INVALID")
+                    refs.extend(trusted.evidence_ids[:2])
+            try:
+                object_rows = (row, *parents)
+                external_ids = []
+                for object_row in object_rows:
+                    external = engine.evidence.read_content(
+                        object_row["external_id_evidence_id"], allow_sensitive=True,
+                        max_bytes=256).decode("ascii")
+                    if hashlib.sha256((object_row["test_object_id"] + ":" + external).encode()).hexdigest() != object_row["external_id_hash"]:
+                        raise ValueError
+                    external_ids.append(external)
+                for observation, expected_parent in ((owner_write, external_ids[1]),
+                                                     (foreign_write, external_ids[2]),
+                                                     (restore, external_ids[1])):
+                    request = observation.exchange.request
+                    raw = engine.evidence.read_content(request.body_evidence_id,
+                                                       allow_sensitive=True, max_bytes=8192)
+                    if hashlib.sha256(raw).hexdigest() != request.body_hash:
+                        raise ValueError
+                    payload = json.loads(raw, object_pairs_hook=GraphQLValidator._unique_pairs)
+                    variables = payload.get("variables") if isinstance(payload, dict) else None
+                    if (not isinstance(variables, dict) or
+                            set(variables) != {"parentId", "id", "name"} or
+                            variables["id"] != external_ids[0] or
+                            variables["parentId"] != expected_parent):
+                        raise ValueError
+                    if request.body_evidence_id:
+                        refs.append(request.body_evidence_id)
+            except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
+                    PermissionError):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "NESTED_MUTATION_TRAFFIC_INVALID")
+            nested_refs = tuple(dict.fromkeys(refs))[:16]
         ledger = MutationResultStore(engine.evidence)
         control = ledger.for_phase(run.id, item_id, MutationPhase.OWNER_CONTROL)
         boundary = ledger.for_phase(run.id, item_id, MutationPhase.BOUNDARY)
@@ -861,6 +959,8 @@ class TypedMutationValidator:
                          boundary.evidence_ids[:4]),
                   _check("RESTORE_READBACK", reversal.verified_effect,
                          reversal.evidence_ids[:4])]
+        if nested_refs:
+            checks.append(_check("NESTED_PARENT_CHILD_BINDING", True, nested_refs[:8]))
         if not linked or not control.verified_effect:
             return _decision(ValidationStatus.INVALID_TEST, "MUTATION_CONTROL_INVALID",
                              checks=tuple(checks))
@@ -932,7 +1032,7 @@ class TypedMutationValidator:
                              checks=tuple(checks))
         supporting = tuple(dict.fromkeys((
             *(ref for entry in (control, boundary, reversal) for ref in entry.evidence_ids),
-            *vis_refs, *policy_refs, *tenant_refs, *extra_refs,
+            *vis_refs, *policy_refs, *tenant_refs, *extra_refs, *nested_refs,
             *owner_member[2], *foreign_member[2])))[:64]
         finding = engine._finding(context, first, foreign_write,
                                   "AUTHORIZATION_MUTATION", "UNAUTHORIZED_STATE_CHANGE")
@@ -941,6 +1041,212 @@ class TypedMutationValidator:
                                                           "FOREIGN_READBACK", "RESTORE_READBACK"),
                          supporting=supporting, reproductions=1,
                          impact="UNAUTHORIZED_STATE_CHANGE", finding=finding)
+
+    def _evaluate_delete(self, context: ValidationContext,
+                         engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        run, target = context.run, context.run.target_id
+        stages = ("BEFORE_READ", "OWNER_MUTATE", "OWNER_READBACK",
+                  "TARGET_BEFORE_READ", "BOUNDARY_MUTATE", "BOUNDARY_READBACK",
+                  "RESTORE", "RESTORE_READBACK")
+        templates = context.plan.get("request_templates", [])
+        if (len(templates) != 8 or
+                tuple(item.get("stage") for item in templates) != stages or
+                any(item.get("binding") != "AUTHORIZATION_RECIPE_MUTATION_V1" or
+                    item.get("mutation_type") != "DELETE_DISPOSABLE" or
+                    item.get("recipe_hash") != templates[0].get("recipe_hash") or
+                    item.get("test_object_id") != templates[0].get("test_object_id") or
+                    item.get("delete_control_object_id") != templates[0].get("delete_control_object_id") or
+                    "parent_object_id" in item for item in templates)):
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_PLAN_SHAPE_INVALID")
+        control_id = templates[0].get("delete_control_object_id")
+        target_id = templates[0].get("test_object_id")
+        if not isinstance(control_id, str) or not isinstance(target_id, str) or control_id == target_id:
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_OBJECT_PAIR_INVALID")
+        observations = {item.step.action_slot: item for item in context.observations}
+        restore_step = next((item for item in engine.runs.steps(run.id)
+                             if item.action_slot == 6), None)
+        skipped_cleanup = bool(restore_step is not None and
+                               restore_step.status is RuntimeStepStatus.COMPLETED and
+                               restore_step.safe_reason == "DELETE_ALREADY_ABSENT" and
+                               engine.runs.result(restore_step.id) is not None and
+                               not engine.runs.result(restore_step.id).exchange_ids)
+        expected_slots = set(range(8)) - ({6} if skipped_cleanup else set())
+        if (set(observations) != expected_slots or
+                not all(item.audit_valid for item in observations.values())):
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_AUDIT_INVALID")
+        first, owner_write, owner_after, target_before, foreign_write, foreign_after, final = (
+            observations[index] for index in (0, 1, 2, 3, 4, 5, 7))
+        cleanup = observations.get(6)
+        if (any(item.identity_id != first.identity_id for item in
+                (owner_write, owner_after, target_before, foreign_after, final,
+                 *((cleanup,) if cleanup else ()))) or
+                foreign_write.identity_id in {None, first.identity_id} or
+                any(item.features.request_method != "GET" for item in
+                    (first, owner_after, target_before, foreign_after, final)) or
+                any(item.features.request_method != "DELETE" for item in
+                    (owner_write, foreign_write, *((cleanup,) if cleanup else ()))) or
+                first.features.status_code != 200 or
+                owner_write.features.status_code not in {200, 202, 204} or
+                owner_after.features.status_code not in {404, 410} or
+                target_before.features.status_code != 200 or
+                foreign_after.features.status_code not in {200, 404, 410} or
+                final.features.status_code not in {404, 410} or
+                first.object_ref_hash is None or target_before.object_ref_hash is None or
+                any(item.object_ref_hash != first.object_ref_hash for item in
+                    (owner_write, owner_after)) or
+                any(item.object_ref_hash != target_before.object_ref_hash for item in
+                    (foreign_write, foreign_after, final,
+                     *((cleanup,) if cleanup else ()))) or
+                first.object_ref_hash == target_before.object_ref_hash):
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_ACTORS_OR_READBACK_INVALID")
+        with engine.evidence._connection() as db:
+            rows = [db.execute(
+                "SELECT test_object_id,package_id,disposable,verified_at,creator_identity_id,"
+                "tenant_id,object_type,parent_test_object_id,recipe_id,recipe_hash,"
+                "external_id_hash,external_id_evidence_id FROM test_objects "
+                "WHERE test_object_id=? AND target_id=?", (object_id, target)).fetchone()
+                for object_id in (control_id, target_id)]
+        control_row, target_row = rows
+        if (any(row is None or not row["disposable"] or not row["verified_at"] or
+                not row["external_id_evidence_id"] or row["creator_identity_id"] != first.identity_id or
+                row["package_id"] != run.package_id or row["recipe_hash"] != templates[0]["recipe_hash"]
+                for row in rows) or
+                any(control_row[key] != target_row[key] for key in
+                    ("tenant_id", "object_type", "parent_test_object_id", "recipe_id"))):
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_DISPOSABLE_OWNERSHIP_INVALID")
+        try:
+            external_ids = [engine.evidence.read_content(
+                row["external_id_evidence_id"], allow_sensitive=True,
+                max_bytes=256).decode("ascii") for row in rows]
+            if any(_digest(row["test_object_id"] + ":" + value) != row["external_id_hash"]
+                   for row, value in zip(rows, external_ids)):
+                raise ValueError
+            for observation, external in ((first, external_ids[0]),
+                                          (target_before, external_ids[1])):
+                if _digest(external) not in observation.features.object_id_hashes:
+                    raise ValueError
+            urls = {}
+            for slot, observation in observations.items():
+                record = engine.evidence.get_evidence(
+                    observation.exchange.request.observation_evidence_id)
+                if record is None or record.target_ref != target:
+                    raise ValueError
+                payload = json.loads(engine.evidence.read_content(
+                    record.evidence_id, allow_sensitive=True, max_bytes=8192))
+                urls[slot] = payload["url"]
+            if (len({urls[slot] for slot in (0, 1, 2)}) != 1 or
+                    len({urls[slot] for slot in expected_slots - {0, 1, 2}}) != 1 or
+                    urls[0] == urls[3] or
+                    urlsplit(urls[0]).path.split("/")[-1] != external_ids[0] or
+                    urlsplit(urls[3]).path.split("/")[-1] != external_ids[1]):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_OBJECT_TRAFFIC_INVALID")
+        ledger = MutationResultStore(engine.evidence)
+        owner = ledger.for_phase(run.id, control_id, MutationPhase.OWNER_CONTROL)
+        boundary = ledger.for_phase(run.id, target_id, MutationPhase.BOUNDARY)
+        reversal = ledger.for_phase(run.id, target_id, MutationPhase.RESTORE)
+        if owner is None or boundary is None or (reversal is None and not skipped_cleanup):
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE, "DELETE_LEDGER_INCOMPLETE")
+        linked_entries = [(owner, owner_write, owner_after),
+                          (boundary, foreign_write, foreign_after)]
+        if cleanup is not None and reversal is not None:
+            linked_entries.append((reversal, cleanup, final))
+        linked = all((entry.mutation_action_id == write.step.action_id and
+                      entry.mutation_exchange_id == write.exchange.id and
+                      entry.readback_action_id == read.step.action_id and
+                      entry.readback_exchange_id == read.exchange.id and
+                      entry.mutation_type.value == "DELETE_DISPOSABLE" and
+                      entry.recipe_hash == templates[0]["recipe_hash"])
+                     for entry, write, read in linked_entries)
+        if skipped_cleanup and reversal is not None:
+            linked = False
+        expected_present, expected_absent = value_hash("present"), value_hash("absent")
+        state_chain = (owner.before_value_hash == expected_present and
+                       owner.after_value_hash == expected_absent and owner.verified_effect and
+                       boundary.before_value_hash == expected_present and
+                       boundary.after_value_hash in {expected_present, expected_absent} and
+                       ((skipped_cleanup and boundary.verified_effect and
+                         boundary.after_value_hash == expected_absent) or
+                        (reversal is not None and
+                         reversal.before_value_hash == boundary.after_value_hash and
+                         reversal.after_value_hash == expected_absent and
+                         ((boundary.status is MutationStatus.VERIFIED and
+                           reversal.status is MutationStatus.DENIED) or
+                          (boundary.status is MutationStatus.DENIED and
+                           reversal.status is MutationStatus.VERIFIED)))))
+        checks = (_check("DELETE_AUDIT_CHAIN", linked,
+                         tuple(ref for item in observations.values() for ref in item.evidence_ids[:1])[:8]),
+                  _check("OWNER_DELETE_CONTROL", owner.verified_effect, owner.evidence_ids[:4]),
+                  _check("TARGET_PRESENT_BEFORE_BOUNDARY", True, target_before.evidence_ids[:4]),
+                  _check("BOUNDARY_DELETE_READBACK", boundary.readback_exchange_id is not None,
+                         boundary.evidence_ids[:4]),
+                  _check("TARGET_ABSENT_AFTER_CLEANUP", state_chain,
+                         reversal.evidence_ids[:4] if reversal else final.evidence_ids[:4]))
+        if not linked or not state_chain:
+            return _decision(ValidationStatus.INVALID_TEST, "DELETE_STATE_CHAIN_INVALID",
+                             checks=checks)
+        for row in rows:
+            for predicate, value in (("created_by", row["creator_identity_id"]),
+                                     ("resource_tenant", row["tenant_id"]),
+                                     ("disposable", "true")):
+                facts = engine.evidence.find_facts(row["test_object_id"], predicate, limit=8).items
+                if not any(fact.target_ref == target and fact.status is FactStatus.ACTIVE and
+                           fact.source != "MANUAL" and fact.confidence >= 0.9 and
+                           fact.evidence_ids and fact.object == value for fact in facts):
+                    return _decision(ValidationStatus.INVALID_TEST, "DELETE_OBJECT_FACTS_INVALID",
+                                     checks=checks)
+        visibility, vis_refs = engine.fact_value(target_before.object_ref_hash,
+                                                 "resource_visibility", target)
+        policy, policy_refs = engine.fact_value(target_before.object_ref_hash,
+                                                "access_policy", target)
+        tenant, tenant_refs = engine.fact_value(target_before.object_ref_hash,
+                                                "resource_tenant", target)
+        owner_member = engine.membership(first.identity_id, target)
+        foreign_member = engine.membership(foreign_write.identity_id, target)
+        hypothesis = engine.hypotheses.get(run.hypothesis_id, target)
+        relation = False
+        if (visibility == "PRIVATE" and policy and tenant and owner_member and
+                foreign_member and hypothesis):
+            if hypothesis.category == "CROSS_TENANT":
+                relation = (owner_member[0] == tenant and foreign_member[0] != tenant and
+                            policy in {"TENANT_ONLY", "OWNER_ONLY"})
+            elif hypothesis.category == "HORIZONTAL":
+                owner_principal = engine.principal(first.identity_id, target)
+                foreign_principal = engine.principal(foreign_write.identity_id, target)
+                resource_owner, _ = engine.fact_value(target_before.object_ref_hash,
+                                                      "resource_owner", target)
+                relation = bool(policy == "OWNER_ONLY" and
+                                owner_member[0] == foreign_member[0] == tenant and
+                                owner_principal and foreign_principal and
+                                owner_principal[0] != foreign_principal[0] and
+                                resource_owner == owner_principal[0])
+            elif hypothesis.category in {"VERTICAL", "HIDDEN_FUNCTION"}:
+                role, _ = engine.fact_value(target_before.object_ref_hash,
+                                            "required_role", target)
+                relation = bool(policy == "ROLE_RESTRICTED" and
+                                owner_member[0] == foreign_member[0] == tenant and
+                                role and role in owner_member[1] and
+                                role not in foreign_member[1])
+        if not relation:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "DELETE_BOUNDARY_UNPROVEN", checks=checks)
+        if boundary.status is MutationStatus.DENIED:
+            return _decision(ValidationStatus.REJECTED, "BOUNDARY_DELETE_DENIED",
+                             checks=checks,
+                             controls=("OWNER_DELETE", "TARGET_PREFLIGHT", "TARGET_FINAL_ABSENCE"),
+                             contradicting=boundary.evidence_ids[:8])
+        supporting = tuple(dict.fromkeys((
+            *(ref for entry in (owner, boundary, *((reversal,) if reversal else ()))
+              for ref in entry.evidence_ids),
+            *vis_refs, *policy_refs, *tenant_refs, *owner_member[2], *foreign_member[2])))[:64]
+        finding = engine._finding(context, target_before, foreign_write,
+                                  "AUTHORIZATION_DELETE", "UNAUTHORIZED_OBJECT_DELETION")
+        return _decision(ValidationStatus.CONFIRMED, "UNAUTHORIZED_DELETE_READBACK",
+                         checks=checks,
+                         controls=("OWNER_DELETE", "TARGET_PREFLIGHT", "TARGET_FINAL_ABSENCE"),
+                         supporting=supporting, reproductions=1,
+                         impact="UNAUTHORIZED_OBJECT_DELETION", finding=finding)
 
 
 class GraphQLValidator:
@@ -1150,6 +1456,617 @@ class GraphQLValidator:
                          checks=tuple(checks), controls=("OWNER_CONTROL", "INVALID_OBJECT"),
                          supporting=evidence, reproductions=len(matches),
                          impact="GRAPHQL_PROTECTED_OBJECT_READ", finding=finding)
+
+
+class APIReadValidator:
+    """Confirm only owned, protected API data read through an audited plan."""
+
+    id = "api_observed_read"
+
+    @staticmethod
+    def _executed_query(item: Observation,
+                        engine: DeterministicValidatorEngine) -> str | None:
+        request = item.exchange.request
+        record = engine.evidence.get_evidence(request.body_evidence_id) if request.body_evidence_id else None
+        if (record is None or record.target_ref != item.exchange.target_id or
+                record.redaction_status is not RedactionStatus.ORIGINAL or
+                record.content_size > 16384):
+            return None
+        try:
+            raw = engine.evidence.read_content(record.evidence_id, allow_sensitive=True,
+                                               max_bytes=16384)
+            if hashlib.sha256(raw).hexdigest() != request.body_hash:
+                return None
+            payload = json.loads(raw, object_pairs_hook=GraphQLValidator._unique_pairs)
+            return payload.get("query") if isinstance(payload, dict) and isinstance(
+                payload.get("query"), str) else None
+        except (ValueError, TypeError, UnicodeError, PermissionError):
+            return None
+    version = _VALIDATOR_VERSION
+
+    @staticmethod
+    def _batch_payload(item: Observation, engine: DeterministicValidatorEngine) -> object | None:
+        response = item.exchange.response
+        ref = engine.evidence.get_evidence(response.body_evidence_id) if response and response.body_evidence_id else None
+        if (ref is None or ref.target_ref != item.exchange.target_id or
+                ref.redaction_status.value != "ORIGINAL" or ref.content_size > 262144 or
+                ref.content_hash != response.body_hash):
+            return None
+        try:
+            return json.loads(engine.evidence.read_content(
+                ref.evidence_id, allow_sensitive=True, max_bytes=262144),
+                object_pairs_hook=GraphQLValidator._unique_pairs)
+        except (ValueError, TypeError, UnicodeError, PermissionError):
+            return None
+
+    def _evaluate_batch(self, context: ValidationContext,
+                        engine: DeterministicValidatorEngine,
+                        candidate: APICandidate, operation: APIOperation,
+                        observations: tuple[Observation, ...],
+                        frozen: dict[str, object]) -> ValidatorDecision:
+        owner, actor_control, invalid, first, second = observations
+        target = context.run.target_id
+        templates = context.plan["request_templates"]
+        root = frozen.get("batch_root_key")
+        id_type = frozen.get("batch_id_type")
+        envelope = frozen.get("batch_envelope")
+        object_ids = (templates[0]["test_object_id"],
+                      templates[0]["source_companion_id"],
+                      templates[1]["test_object_id"],
+                      templates[1]["source_companion_id"])
+        if (operation.type is not APIOperationType.GRAPHQL_QUERY or
+                operation.method != "POST" or not isinstance(root, str) or
+                not isinstance(id_type, str) or envelope not in {
+                    "NODES_LIST", "OPERATION_ARRAY"} or len(set(object_ids)) != 4 or
+                candidate.test_object_id != object_ids[0] or
+                tuple(shape.get("source_companion_id") for shape in templates) !=
+                (object_ids[1], object_ids[3], object_ids[1], object_ids[1], object_ids[1]) or
+                tuple(shape.get("companion_object_id") for shape in templates) !=
+                (object_ids[1], object_ids[3], object_ids[1], object_ids[2], object_ids[2]) or
+                tuple(shape.get("test_object_id") for shape in templates) !=
+                (object_ids[0], object_ids[2], object_ids[0], object_ids[0], object_ids[0]) or
+                any(shape.get("root_key") != root or shape.get("id_type") != id_type or
+                    shape.get("envelope") != envelope or
+                    shape.get("variable_name") != templates[0].get("variable_name")
+                    for shape in templates)):
+            return _decision(ValidationStatus.INVALID_TEST, "API_BATCH_BINDING_INVALID")
+        registry = ObjectRegistry(engine.evidence)
+        records = [registry.get(object_id, target) for object_id in object_ids]
+        if any(item is None or not item.disposable or not item.verified_at or
+               item.cleaned_at or item.state not in {ObjectState.READY, ObjectState.IN_USE,
+                                                     ObjectState.CLEANUP_PENDING} or
+               not item.external_id_evidence_id or not item.external_id_hash
+               for item in records):
+            return _decision(ValidationStatus.INVALID_TEST, "API_BATCH_OBJECTS_UNAVAILABLE")
+        display_hashes: list[str] = []
+        external_hashes: list[str] = []
+        for item in records:
+            try:
+                external = engine.evidence.read_content(item.external_id_evidence_id,
+                    allow_sensitive=True, max_bytes=256).decode("ascii")
+                if _digest(item.id + ":" + external) != item.external_id_hash:
+                    raise ValueError
+                display = external if id_type == "PLAIN" else encode_observed_global_id(
+                    id_type, external)
+            except (ValueError, UnicodeError, PermissionError):
+                return _decision(ValidationStatus.INVALID_TEST, "API_BATCH_OBJECT_ID_INVALID")
+            display_hashes.append(_digest(display))
+            external_hashes.append(_digest(external))
+        if (records[0].creator_identity_id != owner.identity_id or
+                records[1].creator_identity_id != owner.identity_id or
+                records[2].creator_identity_id != first.identity_id or
+                records[3].creator_identity_id != first.identity_id or
+                records[0].tenant_id != records[1].tenant_id or
+                records[2].tenant_id != records[3].tenant_id or
+                records[0].tenant_id == records[2].tenant_id):
+            return _decision(ValidationStatus.INVALID_TEST, "API_BATCH_OWNERSHIP_INVALID")
+        owner_member = engine.membership(owner.identity_id, target)
+        actor_member = engine.membership(first.identity_id, target)
+        fact_refs: list[str] = []
+        for item in records:
+            creator, refs = engine.fact_value(item.id, "created_by", target)
+            tenant, tenant_refs = engine.fact_value(item.id, "resource_tenant", target)
+            disposable, disposable_refs = engine.fact_value(item.id, "disposable", target)
+            if (creator != item.creator_identity_id or tenant != item.tenant_id or
+                    disposable != "true"):
+                return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                                 "API_BATCH_OWNERSHIP_UNPROVEN")
+            fact_refs.extend((*refs, *tenant_refs, *disposable_refs))
+        tenant, tenant_refs = engine.fact_value(external_hashes[0], "resource_tenant", target)
+        visibility, visibility_refs = engine.fact_value(external_hashes[0],
+                                                       "resource_visibility", target)
+        policy, policy_refs = engine.fact_value(external_hashes[0], "access_policy", target)
+        if visibility == "PUBLIC":
+            return _decision(ValidationStatus.REJECTED, "API_BATCH_OBJECT_PUBLIC",
+                             contradicting=visibility_refs)
+        boundary = bool(owner_member and actor_member and
+                        owner_member[0] == records[0].tenant_id and
+                        actor_member[0] == records[2].tenant_id and
+                        tenant == records[0].tenant_id and visibility == "PRIVATE" and
+                        policy in {"OWNER_ONLY", "TENANT_ONLY"})
+        checks = [_check("BATCH_PRIVATE_TENANT_BOUNDARY", boundary,
+                         tuple((*tenant_refs, *visibility_refs, *policy_refs))[:6])]
+        if not boundary:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "API_BATCH_PRIVACY_UNPROVEN", checks=tuple(checks))
+        owner_values = graphql_batch_values(self._batch_payload(owner, engine), root,
+                                           frozenset(display_hashes[:2]), envelope=envelope)
+        actor_values = graphql_batch_values(self._batch_payload(actor_control, engine), root,
+                                           frozenset(display_hashes[2:]), envelope=envelope)
+        owner_ok = owner.features.status_code == 200 and len(owner_values) == 2
+        actor_ok = actor_control.features.status_code == 200 and len(actor_values) == 2
+        negative = self._batch_payload(invalid, engine)
+        if envelope == "NODES_LIST":
+            negative_data = negative.get("data") if isinstance(negative, dict) else None
+            negative_nodes = negative_data.get(root) if isinstance(negative_data, dict) else None
+            negative_empty = bool(isinstance(negative, dict) and
+                (root in negative_data if isinstance(negative_data, dict) else
+                 isinstance(negative.get("errors"), list) and bool(negative["errors"])) and
+                (negative_nodes is None or negative_nodes == [] or
+                 isinstance(negative_nodes, list) and len(negative_nodes) <= 2 and
+                 all(value is None for value in negative_nodes)))
+        else:
+            negative_empty = bool(isinstance(negative, list) and len(negative) == 2 and
+                all(isinstance(part, dict) and
+                    (isinstance(part.get("data"), dict) and
+                     part["data"].get(root) is None or
+                     isinstance(part.get("errors"), list) and bool(part["errors"])) and
+                    not (isinstance(part.get("data"), dict) and
+                         isinstance(part["data"].get(root), dict)) for part in negative))
+        negative_ok = bool(invalid.features.status_code in {200, 400, 404} and
+                           negative_empty)
+        checks.extend((_check("OWNER_TWO_ITEM_CONTROL", owner_ok, owner.evidence_ids[:2]),
+                       _check("ACTOR_TWO_ITEM_CONTROL", actor_ok,
+                              actor_control.evidence_ids[:2]),
+                       _check("INVALID_TWO_ITEM_CONTROL", negative_ok,
+                              invalid.evidence_ids[:2])))
+        if not owner_ok or not actor_ok or not negative_ok:
+            return _decision(ValidationStatus.INVALID_TEST,
+                             "API_BATCH_CONTROLS_FAILED", checks=tuple(checks))
+        matched: list[Observation] = []
+        for item in (first, second):
+            values = graphql_batch_values(self._batch_payload(item, engine), root,
+                                          frozenset((display_hashes[0], display_hashes[2])),
+                                          envelope=envelope)
+            if (item.features.status_code == 200 and len(values) == 2 and
+                    any(values[display_hashes[0]].get(key) == value
+                        for key, value in owner_values[display_hashes[0]].items()) and
+                    any(values[display_hashes[2]].get(key) == value
+                        for key, value in actor_values[display_hashes[2]].items())):
+                matched.append(item)
+        checks.append(_check("MIXED_BATCH_PER_OBJECT_DATA", len(matched) == 2,
+                             tuple(ref for item in matched for ref in item.evidence_ids[:2])[:4]))
+        if not matched:
+            return _decision(ValidationStatus.REJECTED, "API_BATCH_FOREIGN_ITEM_FILTERED",
+                             checks=tuple(checks), contradicting=first.evidence_ids[:2] +
+                             second.evidence_ids[:2])
+        if len(matched) == 1:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "API_BATCH_REPRODUCTION_REQUIRED", checks=tuple(checks),
+                             reproductions=1)
+        root_key, root_refs = engine.fact_value(external_hashes[0], "root_cause_key", target)
+        finding = engine._finding(context, owner, first, "API_AUTHORIZATION",
+                                  "CROSS_TENANT_PROTECTED_BATCH_READ",
+                                  root_key or operation.operation_key)
+        refs = tuple(dict.fromkeys((
+            *owner.evidence_ids[:3], *actor_control.evidence_ids[:3], *invalid.evidence_ids[:2],
+            *first.evidence_ids[:3], *second.evidence_ids[:3],
+            *(ref for item in records for ref in item.verification_evidence_ids),
+            *fact_refs, *tenant_refs, *visibility_refs, *policy_refs, *root_refs)))[:64]
+        return _decision(ValidationStatus.CONFIRMED, "API_PROTECTED_MIXED_BATCH",
+                         checks=tuple(checks), controls=("OWNER_BATCH", "ACTOR_BATCH",
+                                                        "INVALID_BATCH"),
+                         supporting=refs, reproductions=2,
+                         impact="CROSS_TENANT_PROTECTED_BATCH_READ", finding=finding)
+
+    @staticmethod
+    def _nested_values(item: Observation, engine: DeterministicValidatorEngine,
+                       path: str, parent_hash: str, child_hash: str) -> dict[str, str]:
+        response = item.exchange.response
+        ref = engine.evidence.get_evidence(response.body_evidence_id) if response and response.body_evidence_id else None
+        if (ref is None or ref.target_ref != item.exchange.target_id or
+                ref.redaction_status.value != "ORIGINAL" or ref.content_size > 262144 or
+                ref.content_hash != response.body_hash):
+            return {}
+        try:
+            body = json.loads(engine.evidence.read_content(
+                ref.evidence_id, allow_sensitive=True, max_bytes=262144),
+                object_pairs_hook=GraphQLValidator._unique_pairs)
+        except (ValueError, TypeError, UnicodeError, PermissionError):
+            return {}
+        return nested_child_values(body, path, parent_hash, child_hash)
+
+    def _evaluate_nested(self, context: ValidationContext,
+                         engine: DeterministicValidatorEngine,
+                         candidate: APICandidate, operation: APIOperation,
+                         observations: tuple[Observation, ...],
+                         frozen: dict[str, object]) -> ValidatorDecision:
+        owner, actor_control, invalid, first, second = observations
+        target = context.run.target_id
+        templates = context.plan["request_templates"]
+        parent_id = templates[0]["test_object_id"]
+        child_id = frozen.get("nested_child_id")
+        path = frozen.get("nested_path")
+        registry = ObjectRegistry(engine.evidence)
+        parent = registry.get(parent_id, target)
+        child = registry.get(child_id, target) if isinstance(child_id, str) else None
+        if (operation.type is not APIOperationType.GRAPHQL_QUERY or
+                candidate.test_object_id != parent_id or
+                candidate.child_object_id != child_id or
+                candidate.field_path != path or
+                not isinstance(path, str) or
+                path + "/id" not in {field.path for field in operation.fields}):
+            return _decision(ValidationStatus.INVALID_TEST, "API_NESTED_BINDING_INVALID")
+        if (parent is None or child is None or child.parent_id != parent.id or
+                child.creator_identity_id != owner.identity_id or
+                child.tenant_id != parent.tenant_id):
+            return _decision(ValidationStatus.INVALID_TEST, "API_NESTED_OBJECT_RELATION_INVALID")
+        if (not child.disposable or not child.verified_at or
+                child.state not in {ObjectState.READY, ObjectState.IN_USE,
+                                    ObjectState.CLEANUP_PENDING} or child.cleaned_at or
+                not child.external_id_evidence_id or not child.external_id_hash):
+            return _decision(ValidationStatus.INVALID_TEST, "API_NESTED_CHILD_UNAVAILABLE")
+        try:
+            external = engine.evidence.read_content(child.external_id_evidence_id,
+                        allow_sensitive=True, max_bytes=256).decode("ascii")
+            if _digest(child.id + ":" + external) != child.external_id_hash:
+                raise ValueError
+        except (ValueError, UnicodeError, PermissionError):
+            return _decision(ValidationStatus.INVALID_TEST, "API_NESTED_CHILD_ID_INVALID")
+        child_hash = _digest(external)
+        relation, relation_refs = engine.fact_value(child.id, "belongs_to", target)
+        creator, creator_refs = engine.fact_value(child.id, "created_by", target)
+        relation_source = any(fact.object == parent.id and fact.source in {
+            "OBJECT_FACTORY", "NORMAL_BEHAVIOUR_LEARNER", "FIXTURE"}
+                              for fact in engine.fact(child.id, "belongs_to", target))
+        creator_source = any(fact.object == owner.identity_id and fact.source in {
+            "OBJECT_FACTORY", "FIXTURE"}
+                             for fact in engine.fact(child.id, "created_by", target))
+        tenant, tenant_refs = engine.fact_value(child_hash, "resource_tenant", target)
+        visibility, visibility_refs = engine.fact_value(child_hash, "resource_visibility", target)
+        policy, policy_refs = engine.fact_value(child_hash, "access_policy", target)
+        owner_member = engine.membership(owner.identity_id, target)
+        foreign_member = engine.membership(first.identity_id, target)
+        relationship = bool(relation == parent.id and relation_source and
+                            creator == owner.identity_id and creator_source and
+                            owner_member and foreign_member and tenant == child.tenant_id and
+                            owner_member[0] == tenant and foreign_member[0] != tenant and
+                            visibility == "PRIVATE" and policy in {"OWNER_ONLY", "TENANT_ONLY"})
+        checks = [_check("NESTED_CHILD_RELATION_AND_PRIVACY", relationship,
+                         (*relation_refs, *creator_refs, *tenant_refs,
+                          *visibility_refs, *policy_refs)[:10])]
+        if not relationship:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "API_NESTED_CHILD_PRIVACY_UNPROVEN", checks=tuple(checks))
+        parent_hash = owner.object_ref_hash
+        owner_ok = (owner.features.status_code == 200 and
+                    self._graphql_owned_data(owner, engine, parent_hash))
+        actor_ok = (actor_control.features.status_code == 200 and
+                    self._graphql_owned_data(actor_control, engine,
+                                             actor_control.object_ref_hash))
+        negative_ok = (not invalid.features.graphql_data_present and
+                       not self._graphql_owned_data(invalid, engine, parent_hash))
+        checks.extend((_check("OWNER_PARENT_CONTROL", owner_ok, owner.evidence_ids[:2]),
+                       _check("ACTOR_PARENT_CONTROL", actor_ok, actor_control.evidence_ids[:2]),
+                       _check("INVALID_PARENT_CONTROL", negative_ok, invalid.evidence_ids[:2])))
+        if not owner_ok or not actor_ok or not negative_ok:
+            return _decision(ValidationStatus.INVALID_TEST,
+                             "API_NESTED_CONTROLS_FAILED", checks=tuple(checks))
+        owner_values = self._nested_values(owner, engine, path, parent_hash, child_hash)
+        if not owner_values:
+            return _decision(ValidationStatus.INVALID_TEST,
+                             "API_NESTED_OWNER_CHILD_DATA_MISSING", checks=tuple(checks))
+        matches = tuple(item for item in (first, second) if
+                        item.features.status_code == 200 and
+                        any(self._nested_values(item, engine, path, parent_hash,
+                                                child_hash).get(key) == value
+                            for key, value in owner_values.items()))
+        checks.append(_check("PROTECTED_NESTED_CHILD_DATA", len(matches) == 2,
+                             tuple(ref for item in matches for ref in item.evidence_ids[:2])[:4]))
+        if not matches:
+            return _decision(ValidationStatus.REJECTED, "API_NESTED_CHILD_FILTERED",
+                             checks=tuple(checks), contradicting=first.evidence_ids[:2] +
+                             second.evidence_ids[:2])
+        if len(matches) == 1:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW,
+                             "API_NESTED_REPRODUCTION_REQUIRED", checks=tuple(checks),
+                             reproductions=1)
+        root_key, root_refs = engine.fact_value(child_hash, "root_cause_key", target)
+        finding = engine._finding(context, owner, first, "API_AUTHORIZATION",
+                                  "CROSS_TENANT_PROTECTED_NESTED_CHILD_READ",
+                                  root_key or operation.operation_key)
+        refs = tuple(dict.fromkeys((*owner.evidence_ids[:3], *actor_control.evidence_ids[:3],
+                                    *invalid.evidence_ids[:2], *first.evidence_ids[:3],
+                                    *second.evidence_ids[:3], *child.verification_evidence_ids,
+                                    *relation_refs, *creator_refs, *tenant_refs,
+                                    *visibility_refs, *policy_refs, *root_refs)))[:64]
+        return _decision(ValidationStatus.CONFIRMED, "API_PROTECTED_NESTED_CHILD",
+                         checks=tuple(checks), controls=("OWNER_PARENT", "ACTOR_PARENT",
+                                                        "INVALID_PARENT"),
+                         supporting=refs, reproductions=2,
+                         impact="CROSS_TENANT_PROTECTED_NESTED_CHILD_READ", finding=finding)
+
+    @staticmethod
+    def _graphql_owned_values(item: Observation, engine: DeterministicValidatorEngine,
+                              object_hash: str) -> dict[str, str]:
+        response = item.exchange.response
+        ref = engine.evidence.get_evidence(response.body_evidence_id) if response and response.body_evidence_id else None
+        if (ref is None or ref.target_ref != item.exchange.target_id or
+                ref.redaction_status.value != "ORIGINAL" or ref.content_size > 262144 or
+                ref.content_hash != response.body_hash):
+            return {}
+        try:
+            body = json.loads(engine.evidence.read_content(
+                ref.evidence_id, allow_sensitive=True, max_bytes=262144),
+                object_pairs_hook=GraphQLValidator._unique_pairs)
+            data = body.get("data") if isinstance(body, dict) else None
+            pending: list[tuple[object, int]] = [(data, 0)]
+            visits = 0
+            while pending:
+                value, depth = pending.pop()
+                visits += 1
+                if visits > 512 or depth > 10:
+                    return {}
+                if isinstance(value, dict):
+                    if isinstance(value.get("id"), str) and _digest(value["id"]) == object_hash:
+                        return {key: _digest(json.dumps(field, sort_keys=True,
+                                                        ensure_ascii=True)) for key, field in
+                                list(value.items())[:24] if key not in {
+                                    "id", "__typename", "type", "tenant", "tenantId",
+                                    "owner", "ownerId"}
+                                and field is not None and isinstance(field, (str, int, float, bool))}
+                    pending.extend((child, depth + 1) for child in value.values())
+                elif isinstance(value, list):
+                    pending.extend((child, depth + 1) for child in value[:16])
+        except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+            return {}
+        return {}
+
+    @staticmethod
+    def _graphql_owned_data(item: Observation, engine: DeterministicValidatorEngine,
+                            object_hash: str, field_path: str | None = None) -> bool:
+        response = item.exchange.response
+        ref = engine.evidence.get_evidence(response.body_evidence_id) if response and response.body_evidence_id else None
+        if (ref is None or ref.target_ref != item.exchange.target_id or
+                ref.redaction_status.value != "ORIGINAL" or ref.content_size > 262144 or
+                ref.content_hash != response.body_hash):
+            return False
+        try:
+            body = json.loads(engine.evidence.read_content(ref.evidence_id, allow_sensitive=True,
+                                                           max_bytes=262144),
+                              object_pairs_hook=GraphQLValidator._unique_pairs)
+            data = body.get("data") if isinstance(body, dict) else None
+            if field_path:
+                parts = field_path.strip("/").split("/")
+                if (not isinstance(data, dict) or len(parts) not in {2, 3} or
+                        any(not part or part in {".", ".."} for part in parts)):
+                    return False
+                root = data.get(parts[0])
+                if (not isinstance(root, dict) or not isinstance(root.get("id"), str) or
+                        _digest(root["id"]) != object_hash):
+                    return False
+                parent = root
+                for part in parts[1:-1]:
+                    parent = parent.get(part) if isinstance(parent, dict) else None
+                    if (not isinstance(parent, dict) or
+                            "id" in parent and
+                            (not isinstance(parent["id"], str) or
+                             _digest(parent["id"]) != object_hash)):
+                        return False
+                value = parent.get(parts[-1]) if isinstance(parent, dict) else None
+                return value is not None and isinstance(value, (str, int, float, bool))
+            pending: list[tuple[object, int]] = [(data, 0)]
+            visits = 0
+            while pending:
+                value, depth = pending.pop()
+                visits += 1
+                if visits > 512 or depth > 10:
+                    return False
+                if isinstance(value, dict):
+                    if isinstance(value.get("id"), str) and _digest(value["id"]) == object_hash:
+                        return True
+                    pending.extend((nested, depth + 1) for nested in value.values())
+                elif isinstance(value, list):
+                    pending.extend((nested, depth + 1) for nested in value[:16])
+        except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
+            return False
+        return False
+
+    def evaluate(self, context: ValidationContext,
+                 engine: DeterministicValidatorEngine) -> ValidatorDecision:
+        frozen = context.plan.get("api_binding")
+        if (engine.api_operations is None or not isinstance(frozen, dict) or
+                context.plan.get("skill_id") != "api-observed-read"):
+            return _decision(ValidationStatus.INVALID_TEST, "API_BINDING_MISSING")
+        candidate = engine.api_operations.get_candidate(context.run.target_id,
+                                                        frozen.get("candidate_id", ""))
+        operation = engine.api_operations.get_operation(context.run.target_id,
+                                                        frozen.get("operation_id", ""))
+        if (candidate is None or operation is None or candidate.operation_id != operation.id or
+                candidate.plan_id != context.run.plan_id or
+                candidate.category != frozen.get("category") or
+                operation.version_hash != frozen.get("version_hash") or
+                operation.state != "CURRENT" or operation.package_id != context.run.package_id or
+                candidate.category not in {"OBJECT_AUTH", "FIELD_AUTH", "NESTED_AUTH",
+                                           "BATCH_AUTH"}):
+            return _decision(ValidationStatus.INVALID_TEST, "API_OPERATION_STALE_OR_UNBOUND")
+        observations = sorted(context.observations,
+                              key=lambda item: item.step.action_slot if item.step.action_slot is not None else 99)
+        if (len(observations) != 5 or
+                tuple(item.step.action_slot for item in observations) != (0, 1, 2, 3, 4) or
+                tuple(item.step.role for item in observations) !=
+                ("CONTROL", "CONTROL", "OTHER", "BOUNDARY", "BOUNDARY") or
+                not all(item.audit_valid for item in observations)):
+            return _decision(ValidationStatus.INVALID_TEST, "API_AUDIT_OR_CONTROLS_MISSING")
+        owner, actor_control, invalid, first, second = observations
+        templates = context.plan.get("request_templates")
+        alternate = ("actor_control_operation_id" in frozen or
+                     "actor_control_version_hash" in frozen)
+        actor_operation = (engine.api_operations.get_operation(
+            context.run.target_id, frozen.get("actor_control_operation_id", ""))
+            if alternate else operation)
+        if (actor_operation is None or actor_operation.state != "CURRENT" or
+                actor_operation.package_id != context.run.package_id or
+                (alternate and (candidate.category != "FIELD_AUTH" or
+                                actor_operation.id == operation.id or
+                                actor_operation.type is not APIOperationType.GRAPHQL_QUERY or
+                                actor_operation.endpoint != operation.endpoint or
+                                actor_operation.method != operation.method or
+                                actor_operation.name != operation.name or
+                                actor_operation.version_hash != frozen.get(
+                                    "actor_control_version_hash")))):
+            return _decision(ValidationStatus.INVALID_TEST, "API_FIELD_CONTROL_OPERATION_INVALID")
+        if (not isinstance(templates, list) or len(templates) != 5 or
+                any(not isinstance(shape, dict) or shape.get("binding") != (
+                        "API_OBSERVED_BATCH_V1" if candidate.category == "BATCH_AUTH" else
+                        "API_OBSERVED_READ_V1") or
+                    shape.get("operation_id") != (actor_operation.id if index == 1 else operation.id) or
+                    shape.get("version_hash") != (actor_operation.version_hash if index == 1
+                                                  else operation.version_hash) or
+                    shape.get("field_path") != ("" if alternate and index == 1 else
+                                                frozen.get("field_path"))
+                    for index, shape in enumerate(templates)) or
+                (alternate and templates[1].get("source_exchange_id") not in
+                 actor_operation.exchange_ids) or
+                tuple(shape.get("variant") for shape in templates) !=
+                ("OWNER", "OWNER", "INVALID_OBJECT", "FOREIGN", "FOREIGN") or
+                owner.identity_id != invalid.identity_id or
+                actor_control.identity_id != first.identity_id or
+                first.identity_id != second.identity_id or
+                owner.identity_id == first.identity_id or
+                owner.object_ref_hash is None or
+                owner.object_ref_hash != first.object_ref_hash or
+                owner.object_ref_hash != second.object_ref_hash or
+                actor_control.object_ref_hash is None or
+                actor_control.object_ref_hash == owner.object_ref_hash or
+                any(item.operation != (actor_operation.id if index == 1 else operation.id)
+                    for index, item in enumerate(observations)) or
+                any(item.features.request_method != operation.method for item in observations)):
+            return _decision(ValidationStatus.INVALID_TEST, "API_CONTROL_BINDING_INVALID")
+        if alternate:
+            owner_document = self._executed_query(owner, engine)
+            actor_document = self._executed_query(actor_control, engine)
+            if (owner_document is None or actor_document is None or
+                    hashlib.sha256(owner_document.encode()).hexdigest() != operation.version_hash or
+                    hashlib.sha256(actor_document.encode()).hexdigest() != actor_operation.version_hash or
+                    not observed_field_selection_pair(owner_document, actor_document,
+                                                       frozen.get("field_path", ""))):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "API_FIELD_SELECTION_DIFFERENTIAL_INVALID")
+        if candidate.category == "NESTED_AUTH":
+            return self._evaluate_nested(context, engine, candidate, operation,
+                                         tuple(observations), frozen)
+        if candidate.category == "BATCH_AUTH":
+            return self._evaluate_batch(context, engine, candidate, operation,
+                                        tuple(observations), frozen)
+        target = context.run.target_id
+        obj_hash = owner.object_ref_hash
+        owner_member = engine.membership(owner.identity_id, target)
+        foreign_member = engine.membership(first.identity_id, target)
+        tenant, tenant_refs = engine.fact_value(obj_hash, "resource_tenant", target)
+        visibility, visibility_refs = engine.fact_value(obj_hash, "resource_visibility", target)
+        policy, policy_refs = engine.fact_value(obj_hash, "access_policy", target)
+        if visibility == "PUBLIC":
+            return _decision(ValidationStatus.REJECTED, "API_OBJECT_PUBLIC",
+                             contradicting=visibility_refs)
+        relationship = bool(owner_member and foreign_member and tenant and
+                            owner_member[0] == tenant and foreign_member[0] != tenant and
+                            visibility == "PRIVATE" and policy in {"OWNER_ONLY", "TENANT_ONLY"})
+        checks = [
+            _check("OWNER_CONTROL", owner.features.status_code is not None and
+                   200 <= owner.features.status_code < 300, owner.evidence_ids[:2]),
+            _check("ACTOR_OWNED_CONTROL", actor_control.features.status_code is not None and
+                   200 <= actor_control.features.status_code < 300,
+                   actor_control.evidence_ids[:2]),
+            _check("TENANT_PRIVACY_BOUNDARY", relationship,
+                   (*tenant_refs, *visibility_refs, *policy_refs)[:6]),
+        ]
+        if not relationship:
+            return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                             "API_OWNERSHIP_OR_PRIVACY_UNPROVEN", checks=tuple(checks))
+        graphql = operation.type is APIOperationType.GRAPHQL_QUERY
+        def has_object(item: Observation, expected: str) -> bool:
+            if item.features.status_code is None or not 200 <= item.features.status_code < 300:
+                return False
+            if graphql:
+                return self._graphql_owned_data(item, engine, expected)
+            return expected in item.features.object_id_hashes and bool(item.features.normalized_json_hash)
+        owner_ok = has_object(owner, obj_hash)
+        actor_ok = has_object(actor_control, actor_control.object_ref_hash)
+        checks[0] = _check("OWNER_CONTROL", owner_ok, owner.evidence_ids[:2])
+        checks[1] = _check("ACTOR_OWNED_CONTROL", actor_ok, actor_control.evidence_ids[:2])
+        if not owner_ok or not actor_ok:
+            return _decision(ValidationStatus.INVALID_TEST, "API_SEMANTIC_CONTROL_FAILED",
+                             checks=tuple(checks))
+        negative_ok = not has_object(invalid, obj_hash) and (
+            invalid.features.status_code in _DENIED if not graphql else
+            not invalid.features.graphql_data_present)
+        checks.append(_check("INVALID_OBJECT_CONTROL", negative_ok, invalid.evidence_ids[:2]))
+        if not negative_ok:
+            return _decision(ValidationStatus.INVALID_TEST, "API_NEGATIVE_CONTROL_FAILED",
+                             checks=tuple(checks))
+        field_path = frozen.get("field_path", "")
+        if candidate.category == "FIELD_AUTH":
+            classification, class_refs = engine.fact_value(obj_hash, "data_classification", target)
+            field_name = field_path.rsplit("/", 1)[-1]
+            field_visibility, field_refs = engine.fact_value(obj_hash, "field_visibility", target)
+            field_protected = bool(field_path and classification == "SENSITIVE" and
+                                   (field_visibility == field_name or
+                                    isinstance(field_visibility, str) and
+                                    field_visibility.startswith(field_name + ":")))
+            checks.append(_check("PROTECTED_FIELD_POLICY", field_protected,
+                                 (*class_refs, *field_refs)[:4]))
+            if not field_protected:
+                return _decision(ValidationStatus.INSUFFICIENT_EVIDENCE,
+                                 "API_FIELD_EXPECTATION_UNKNOWN", checks=tuple(checks))
+            owner_value = owner.features.graphql_value(field_path)
+            if not self._graphql_owned_data(owner, engine, obj_hash, field_path):
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "API_FIELD_OWNER_BINDING_INVALID", checks=tuple(checks))
+            def disclosed(item: Observation) -> bool:
+                return bool(owner_value and
+                            self._graphql_owned_data(item, engine, obj_hash, field_path) and
+                            item.features.graphql_value(field_path) == owner_value)
+        else:
+            owner_values = self._graphql_owned_values(owner, engine, obj_hash) if graphql else {}
+            if graphql and not owner_values:
+                return _decision(ValidationStatus.INVALID_TEST,
+                                 "API_OBJECT_OWNER_DATA_MISSING", checks=tuple(checks))
+            def disclosed(item: Observation) -> bool:
+                if not has_object(item, obj_hash):
+                    return False
+                if graphql:
+                    values = self._graphql_owned_values(item, engine, obj_hash)
+                    return any(values.get(key) == value for key, value in owner_values.items())
+                return bool(item.features.normalized_json_hash and
+                            item.features.normalized_json_hash == owner.features.normalized_json_hash)
+        matches = tuple(item for item in (first, second) if disclosed(item))
+        checks.append(_check("PROTECTED_DATA", len(matches) == 2,
+                             tuple(ref for item in matches for ref in item.evidence_ids[:2])[:4]))
+        if len(matches) == 0:
+            return _decision(ValidationStatus.REJECTED, "API_BOUNDARY_DENIED",
+                             checks=tuple(checks), contradicting=first.evidence_ids[:2] +
+                             second.evidence_ids[:2])
+        if len(matches) == 1:
+            return _decision(ValidationStatus.NEEDS_MANUAL_REVIEW, "API_REPRODUCTION_REQUIRED",
+                             checks=tuple(checks), reproductions=1)
+        refs = tuple(dict.fromkeys((*owner.evidence_ids[:3], *actor_control.evidence_ids[:3],
+                                    *invalid.evidence_ids[:2], *first.evidence_ids[:3],
+                                    *second.evidence_ids[:3], *tenant_refs,
+                                    *visibility_refs, *policy_refs,
+                                    *(owner_member[2] if owner_member else ()),
+                                    *(foreign_member[2] if foreign_member else ()))))[:64]
+        root_key, root_refs = engine.fact_value(obj_hash, "root_cause_key", target)
+        if not root_key:
+            root_key = operation.operation_key
+        refs = tuple(dict.fromkeys((*refs, *root_refs)))[:64]
+        impact = ("CROSS_TENANT_PROTECTED_FIELD_READ" if candidate.category == "FIELD_AUTH" else
+                  "CROSS_TENANT_PROTECTED_OBJECT_READ")
+        finding = engine._finding(context, owner, first, "API_AUTHORIZATION", impact,
+                                  root_key)
+        return _decision(ValidationStatus.CONFIRMED, "API_PROTECTED_BOUNDARY",
+                         checks=tuple(checks), controls=("OWNER", "ACTOR_OWNED", "INVALID_OBJECT"),
+                         supporting=refs, reproductions=2, impact=impact, finding=finding)
 
 
 class ExposureFieldValidator:

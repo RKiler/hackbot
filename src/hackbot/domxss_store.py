@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -235,15 +237,54 @@ class DOMXSSStore:
         return self._asset(row) if row else None
 
     def list_current_assets(self, target_id: str, *, limit: int = 50) -> tuple[DOMAssetRecord, ...]:
+        items, _ = self.page_current_assets(target_id, limit=limit)
+        return items
+
+    @staticmethod
+    def cursor_after_current_asset(asset: DOMAssetRecord) -> str:
+        if asset.state != "CURRENT":
+            raise ValueError("Only current assets can advance inventory")
+        encoded = json.dumps([asset.target_id, asset.retrieved_at.isoformat(),
+                              asset.artifact_id], separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+
+    def page_current_assets(self, target_id: str, *, limit: int = 50,
+                            cursor: str | None = None
+                            ) -> tuple[tuple[DOMAssetRecord, ...], str | None]:
         if type(limit) is not int or not 1 <= limit <= 50:
             raise ValueError("Current asset inventory limit must be 1..50")
+        marker: tuple[str, str] | None = None
+        if cursor is not None:
+            if len(cursor) > 512 or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor):
+                raise ValueError("Invalid current asset cursor")
+            try:
+                raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4),
+                                       altchars=b"-_", validate=True)
+                parts = json.loads(raw)
+                if (not isinstance(parts, list) or len(parts) != 3 or
+                        parts[0] != target_id or not isinstance(parts[1], str) or
+                        len(parts[1]) > 64 or datetime.fromisoformat(parts[1]).tzinfo is None or
+                        not isinstance(parts[2], str) or
+                        not re.fullmatch(r"DOMART-[0-9a-f]{32}", parts[2])):
+                    raise ValueError
+                marker = parts[1], parts[2]
+            except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+                raise ValueError("Invalid current asset cursor") from exc
+        condition = (" AND (retrieved_at<? OR (retrieved_at=? AND artifact_id<?))"
+                     if marker else "")
+        params = ((target_id, marker[0], marker[0], marker[1], limit + 1)
+                  if marker else (target_id, limit + 1))
         with self.evidence._connection() as connection:
             rows = connection.execute("""SELECT * FROM dom_js_artifacts
                 WHERE target_id=? AND state='CURRENT' AND (recon_sha256=artifact_sha256
-                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))
-                ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?""",
-                (target_id, limit)).fetchall()
-        return tuple(self._asset(row) for row in rows)
+                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))""" +
+                condition + " ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?",
+                params).fetchall()
+        items = tuple(self._asset(row) for row in rows[:limit])
+        next_cursor = None
+        if len(rows) > limit and items:
+            next_cursor = self.cursor_after_current_asset(items[-1])
+        return items, next_cursor
 
     def get_source_map(self, target_id: str, js_artifact_id: str) -> DOMSourceMapRecord | None:
         with self.evidence._connection() as connection:

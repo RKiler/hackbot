@@ -18,6 +18,7 @@ import uuid
 from unittest.mock import Mock, patch
 
 from hackbot.browser import IdentityObservation
+from hackbot.api_registry import APICandidate, APIOperationType
 from hackbot.config import (BrowserSettings, BurpSettings, SecretBindingConfig,
                             SecretSettings, TargetSettings, load_config)
 from hackbot.domxss import DOMAcquisitionStatus
@@ -509,9 +510,74 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(self.client.post("/v1/authorization/example/hunts", json={
                 "mode": "PLAN_ONLY", "candidate_limit": 500}).status_code, 400)
 
+    def test_api_specialist_routes_are_target_scoped_and_local_only(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        base = "/v1/api/example"
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            coverage = self.get(base + "/coverage")
+            self.assertEqual(coverage["counts"]["operations_current"], 0)
+            self.assertEqual(coverage["metrics"]["plans"], 0)
+            self.assertEqual(coverage["metrics"]["requests"], 0)
+            self.assertEqual(coverage["inventory_more"], {
+                "traffic": False, "js": False, "operations": False})
+            self.assertEqual(self.get(base + "/operations")["items"], [])
+            self.assertEqual(self.get(base + "/candidates")["items"], [])
+            analyzed = self.client.post(base + "/analyze", json={"mode": "PLAN_ONLY",
+                "limits": {"traffic": 5, "js_assets": 2, "recon_surfaces": 2, "candidates": 2}})
+            self.assertEqual(analyzed.status_code, 201, analyzed.get_data(as_text=True))
+            self.assertEqual(analyzed.get_json()["items"], [])
+            self.assertEqual(self.client.post(base + "/analyze", json={
+                "limits": {"traffic": 151}}).status_code, 400)
+            self.assertEqual(self.client.post(base + "/analyze", json={
+                "mode": "BOUNDED_AUTONOMOUS"}).status_code, 201)
+            self.assertEqual(self.client.post(base + "/analyze", json={
+                "query": "{ users { id } }"}).status_code, 400)
+            self.assertEqual(self.client.post(base + "/query", json={
+                "query": "{ users { id } }"}).status_code, 404)
+            self.assertEqual(self.client.get("/v1/api/not-here/coverage").status_code, 404)
+            self.assertEqual(self.client.get(base + "/operations/APIO-invalid").status_code, 404)
+            self.assertEqual(self.client.get(base + "/candidates/APIC-invalid").status_code, 404)
+            for number in range(3):
+                self.runtime.api_operations.upsert_operation(
+                    target_id=self.runtime.package("example").target.id,
+                    package_id="example", name=f"PageTest{number}",
+                    kind=APIOperationType.REST,
+                    endpoint=f"https://app.example.com/api/items/{number}",
+                    method="GET", version_hash=hashlib.sha256(str(number).encode()).hexdigest(),
+                    observed_at=f"2026-01-01T00:00:0{number}+00:00")
+            first = self.get(base + "/operations?limit=2")
+            self.assertEqual(len(first["items"]), 2)
+            self.assertIsNotNone(first["next_cursor"])
+            second = self.get(base + "/operations?limit=2&cursor=" + first["next_cursor"])
+            self.assertEqual(len(second["items"]), 1)
+            self.assertIsNone(second["next_cursor"])
+            self.assertFalse({item["id"] for item in first["items"]} &
+                             {item["id"] for item in second["items"]})
+            selected = first["items"][0]
+            self.runtime.api_operations.upsert_candidate(APICandidate(
+                id="APIC-service-fixture", target_id=self.runtime.package("example").target.id,
+                operation_id=selected["id"], category="OBJECT_AUTH",
+                boundary_identity_id=None, owner_identity_id=None,
+                test_object_id=None, owner_exchange_id=None, field_path=None,
+                score=50, reasons=("FIXTURE",), gaps=("OBJECT_OWNERSHIP_UNKNOWN",),
+                status="PLAN_ONLY"))
+            detail = self.get(base + "/operations/" + selected["id"])
+            self.assertEqual([item["id"] for item in detail["candidates"]],
+                             ["APIC-service-fixture"])
+            self.assertEqual([item["id"] for item in self.get(
+                base + "/candidates?operation_id=" + selected["id"])["items"]],
+                ["APIC-service-fixture"])
+            self.assertEqual(self.client.get(base + "/candidates?operation_id=APIO-invalid")
+                             .status_code, 404)
+            focused = self.client.post(base + "/analyze", json={
+                "mode": "PLAN_ONLY", "operation_id": selected["id"]})
+            self.assertEqual(focused.status_code, 201)
+            self.assertEqual({item["operation_id"] for item in focused.get_json()["items"]},
+                             {selected["id"]})
+
     def test_skill_routes_are_target_scoped_and_never_execute(self):
         catalog = self.get("/v1/skills")["items"]
-        self.assertEqual(len(catalog), 18)
+        self.assertEqual(len(catalog), 19)
         self.assertTrue(all(item["status"] == "PLAN_ONLY" for item in catalog))
         detail = self.get("/v1/skills/check-before-transform-dom-xss")
         self.assertEqual(detail["execution"], "PLAN_ONLY")

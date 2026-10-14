@@ -14,13 +14,14 @@ from urllib.parse import urlsplit
 import uuid
 
 from .authorization_binding import reference_fingerprint
+from .api_binding import api_batch_reference_fingerprint, api_reference_fingerprint
 from .domxss_static import DOMCandidateStatus
 from .domxss_store import DOMXSSStore
 from .exposure_store import ExposureStore
 from .exposure_models import ExposureCategory, ExposureStatus
 from .postmessage_static import MessageCandidateStatus
 from .postmessage_store import PostMessageStore
-from .mutation_binding import MutationStage, STAGES, mutation_fingerprint
+from .mutation_binding import DELETE_STAGES, MutationStage, STAGES, mutation_fingerprint
 from .executor import RequestTemplate
 from .hypotheses import Hypothesis
 from .identity_registry import IdentityRegistry
@@ -433,6 +434,7 @@ class InvestigationPlan:
     dom_binding: dict[str, str] | None = None
     message_binding: dict[str, str] | None = None
     exposure_binding: dict[str, str] | None = None
+    api_binding: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "hypothesis_id": self.hypothesis_id, "skill_id": self.skill_id,
@@ -455,6 +457,7 @@ class InvestigationPlan:
                 "dom_binding": self.dom_binding,
                 "message_binding": self.message_binding,
                 "exposure_binding": self.exposure_binding,
+                "api_binding": self.api_binding,
                 "execution_started": False, "finding_status": "UNVALIDATED"}
 
 
@@ -479,6 +482,25 @@ class AuthorizationPlanBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class APIReadPlanBinding:
+    operation_id: str
+    version_hash: str
+    source_exchange_id: str
+    test_object_id: str
+    object_type: str
+    object_ref_hash: str
+    method: str
+    identity_id: str
+    session_id: str
+    role: str
+    variant: str
+    variable_name: str = ""
+    field_path: str = ""
+    source_companion_id: str = ""
+    companion_object_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class TypedMutationPlanBinding:
     test_object_id: str
     object_type: str
@@ -494,6 +516,10 @@ class TypedMutationPlanBinding:
     boundary_identity_id: str
     boundary_session_id: str
     boundary: str
+    parent_object_id: str | None = None
+    foreign_parent_object_id: str | None = None
+    delete_control_object_id: str | None = None
+    delete_control_ref_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1007,6 +1033,143 @@ class SkillPlanner:
             skill.metadata.token_budget, status, datetime.now(timezone.utc).isoformat())
         return self.store.save(plan, regenerate=regenerate)
 
+    def bind_api_read(self, package: TargetPackage, hypothesis: Hypothesis,
+                      context: SkillContext, candidate_id: str, category: str,
+                      bindings: tuple[APIReadPlanBinding, ...], *,
+                      nested_child_id: str | None = None,
+                      nested_path: str | None = None,
+                      batch_root_key: str | None = None,
+                      batch_id_type: str | None = None,
+                      batch_envelope: str | None = None) -> dict[str, object]:
+        """Freeze a five-request, observed-operation comparison without request bytes."""
+        if hypothesis.target_id != package.target.id or context.target_id != package.target.id:
+            raise ValueError("API plan target mismatch")
+        skill = self.registry.select("api-observed-read")
+        prerequisite = self.checker.check(skill.metadata, context)
+        if prerequisite.state is not PrerequisiteState.READY:
+            raise ValueError("API read prerequisites are not ready")
+        if (category not in {"OBJECT_AUTH", "FIELD_AUTH", "NESTED_AUTH", "BATCH_AUTH", "BFLA"}
+                or len(bindings) != 5 or skill.metadata.request_budget < 5
+                or tuple(item.role for item in bindings) !=
+                ("CONTROL", "CONTROL", "OTHER", "BOUNDARY", "BOUNDARY")
+                or tuple(item.variant for item in bindings) !=
+                ("OWNER", "OWNER", "INVALID_OBJECT", "FOREIGN", "FOREIGN")
+                or len({item.operation_id for index, item in enumerate(bindings) if index != 1}) != 1
+                or len({item.version_hash for index, item in enumerate(bindings) if index != 1}) != 1
+                or len({item.method for item in bindings}) != 1
+                or len({item.field_path for index, item in enumerate(bindings) if index != 1}) != 1
+                or (bindings[1].operation_id != bindings[0].operation_id and
+                    (category != "FIELD_AUTH" or bindings[1].field_path or
+                     bindings[1].version_hash == bindings[0].version_hash))
+                or (bindings[1].operation_id == bindings[0].operation_id and
+                    (bindings[1].version_hash != bindings[0].version_hash or
+                     bindings[1].field_path != bindings[0].field_path))
+                or bindings[0].test_object_id != bindings[2].test_object_id
+                or bindings[0].test_object_id != bindings[3].test_object_id
+                or bindings[0].test_object_id != bindings[4].test_object_id
+                or bindings[1].test_object_id == bindings[0].test_object_id
+                or bindings[0].identity_id != bindings[2].identity_id
+                or bindings[1].identity_id != bindings[3].identity_id
+                or bindings[1].identity_id != bindings[4].identity_id
+                or category == "FIELD_AUTH" and not bindings[0].field_path
+                or category != "FIELD_AUTH" and bindings[0].field_path
+                or category == "NESTED_AUTH" and (
+                    not nested_child_id or not nested_path or
+                    not re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*/[A-Za-z_][A-Za-z0-9_]*",
+                                     nested_path))
+                or category != "NESTED_AUTH" and (nested_child_id or nested_path)):
+            raise ValueError("API read controls are incomplete")
+        if category == "BATCH_AUTH":
+            if (not batch_root_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", batch_root_key)
+                    or not batch_id_type or not re.fullmatch(
+                        r"(?:PLAIN|[A-Za-z_][A-Za-z0-9_]{0,63})", batch_id_type)
+                    or batch_envelope not in {"NODES_LIST", "OPERATION_ARRAY"}
+                    or any(item.method != "POST" or not item.variable_name or
+                           not item.source_companion_id or not item.companion_object_id
+                           for item in bindings)
+                    or bindings[0].source_companion_id != bindings[0].companion_object_id
+                    or bindings[1].source_companion_id != bindings[1].companion_object_id
+                    or bindings[2].source_companion_id != bindings[0].source_companion_id
+                    or bindings[3].source_companion_id != bindings[0].source_companion_id
+                    or bindings[4].source_companion_id != bindings[0].source_companion_id
+                    or bindings[2].companion_object_id != bindings[0].companion_object_id
+                    or bindings[3].companion_object_id != bindings[1].test_object_id
+                    or bindings[4].companion_object_id != bindings[1].test_object_id
+                    or bindings[0].source_exchange_id != bindings[2].source_exchange_id
+                    or bindings[0].source_exchange_id != bindings[3].source_exchange_id
+                    or bindings[0].source_exchange_id != bindings[4].source_exchange_id):
+                raise ValueError("API batch controls are incomplete")
+        elif (batch_root_key or batch_id_type or batch_envelope or
+              any(item.source_companion_id or item.companion_object_id for item in bindings)):
+            raise ValueError("Unexpected API batch binding")
+        frozen = {"candidate_id": candidate_id, "category": category,
+                  "operation_id": bindings[0].operation_id,
+                  "version_hash": bindings[0].version_hash,
+                  "field_path": bindings[0].field_path}
+        if bindings[1].operation_id != bindings[0].operation_id:
+            frozen["actor_control_operation_id"] = bindings[1].operation_id
+            frozen["actor_control_version_hash"] = bindings[1].version_hash
+        if category == "NESTED_AUTH":
+            frozen["nested_child_id"] = nested_child_id
+            frozen["nested_path"] = nested_path
+        if category == "BATCH_AUTH":
+            frozen.update({"batch_root_key": batch_root_key,
+                           "batch_id_type": batch_id_type,
+                           "batch_envelope": batch_envelope})
+        actions: list[dict[str, object]] = []
+        templates: list[dict[str, str]] = []
+        for item in bindings:
+            if (not item.identity_id or not item.session_id or
+                    not re.fullmatch(r"[0-9a-f]{64}", item.object_ref_hash) or
+                    not re.fullmatch(r"[0-9a-f]{64}", item.version_hash) or
+                    item.method not in {"GET", "HEAD", "POST"} or
+                    item.method == "POST" and not item.variable_name.isidentifier() or
+                    item.method != "POST" and item.variable_name):
+                raise ValueError("API read binding is unsafe")
+            shape = {"binding": "API_OBSERVED_READ_V1", "operation_id": item.operation_id,
+                     "version_hash": item.version_hash,
+                     "source_exchange_id": item.source_exchange_id,
+                     "test_object_id": item.test_object_id, "variant": item.variant,
+                     "variable_name": item.variable_name, "field_path": item.field_path,
+                     "method": item.method, "authentication": "EXECUTOR_SUPPLIED"}
+            if category == "BATCH_AUTH":
+                shape.update({"binding": "API_OBSERVED_BATCH_V1",
+                              "source_companion_id": item.source_companion_id,
+                              "companion_object_id": item.companion_object_id,
+                              "root_key": batch_root_key, "id_type": batch_id_type,
+                              "envelope": batch_envelope})
+            shape["fingerprint"] = (api_batch_reference_fingerprint(shape)
+                                    if category == "BATCH_AUTH" else
+                                    api_reference_fingerprint(shape))
+            templates.append(shape)
+            actions.append({"category": "AUTHORIZATION_TEST" if item.role == "BOUNDARY" or
+                            item.method == "POST" else "SAFE_READ", "actor": "AUTHENTICATED",
+                            "identity_id": item.identity_id, "session_id": item.session_id,
+                            "method": item.method, "operation": item.operation_id,
+                            "object_type": item.object_type,
+                            "object_ref_hash": item.object_ref_hash,
+                            "disposable_intent": True,
+                            "cross_identity": item.variant == "FOREIGN",
+                            "role": item.role,
+                            "control_kind": "INVALID_OBJECT" if item.variant == "INVALID_OBJECT" else None,
+                            "vulnerability_class": skill.metadata.vulnerability_classes[0].lower(),
+                            "request_template_fingerprint": shape["fingerprint"],
+                            "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True})
+        steps = ((StepType.OBSERVE, "Review the observed API operation and owned controls."),
+                 *((StepType.EXECUTE_REQUEST, "Execute one bound API read.") for _ in bindings),
+                 (StepType.COMPARE_RESPONSE, "Compare semantic object and field data."))
+        plan = InvestigationPlan(
+            "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
+            skill.metadata.version, skill.content_hash, skill.metadata.category,
+            skill.metadata.vulnerability_classes, skill.metadata.prerequisites,
+            skill.metadata.required_validators, package.target.id, True, prerequisite,
+            skill.controls, steps, tuple(actions), tuple(templates), skill.positive_signals,
+            skill.negative_signals, skill.evidence_requirements, skill.confirmation_requirements,
+            skill.rejection_conditions, skill.metadata.risk, 5, skill.metadata.token_budget,
+            "READY_FOR_MANUAL_REVIEW", datetime.now(timezone.utc).isoformat(),
+            ({"control_slot": 0, "boundary_slot": 3},), api_binding=frozen)
+        return self.store.save(plan, regenerate=True)
+
     def bind_authorization(self, package: TargetPackage, hypothesis: Hypothesis,
                            context: SkillContext, skill_id: str,
                            bindings: tuple[AuthorizationPlanBinding, ...],
@@ -1154,17 +1317,33 @@ class SkillPlanner:
         prerequisite = self.checker.check(skill.metadata, context)
         if prerequisite.state is not PrerequisiteState.READY:
             raise ValueError("typed mutation prerequisites are not ready")
-        if (binding.mutation_type != "RENAME" or binding.write_method not in {"PATCH", "PUT", "POST"}
+        deleting = binding.mutation_type == "DELETE_DISPOSABLE"
+        stages = DELETE_STAGES if deleting else STAGES
+        if (binding.mutation_type not in {"RENAME", "DELETE_DISPOSABLE"} or
+                binding.write_method not in ({"DELETE"} if deleting else {"PATCH", "PUT", "POST"})
                 or binding.boundary not in {"CROSS_TENANT", "HORIZONTAL", "VERTICAL",
                                              "HIDDEN_FUNCTION", "GRAPHQL_MUTATION"}
                 or binding.owner_identity_id == binding.boundary_identity_id
                 or not re.fullmatch(r"[0-9a-f]{64}", binding.object_ref_hash)
                 or not re.fullmatch(r"[0-9a-f]{64}", binding.recipe_hash)
-                or len(STAGES) != skill.metadata.request_budget):
+                or len(stages) > skill.metadata.request_budget):
             raise ValueError("typed mutation plan binding is unsafe")
+        nested = bool(binding.parent_object_id or binding.foreign_parent_object_id)
+        if (deleting and (nested or not binding.delete_control_object_id or
+                          binding.delete_control_object_id == binding.test_object_id or
+                          not isinstance(binding.delete_control_ref_hash, str) or
+                          not re.fullmatch(r"[0-9a-f]{64}", binding.delete_control_ref_hash)) or
+                not deleting and (binding.delete_control_object_id or
+                                  binding.delete_control_ref_hash)):
+            raise ValueError("delete mutation needs a distinct verified control object")
+        if (nested and (binding.write_method != "POST" or
+                        not binding.parent_object_id or not binding.foreign_parent_object_id or
+                        len({binding.test_object_id, binding.parent_object_id,
+                             binding.foreign_parent_object_id}) != 3)):
+            raise ValueError("nested mutation needs two distinct verified parents")
         actions: list[dict[str, object]] = []
         templates: list[dict[str, str]] = []
-        for stage in STAGES:
+        for stage in stages:
             boundary = stage is MutationStage.BOUNDARY_MUTATE
             mutating = stage in {MutationStage.OWNER_MUTATE,
                                  MutationStage.BOUNDARY_MUTATE, MutationStage.RESTORE}
@@ -1174,9 +1353,18 @@ class SkillPlanner:
                      "mutation_type": binding.mutation_type, "stage": stage.value,
                      "method": binding.write_method if mutating else "GET",
                      "authentication": "EXECUTOR_SUPPLIED"}
+            if nested:
+                shape["parent_object_id"] = binding.parent_object_id
+                shape["foreign_parent_object_id"] = binding.foreign_parent_object_id
+            if deleting:
+                shape["delete_control_object_id"] = binding.delete_control_object_id
             shape["fingerprint"] = mutation_fingerprint(shape)
             templates.append(shape)
-            actions.append({"category": "OBJECT_UPDATE" if mutating else "SAFE_READ",
+            control_object = deleting and stage in {
+                MutationStage.BEFORE_READ, MutationStage.OWNER_MUTATE,
+                MutationStage.OWNER_READBACK}
+            actions.append({"category": ("OBJECT_DELETE" if deleting else "OBJECT_UPDATE")
+                            if mutating else "SAFE_READ",
                             "actor": "AUTHENTICATED",
                             "identity_id": (binding.boundary_identity_id if boundary else
                                             binding.owner_identity_id),
@@ -1185,17 +1373,19 @@ class SkillPlanner:
                             "method": shape["method"],
                             "operation": binding.write_operation if mutating else binding.read_operation,
                             "object_type": binding.object_type,
-                            "object_ref_hash": binding.object_ref_hash,
+                            "object_ref_hash": (binding.delete_control_ref_hash if control_object
+                                                else binding.object_ref_hash),
                             "disposable_intent": True, "cross_identity": boundary,
                             "role": ("BOUNDARY" if boundary else "CONTROL" if stage in {
                                 MutationStage.BEFORE_READ, MutationStage.OWNER_MUTATE,
-                                MutationStage.OWNER_READBACK} else "OTHER"),
+                                MutationStage.OWNER_READBACK,
+                                MutationStage.TARGET_BEFORE_READ} else "OTHER"),
                             "control_kind": stage.value, "vulnerability_class": "bola",
                             "request_template_fingerprint": shape["fingerprint"],
                             "policy": {"result": "RECHECK_AT_DISPATCH"}, "simulation_only": True})
         steps = [(StepType.OBSERVE, "Verify owned disposable object and permission boundary.")]
         steps.extend((StepType.EXECUTE_REQUEST, "Execute one recipe-bound mutation or read-back.")
-                     for _ in STAGES)
+                     for _ in stages)
         steps.append((StepType.COMPARE_RESPONSE, "Compare independently verified object state."))
         plan = InvestigationPlan(
             "PLAN-" + uuid.uuid4().hex, hypothesis.id, skill.metadata.name,
@@ -1205,7 +1395,7 @@ class SkillPlanner:
             skill.controls, tuple(steps), tuple(actions), tuple(templates),
             skill.positive_signals, skill.negative_signals, skill.evidence_requirements,
             skill.confirmation_requirements, skill.rejection_conditions,
-            skill.metadata.risk, len(STAGES), skill.metadata.token_budget,
+            skill.metadata.risk, len(stages), skill.metadata.token_budget,
             "READY_FOR_MANUAL_REVIEW", datetime.now(timezone.utc).isoformat(),
             ({"control_slot": 2, "boundary_slot": 4},))
         return self.store.save(plan, regenerate=True)

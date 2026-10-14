@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import hashlib
 from io import StringIO
+from importlib.resources import files
 import os
 from pathlib import Path
 import sqlite3
@@ -58,7 +59,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 24)
+        self.assertEqual(version, 33)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -76,10 +77,49 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(StoreSchemaError):
             self.store.initialize()
 
+    def test_phase26_js_index_upgrades_existing_version_29_store(self):
+        self.store.initialize()
+        original = self._evidence(content=b"preserved-phase26-evidence")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DROP TABLE api_inventory_progress")
+            connection.execute("DROP INDEX api_js_artifacts_target_hash_state")
+            connection.execute("PRAGMA user_version=29")
+        self.store.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='api_js_artifacts_target_hash_state'").fetchone())
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM evidence WHERE evidence_id=?",
+                (original.evidence_id,)).fetchone()[0], 1)
+
+    def test_phase26_inventory_progress_upgrades_existing_version_30_store(self):
+        self.store.initialize()
+        original = self._evidence(content=b"preserved-inventory-evidence")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DROP TABLE api_inventory_progress")
+            connection.execute("DROP INDEX dom_js_artifacts_target_current_page")
+            connection.execute("PRAGMA user_version=30")
+        self.store.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='api_inventory_progress'").fetchone())
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='dom_js_artifacts_target_current_page'").fetchone())
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM evidence WHERE evidence_id=?",
+                (original.evidence_id,)).fetchone()[0], 1)
+
     def test_phase14_store_upgrades_to_phase15_without_losing_evidence(self):
         self.store.initialize()
         original = self._evidence(content=b"preserved-local-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            for table in ("api_inventory_progress", "api_specialist_runs", "api_candidates", "api_operations"):
+                connection.execute(f"DROP TABLE {table}")
             for table in ("behaviour_observations", "behaviour_workflows", "behaviour_expectations",
                           "behaviour_profiles", "behaviour_runs", "bootstrap_observations",
                           "bootstrap_discovery_states", "bootstrap_runs"):
@@ -103,10 +143,44 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=14")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 24)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM evidence WHERE evidence_id=?",
+                (original.evidence_id,)).fetchone()[0], 1)
+
+    def test_phase26_delete_mutation_upgrade_opens_typed_contract(self):
+        self.store.initialize()
+        legacy = files("hackbot").joinpath(
+            "migrations", "016_authorization_mutations.sql").read_text()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DROP TABLE authorization_mutation_results")
+            connection.executescript(legacy)
+            connection.execute("PRAGMA user_version=31")
+        self.store.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='authorization_mutation_results'").fetchone()[0]
+            self.assertIn("DELETE_DISPOSABLE", schema)
+
+    def test_phase26_delete_exchange_indexes_upgrade_version_32_store(self):
+        self.store.initialize()
+        original = self._evidence(content=b"preserved-delete-source-evidence")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DROP INDEX authorization_mutations_delete_exchange")
+            connection.execute("DROP INDEX test_object_operations_cleanup_exchange")
+            connection.execute("PRAGMA user_version=32")
+        self.store.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 33)
+            names = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'")}
+            self.assertIn("authorization_mutations_delete_exchange", names)
+            self.assertIn("test_object_operations_cleanup_exchange", names)
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM evidence WHERE evidence_id=?",
                 (original.evidence_id,)).fetchone()[0], 1)

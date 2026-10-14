@@ -214,6 +214,32 @@ class ObjectRegistry:
                              (object_id, target_id)).fetchone()
         return self._object(row) if row else None
 
+    def find_cleaned_by_delete_exchange(self, target_id: str,
+                                        exchange_id: str) -> TestObject | None:
+        """Resolve one verified cleaned object from its exact deletion exchange."""
+        if (not isinstance(target_id, str) or not target_id or
+                not isinstance(exchange_id, str) or not exchange_id or
+                len(exchange_id) > 128):
+            raise ValueError("invalid delete source lookup")
+        with self.store._connection() as db:
+            rows = db.execute(
+                "WITH source_ids AS ("
+                " SELECT test_object_id FROM authorization_mutation_results"
+                " WHERE target_id=? AND mutation_exchange_id=?"
+                " AND mutation_type='DELETE_DISPOSABLE' AND status='VERIFIED'"
+                " UNION"
+                " SELECT p.test_object_id FROM test_object_operations p"
+                " JOIN test_objects linked ON linked.test_object_id=p.test_object_id"
+                " WHERE linked.target_id=? AND p.exchange_id=?"
+                " AND p.operation_kind='CLEANUP' AND p.status='SUCCEEDED'"
+                ") SELECT o.* FROM source_ids s"
+                " JOIN test_objects o ON o.test_object_id=s.test_object_id"
+                " WHERE o.target_id=? AND o.lifecycle='CLEANED'"
+                " AND o.disposable=1 AND o.verified_at IS NOT NULL"
+                " LIMIT 2",
+                (target_id, exchange_id, target_id, exchange_id, target_id)).fetchall()
+        return self._object(rows[0]) if len(rows) == 1 else None
+
     def list_for_target(self, target_id: str, *, limit: int = 20, cursor: str | None = None,
                         state: ObjectState | None = None, object_type: str | None = None,
                         tenant_id: str | None = None, identity_id: str | None = None,
@@ -304,8 +330,20 @@ class ObjectRegistry:
                         exact["parent_test_object_id"] != parent_id or not exact["disposable"] or
                         not exact["verified_at"] or exact["lifecycle"] != "READY"):
                     raise ValueError("exact object prerequisite is unavailable")
+            plan_row = db.execute("SELECT skill_id,plan_json FROM skill_plans WHERE plan_id=?",
+                                  (plan_id,)).fetchone()
+            batch_plan = False
+            if plan_row is not None and plan_row["skill_id"] == "api-observed-read":
+                try:
+                    snapshot = json.loads(plan_row["plan_json"])
+                    batch_plan = (snapshot.get("api_binding", {}).get("category") == "BATCH_AUTH" and
+                                  len(snapshot.get("request_templates", ())) == 5 and
+                                  all(shape.get("binding") == "API_OBSERVED_BATCH_V1" for shape in
+                                      snapshot["request_templates"]))
+                except (TypeError, ValueError, AttributeError):
+                    batch_plan = False
             if db.execute("SELECT count(*) FROM plan_object_requirements WHERE plan_id=?",
-                          (plan_id,)).fetchone()[0] >= 3:
+                          (plan_id,)).fetchone()[0] >= (4 if batch_plan else 3):
                 raise ValueError("PLAN_REQUIREMENT_LIMIT")
             db.execute("INSERT INTO plan_object_requirements "
                        "(requirement_id,plan_id,target_id,object_type,recipe_id,creator_identity_id,"

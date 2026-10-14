@@ -41,7 +41,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 24
+_SCHEMA_VERSION = 33
 
 
 def _now() -> datetime:
@@ -166,6 +166,15 @@ class EvidenceFactStore:
                 (22, "022_exposure_specialist.sql"),
                 (23, "023_cold_start_bootstrap.sql"),
                 (24, "024_normal_behaviour_learning.sql"),
+                (25, "025_api_specialist.sql"),
+                (26, "026_api_authorization_delegate.sql"),
+                (27, "027_api_behaviour_provenance.sql"),
+                (28, "028_api_global_id.sql"),
+                (29, "029_api_nested_child.sql"),
+                (30, "030_api_js_currentness_index.sql"),
+                (31, "031_api_inventory_progress.sql"),
+                (32, "032_disposable_delete_mutation.sql"),
+                (33, "033_delete_source_exchange_index.sql"),
             ):
                 if version >= target_version:
                     continue

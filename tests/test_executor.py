@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta, datetime, timezone
+import base64
+import binascii
 import gzip
 import hashlib
 import http.client
@@ -63,6 +65,26 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.received.append(("GET", self.path, self.headers.get("Cookie")))
+        if self.path.startswith("/api/admin/projects/") and self.path.count("/") == 4:
+            item = self.server.fixture_objects.get(self.path.rsplit("/", 1)[-1])
+            if item is None or item["type"] != "project":
+                return self._answer(404, b"{}", (("Content-Type", "application/json"),))
+            if (getattr(self.server, "fixture_secure", False) and
+                    self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                return self._answer(403, b'{"error":"forbidden"}',
+                                    (("Content-Type", "application/json"),))
+            return self._answer(200, json.dumps(item).encode(),
+                                (("Content-Type", "application/json"),))
+        if self.path.startswith("/api/projects/") and self.path.count("/") == 3:
+            item = self.server.fixture_objects.get(self.path.rsplit("/", 1)[-1])
+            if item is None or item["type"] != "project":
+                return self._answer(404, b"{}", (("Content-Type", "application/json"),))
+            if (getattr(self.server, "fixture_secure", False) and
+                    self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                return self._answer(403, b'{"error":"forbidden"}',
+                                    (("Content-Type", "application/json"),))
+            return self._answer(200, json.dumps(item).encode(),
+                                (("Content-Type", "application/json"),))
         if self.path == "/assets/app-vhost.js":
             normal = (b'const virtualHost = "http://admin.svc.internal"; '
                       b'const route = "/assets/app-vhost.js";')
@@ -207,12 +229,84 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if self.path == "/fixture/graphql":
             try:
                 payload = json.loads(body)
+                if isinstance(payload, list):
+                    if len(payload) != 2 or any(not isinstance(part, dict) or
+                            not isinstance(part.get("variables"), dict) or
+                            not isinstance(part["variables"].get("id"), str) for part in payload):
+                        raise ValueError
+                    result = []
+                    for part in payload:
+                        item = self.server.fixture_objects.get(part["variables"]["id"])
+                        if item is None:
+                            result.append({"data": {"chosen": None},
+                                           "errors": [{"message": "not found"}]})
+                        elif (getattr(self.server, "fixture_batch_secure", False) and
+                              self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                            result.append({"data": {"chosen": None},
+                                           "errors": [{"message": "forbidden",
+                                                       "extensions": {"code": "FORBIDDEN"}}]})
+                        else:
+                            result.append({"data": {"chosen": item}})
+                    return self._answer(200, json.dumps(result).encode(),
+                                        (("Content-Type", "application/json"),))
+                if isinstance(payload.get("variables", {}).get("ids"), list):
+                    ids = payload["variables"]["ids"]
+                    if len(ids) != 2 or any(not isinstance(value, str) for value in ids):
+                        raise ValueError
+                    nodes = []
+                    errors = []
+                    for index, value in enumerate(ids):
+                        item = self.server.fixture_objects.get(value)
+                        if item is None:
+                            nodes.append(None)
+                            errors.append({"message": "not found", "path": ["chosen", index]})
+                        elif (getattr(self.server, "fixture_batch_secure", False) and
+                              self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                            nodes.append(None)
+                            errors.append({"message": "forbidden", "path": ["chosen", index],
+                                           "extensions": {"code": "FORBIDDEN"}})
+                        else:
+                            nodes.append(item)
+                    result = {"data": {"chosen": nodes}}
+                    if errors:
+                        result["errors"] = errors
+                    return self._answer(200, json.dumps(result).encode(),
+                                        (("Content-Type", "application/json"),))
                 value = payload["variables"]["id"]
-            except (KeyError, TypeError, ValueError):
+            except (AttributeError, KeyError, TypeError, ValueError):
                 return self._answer(400, b'{}', (("Content-Type", "application/json"),))
+            if getattr(self.server, "fixture_global_lookup", False):
+                try:
+                    decoded = base64.b64decode(value, validate=True).decode("ascii")
+                    typename, separator, identifier = decoded.partition(":")
+                    value = identifier if separator and typename == "Project" else ""
+                except (TypeError, ValueError, UnicodeError, binascii.Error):
+                    value = ""
             item = self.server.fixture_objects.get(value)
             if item is None:
                 result = {"data": {"node": None}, "errors": [{"message": "not found"}]}
+            elif (str(payload.get("query", "")).lstrip().startswith("mutation ") and
+                  "parentId" in payload.get("variables", {})):
+                parent_id = payload["variables"]["parentId"]
+                parent = self.server.fixture_objects.get(parent_id)
+                name = payload["variables"].get("name")
+                cookie = self.headers.get("Cookie")
+                if (parent is None or parent.get("type") != "project" or
+                        not isinstance(name, str)):
+                    result = {"data": {"renameDashboard": None},
+                              "errors": [{"message": "invalid parent or name"}]}
+                elif (cookie != "fixture_actor=" + parent["owner"] or
+                      (getattr(self.server, "fixture_nested_mutation_secure", False) and
+                       (item.get("parentId") != parent_id or
+                        cookie != "fixture_actor=" + item["owner"]))):
+                    result = {"data": {"renameDashboard": None},
+                              "errors": [{"message": "forbidden",
+                                          "extensions": {"code": "FORBIDDEN"}}]}
+                else:
+                    if not getattr(self.server, "fixture_noop_mutation", False):
+                        item["name"] = name
+                    result = {"data": {"renameDashboard": {
+                        key: item[key] for key in ("id", "name", "parentId")}}}
             elif (getattr(self.server, "fixture_secure", False) and
                   self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
                 result = {"data": {"node": None}, "errors": [{"message": "forbidden"}]}
@@ -225,8 +319,54 @@ class FixtureHandler(BaseHTTPRequestHandler):
                             getattr(self.server, "fixture_graphql_boundary_noop", False) and
                             self.headers.get("Cookie") == "fixture_actor=tenant_b_admin"):
                         item["name"] = name
-                result = {"data": {"node": item}}
+                node = item
+                if getattr(self.server, "fixture_nested_children", None) is not None:
+                    children = [self.server.fixture_objects[key] for key in
+                                self.server.fixture_nested_children.get(value, ())
+                                if key in self.server.fixture_objects]
+                    if getattr(self.server, "fixture_nested_secure", False):
+                        children = [child for child in children if
+                                    self.headers.get("Cookie") ==
+                                    "fixture_actor=" + child["owner"]]
+                    node = {**item, "dashboards": children}
+                if getattr(self.server, "fixture_nested_profile", False):
+                    node = {**node, "profile": dict(item.get("profile", {}))}
+                result = {"data": {"node": node}}
+                if (getattr(self.server, "fixture_field_secure", False) and
+                        self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                    field_path = (["node", "profile", "email"] if
+                                  getattr(self.server, "fixture_nested_profile", False) else
+                                  ["node", "email"])
+                    denied_node = ({**node, "profile": {**node["profile"], "email": None}}
+                                   if len(field_path) == 3 else {**node, "email": None})
+                    result = {"data": {"node": denied_node}, "errors": [
+                        {"message": "forbidden", "path": field_path,
+                         "extensions": {"code": "FORBIDDEN"}}]}
+                elif getattr(self.server, "fixture_partial_error", False):
+                    result["errors"] = [{"message": "unrelated error", "path": ["other"],
+                                         "extensions": {"code": "FORBIDDEN"}}]
             return self._answer(200, json.dumps(result).encode(),
+                                (("Content-Type", "application/json"),))
+        parts = self.path.split("/")
+        if (len(parts) == 6 and parts[1] == "fixture" and
+                parts[3] in {"projects", "dashboards"} and parts[5] == "rename"):
+            item = self.server.fixture_objects.get(parts[4])
+            if item is None or item["tenant"] != parts[2]:
+                return self._answer(404)
+            if (getattr(self.server, "fixture_secure", False) and
+                    self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                return self._answer(403, b'{"error":"forbidden"}',
+                                    (("Content-Type", "application/json"),))
+            try:
+                value = json.loads(body)
+            except ValueError:
+                return self._answer(400)
+            if (not isinstance(value, dict) or set(value) != {"name"} or
+                    not isinstance(value["name"], str)):
+                return self._answer(400)
+            if not getattr(self.server, "fixture_noop_mutation", False):
+                item["name"] = value["name"]
+            return self._answer(200, json.dumps(item).encode(),
                                 (("Content-Type", "application/json"),))
         if self.path.startswith("/fixture/"):
             parts = self.path.split("/")
@@ -277,6 +417,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     return self._answer(403, b'{"error":"forbidden"}',
                                         (("Content-Type", "application/json"),))
                 data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                if (getattr(self.server, "fixture_mass_assignment_enabled", False) and
+                        set(data) == {"can_share_test"} and
+                        type(data["can_share_test"]) is bool and
+                        item.get("can_share_test") is not None):
+                    item["can_share_test"] = data["can_share_test"]
+                    return self._answer(200, json.dumps(item).encode(),
+                                        (("Content-Type", "application/json"),))
                 if (getattr(self.server, "fixture_fail_restore", False) and
                         data.get("name") == getattr(self.server, "fixture_restore_value", None)):
                     return self._answer(403, b'{"error":"restore blocked"}',
@@ -302,6 +449,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[3] in {"projects", "dashboards"}:
             item = self.server.fixture_objects.get(parts[4])
             if item is not None and item["tenant"] == parts[2]:
+                if (getattr(self.server, "fixture_csrf_required", False) and
+                        self.headers.get("X-CSRF-Token") != "fixture-csrf-secret-token"):
+                    return self._answer(403, b'{"error":"csrf"}',
+                                        (("Content-Type", "application/json"),))
+                if (getattr(self.server, "fixture_secure", False) and
+                        self.headers.get("Cookie") != "fixture_actor=" + item["owner"]):
+                    return self._answer(403, b'{"error":"forbidden"}',
+                                        (("Content-Type", "application/json"),))
                 del self.server.fixture_objects[parts[4]]
                 if self.server.drop_delete_response:
                     self.server.drop_delete_response = False
@@ -374,6 +529,10 @@ class ExecutorTests(unittest.TestCase):
         self.server.received = []
         self.server.created = []
         self.server.fixture_objects = {}
+        self.server.fixture_global_lookup = False
+        self.server.fixture_nested_children = None
+        self.server.fixture_nested_secure = False
+        self.server.fixture_batch_secure = False
         self.server.fixture_secure = False
         self.server.fixture_noop_mutation = False
         self.server.fixture_graphql_boundary_noop = False

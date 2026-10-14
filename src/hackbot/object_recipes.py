@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from .config import ObjectSettings
 from .authorization_binding import single_rename_operation
+from .api_graphql import single_nested_rename_operation
 from .domain import validate_entity_id
 from .executor import RequestTemplate
 from .logging import SecretRedactor, is_sensitive_key
@@ -157,12 +158,28 @@ class MutationRecipe:
     csrf_header: str | None = None
 
     def __post_init__(self) -> None:
+        if self.mutation_type is MutationType.DELETE_DISPOSABLE:
+            if (self.field != "existence" or
+                    self.write.method != "DELETE" or self.write.body is not None or
+                    self.restore != self.write or
+                    self.readback.method != "GET" or self.readback.body is not None or
+                    self.readback.url != self.write.url or
+                    "{object_id}" not in self.write.url or
+                    not _POINTER.fullmatch(self.readback_pointer) or
+                    self.side_effect is not SideEffect.SAFE_DELETE or
+                    self.identity_requirement != "VERIFIED_DISPOSABLE_OWNER_AND_BOUNDARY" or
+                    self.csrf_header not in {None, "X-CSRF-Token"}):
+                raise ValueError("delete recipe lacks exact owned-object cleanup and absence check")
+            return
         if self.mutation_type is not MutationType.RENAME:
             raise ValueError("mutation type needs a reviewed implementation")
         if self.field != "name":
             raise ValueError("mutation field is not allowlisted")
         rest = (self.write.method in {"PATCH", "PUT"} and
                 self.write.body == {self.field: "$test_name"})
+        rest_action = (self.write.method == "POST" and
+                       self.write.url == self.readback.url.rstrip("/") + "/rename" and
+                       self.write.body == {self.field: "$test_name"})
         graphql = False
         if self.write.method == "POST" and isinstance(self.write.body, dict):
             payload = self.write.body
@@ -174,15 +191,22 @@ class MutationRecipe:
                     isinstance(payload.get("operationName"), str)):
                 graphql = (single_rename_operation(payload["query"], "id", "name") ==
                            payload["operationName"])
-        if (not (rest or graphql) or
+            elif (set(payload) == {"query", "variables", "operationName"} and
+                  isinstance(variables, dict) and variables == {
+                      "parentId": "$parent_id", "id": "$object_id", "name": "$test_name"} and
+                  isinstance(payload.get("query"), str) and
+                  isinstance(payload.get("operationName"), str)):
+                graphql = (single_nested_rename_operation(payload["query"]) ==
+                           payload["operationName"])
+        if (not (rest or rest_action or graphql) or
                 self.restore.method != self.write.method or
                 self.readback.method != "GET" or
                 self.restore.body != self.write.body or
+                self.restore.url != self.write.url or
                 (not graphql and "{object_id}" not in self.write.url) or
                 (graphql and "{object_id}" in self.write.url) or
                 "{object_id}" not in self.readback.url or
                 (not graphql and "{object_id}" not in self.restore.url) or
-                (graphql and self.restore.url != self.write.url) or
                 self.side_effect is not SideEffect.SAFE_UPDATE or
                 self.identity_requirement != "VERIFIED_DISPOSABLE_OWNER_AND_BOUNDARY"):
             raise ValueError("mutation recipe lacks a safe read-back and reversal")
@@ -292,13 +316,24 @@ class ObjectRecipe:
                                       entry["readback_pointer"], embedded("restore"),
                                       SideEffect(entry["side_effect"]),
                                       entry["identity_requirement"], entry.get("csrf_header"))
-            if (mutation.readback.url != verify.url or
-                    (mutation.write.method != "POST" and mutation.write.url != verify.url) or
-                    (mutation.restore.method != "POST" and mutation.restore.url != verify.url) or
-                    mutation.write.method != mutation.restore.method or
-                    mutation.write.body != mutation.restore.body or
-                    mutation.readback_pointer != obj["verify_name_pointer"]):
+            if mutation.mutation_type is MutationType.DELETE_DISPOSABLE:
+                if (obj["protocol"] != "REST" or
+                        strategy is not CleanupStrategy.AUTO_CLEANUP or
+                        cleanup is None or mutation.write != cleanup or
+                        mutation.readback != verify or
+                        mutation.readback_pointer != obj["verify_id_pointer"]):
+                    raise ValueError("delete mutation must match the verified cleanup recipe")
+            elif (mutation.readback.url != verify.url or
+                  (mutation.write.method != "POST" and mutation.write.url != verify.url) or
+                  (mutation.restore.method != "POST" and mutation.restore.url != verify.url) or
+                  mutation.write.method != mutation.restore.method or
+                  mutation.write.body != mutation.restore.body or
+                  mutation.readback_pointer != obj["verify_name_pointer"]):
                 raise ValueError("mutation read-back must use the verified object route")
+            if (isinstance(mutation.write.body, dict) and
+                    isinstance(mutation.write.body.get("variables"), dict) and
+                    "parentId" in mutation.write.body["variables"] and parent_type is None):
+                raise ValueError("nested mutation requires a verified parent recipe")
             mutations.append(mutation)
         if len({mutation.mutation_type for mutation in mutations}) != len(mutations):
             raise ValueError("duplicate mutation type")

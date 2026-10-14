@@ -8,19 +8,19 @@ prerequisites: [in_scope_target, authenticated_endpoint, known_ownership, verifi
 risk: HIGH
 required_validators: [ownership_matrix, state_readback, restore_readback]
 token_budget: 1600
-request_budget: 7
+request_budget: 8
 version: 1.0.0
 source: CORE
 execution_mode: PLAN_ONLY
-when_to_use: Use only with a pinned MutationRecipe, a reserved verified disposable object, and separate verified owner and boundary sessions.
-when_not_to_use: Never use for real objects, arbitrary fields, missing read-back, missing reversal, or unknown role semantics.
+when_to_use: Use only with a pinned MutationRecipe, reserved verified disposable objects, and separate verified owner and boundary sessions.
+when_not_to_use: Never use for real objects, arbitrary fields, missing read-back or cleanup, or unknown role semantics.
 alternatives: [cross-tenant-object-authorization]
 boundaries: [OWNER, ROLE, TENANT]
 ---
 
 # Typed authorization mutation
 
-The plan binds only opaque object, recipe, identity, and phase references. The dispatcher resolves an exact request from the pinned recipe and current object registry. Every action receives a fresh policy decision and one-use permit. A successful mutation response is not proof of effect.
+The plan binds only opaque object, recipe, identity, and phase references. The dispatcher resolves an exact request from the pinned recipe and current object registry. Every action receives a fresh policy decision and one-use permit. A successful mutation response is not proof of effect. The optional disposable DELETE variant uses a separate owner-delete control and an owner preflight of the boundary target before the foreign attempt.
 
 ## Plan
 ```yaml

@@ -10,8 +10,11 @@ from urllib.parse import unquote, urlsplit
 import uuid
 
 from .authorization_store import (AuthorizationCandidate, AuthorizationHunt, AuthorizationMode,
-                                  AuthorizationStore, Boundary, HuntStatus, MatrixResult)
+                                  AuthorizationStore, Boundary, HuntStatus, MatrixResult,
+                                  candidate_dedupe_key)
 from .authorization_binding import single_rename_operation
+from .api_graphql import (observed_global_id_type, single_nested_rename_operation,
+                          single_node_id_variable)
 from .browser import BrowserSessionManager, BrowserStatus, VerificationStatus
 from .domain import ObservationState
 from .evidence import FactStatus
@@ -280,14 +283,16 @@ class AuthorizationSpecialist:
             variables = data["variables"]
             if (not isinstance(query, str) or not isinstance(variables, dict) or
                     not isinstance(data, dict) or set(data) - {"query", "variables", "operationName"} or
-                    len(query) > 4096 or len(variables) not in {1, 2} or
-                    list(variables.values()).count(external_id) != 1):
+                    len(query) > 4096 or len(variables) not in {1, 2, 3}):
                 return None
             kind = "QUERY" if query.lstrip().startswith("query ") else (
                 "MUTATION" if query.lstrip().startswith("mutation ") else None)
             if kind is None or ("mutation" in query.lower() and kind == "QUERY"):
                 return None
-            variable = next((key for key, value in variables.items() if value == external_id), None)
+            node_variable = single_node_id_variable(query) if kind == "QUERY" else None
+            matching = [key for key, value in variables.items() if value == external_id or (
+                key == node_variable and observed_global_id_type(value, external_id))]
+            variable = matching[0] if len(matching) == 1 else None
             if not isinstance(variable, str) or not variable.isidentifier():
                 return None
             if len(variables) == 2:
@@ -297,65 +302,83 @@ class AuthorizationSpecialist:
                                 4 <= len(value) <= 80 and
                                 value.replace("-", "").isalnum() for value in changes.values())):
                     return None
+            if len(variables) == 3 and (kind != "MUTATION" or variable != "id" or
+                    set(variables) != {"parentId", "id", "name"} or
+                    not isinstance(variables["parentId"], str) or
+                    not isinstance(variables["name"], str) or
+                    not variables["name"].startswith("hackbot-test-") or
+                    single_nested_rename_operation(query) != data.get("operationName")):
+                return None
             return variable, kind
         except (KeyError, TypeError, ValueError, UnicodeError, PermissionError):
             return None
 
+    def _operation_for_exchange(self, package: TargetPackage, item: AuthorizationObject,
+                                exchange: TrafficExchange | None) -> AuthorizationOperation | None:
+        if (exchange is None or exchange.target_id != package.target.id or
+                exchange.package_id != package.id or exchange.state is not ExchangeState.COMPLETE or
+                exchange.scope_result is not ScopeResult.IN_SCOPE or
+                exchange.attribution.auth_state is not AuthState.VERIFIED or
+                exchange.attribution.verified_identity_id != item.owner_identity_id or
+                exchange.response is None):
+            return None
+        url = self._request_url(exchange, self.evidence)
+        if url is None or package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE:
+            return None
+        parsed = urlsplit(url)
+        method = exchange.request.record.method
+        path_parts = tuple(unquote(segment) for segment in parsed.path.split("/"))
+        batch_ids = (path_parts[-1].split(",") if method == "GET" and
+                     len(path_parts) >= 3 and path_parts[-2] == "batch" else [])
+        stored = self.objects.get(item.id, package.target.id)
+        if stored is None or not stored.disposable or not stored.verified_at:
+            return None
+        try:
+            external_id = self._external_id(stored)
+        except (ValueError, UnicodeError, KeyError, PermissionError):
+            return None
+        graphql = self._graphql_variable(exchange, external_id)
+        if external_id not in path_parts and graphql is None and (
+                not batch_ids or external_id != batch_ids[0]):
+            return None
+        features = self.comparator.features(exchange)
+        semantic = bool(features.status_code is not None and
+                        200 <= features.status_code < 300 and
+                        not features.graphql_errors_present and
+                        (graphql is None or features.graphql_data_present) and
+                        hashlib.sha256(external_id.encode()).hexdigest() in features.object_id_hashes)
+        tenant = self.identities.get_tenant(package.target.id, item.tenant_id)
+        tenant_segments = ({tenant.label, tenant.external_id} - {None, ""}) if tenant else set()
+        normalized_path = "/".join(
+            "{batch}" if segment == path_parts[-1] and external_id in batch_ids else
+            "{object}" if segment == external_id else
+            "{tenant}" if segment in tenant_segments else segment for segment in path_parts)
+        key = _hash(method, exchange.request.origin, normalized_path,
+                    exchange.request.record.operation_id or "")
+        return AuthorizationOperation(
+            key, exchange.id, item.owner_identity_id, item.id, method,
+            exchange.request.origin, exchange.request.display_path,
+            exchange.request.record.operation_id,
+            "GRAPHQL" if graphql else "BATCH" if external_id in batch_ids else "REST",
+            semantic, exchange.evidence_ids[:8],
+            graphql[0] if graphql else None, graphql[1] if graphql else None)
+
+    def observed_operation(self, package: TargetPackage, item: AuthorizationObject,
+                           exchange_id: str) -> AuthorizationOperation | None:
+        """Resolve one exact owned capture without widening the normal profile page."""
+        return self._operation_for_exchange(package, item,
+                                            self.traffic.get_exchange(exchange_id))
+
     def _operations(self, package: TargetPackage,
                     objects: tuple[AuthorizationObject, ...]) -> tuple[AuthorizationOperation, ...]:
         result = []
-        exchanges = self.traffic.find_recent(package.target.id, limit=50).items
-        for exchange in exchanges:
-            if (exchange.package_id != package.id or exchange.state is not ExchangeState.COMPLETE or
-                    exchange.scope_result is not ScopeResult.IN_SCOPE or
-                    exchange.attribution.auth_state is not AuthState.VERIFIED or
-                    exchange.response is None):
-                continue
-            url = self._request_url(exchange, self.evidence)
-            if url is None or package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE:
-                continue
-            parsed = urlsplit(url)
-            method = exchange.request.record.method
-            path_parts = tuple(unquote(segment) for segment in parsed.path.split("/"))
-            batch_ids = (path_parts[-1].split(",") if method == "GET" and
-                         len(path_parts) >= 3 and path_parts[-2] == "batch" else [])
+        for exchange in self.traffic.find_recent(package.target.id, limit=50).items:
             for item in objects:
-                if exchange.attribution.verified_identity_id != item.owner_identity_id:
-                    continue
-                stored = self.objects.get(item.id, package.target.id)
-                if stored is None:
-                    continue
-                try:
-                    external_id = self._external_id(stored)
-                except (ValueError, UnicodeError, KeyError, PermissionError):
-                    continue
-                graphql = self._graphql_variable(exchange, external_id)
-                if external_id not in path_parts and graphql is None and (
-                        not batch_ids or external_id != batch_ids[0]):
-                    continue
-                features = self.comparator.features(exchange)
-                semantic = bool(features.status_code is not None and
-                                200 <= features.status_code < 300 and
-                                not features.graphql_errors_present and
-                                (graphql is None or features.graphql_data_present) and
-                                hashlib.sha256(external_id.encode()).hexdigest() in features.object_id_hashes)
-                tenant = self.identities.get_tenant(package.target.id, item.tenant_id)
-                tenant_segments = ({tenant.label, tenant.external_id} - {None, ""}) if tenant else set()
-                normalized_path = "/".join(
-                    "{batch}" if segment == path_parts[-1] and external_id in batch_ids else
-                    "{object}" if segment == external_id else
-                    "{tenant}" if segment in tenant_segments else segment for segment in path_parts)
-                key = _hash(method, exchange.request.origin, normalized_path,
-                            exchange.request.record.operation_id or "")
-                result.append(AuthorizationOperation(
-                    key, exchange.id, item.owner_identity_id, item.id, method,
-                    exchange.request.origin, exchange.request.display_path,
-                    exchange.request.record.operation_id,
-                    "GRAPHQL" if graphql else "BATCH" if external_id in batch_ids else "REST",
-                    semantic, exchange.evidence_ids[:8],
-                    graphql[0] if graphql else None, graphql[1] if graphql else None))
-                if len(result) >= 40:
-                    return tuple(result)
+                operation = self._operation_for_exchange(package, item, exchange)
+                if operation is not None:
+                    result.append(operation)
+                    if len(result) >= 40:
+                        return tuple(result)
         return tuple(result)
 
     def profile(self, package: TargetPackage) -> AuthorizationSurface:
@@ -393,7 +416,8 @@ class AuthorizationSpecialist:
                    boundary: Boundary, actor: AuthorizationActor | None,
                    reasons: tuple[str, ...], score: int) -> AuthorizationCandidate:
         attacker = actor.identity_id if actor else None
-        key = _hash(surface.target_id, boundary.value, obj.id, operation.key, attacker or "ANONYMOUS")
+        key = candidate_dedupe_key(surface.target_id, boundary.value, obj.id,
+                                   operation.key, attacker)
         candidate = AuthorizationCandidate(
             "AUTHC-" + uuid.uuid4().hex, surface.target_id, hunt.id, key, boundary,
             obj.owner_identity_id, attacker, obj.id, operation.exchange_id,
@@ -601,8 +625,8 @@ class AuthorizationSpecialist:
         seen = set()
         for score, obj, operation, boundary, actor, reasons in sorted(
                 ranked, key=lambda item: (-item[0], item[2].key, item[3].value)):
-            dedupe = _hash(surface.target_id, boundary.value, obj.id, operation.key,
-                           actor.identity_id if actor else "ANONYMOUS")
+            dedupe = candidate_dedupe_key(surface.target_id, boundary.value, obj.id,
+                                          operation.key, actor.identity_id if actor else None)
             if dedupe in seen:
                 continue
             seen.add(dedupe)
@@ -701,11 +725,13 @@ class AuthorizationSpecialist:
                            (candidate.boundary is Boundary.GRAPHQL_OBJECT and
                             item.method == "POST" and item.graphql_kind == "QUERY") or
                            (item.method == "POST" and item.graphql_kind == "MUTATION") or
+                           (item.method == "POST" and item.protocol == "REST") or
                            (item.method in {"PATCH", "PUT"} and item.protocol == "REST"))), None)
         if owned is None or operation is None:
             return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                               status="NEEDS_TEMPLATE")
         if operation.method in {"PATCH", "PUT"} or (
+                operation.method == "POST" and operation.protocol == "REST") or (
                 operation.graphql_kind == "MUTATION" and operation.method == "POST"
                 and self.factory is not None):
             return self._prepare_typed_mutation(candidate, hunt, package, owned,
@@ -1031,14 +1057,37 @@ class AuthorizationSpecialist:
         if mutation is None:
             return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                               status="NEEDS_TEMPLATE")
+        nested = (isinstance(mutation.write.body, dict) and
+                  isinstance(mutation.write.body.get("variables"), dict) and
+                  "parentId" in mutation.write.body["variables"])
+        parent = foreign_parent = None
+        if nested:
+            parent = self.objects.get(item.parent_id, candidate.target_id) if item.parent_id else None
+            if (parent is None or parent.state is not ObjectState.READY or
+                    not parent.disposable or not parent.verified_at or
+                    parent.creator_identity_id != owner.identity_id or
+                    parent.tenant_id != item.tenant_id or
+                    recipe.parent_type != parent.object_type or
+                    len(foreign.observed_tenants) != 1 or
+                    foreign.observed_tenants[0] == item.tenant_id):
+                return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                                  status="NEEDS_OBJECT")
+            foreign_parent = self.objects.find_reusable(
+                candidate.target_id, parent.object_type,
+                foreign.observed_tenants[0], foreign.identity_id)
+            if foreign_parent is None:
+                return self.ledger.link_candidate(candidate.id, candidate.target_id,
+                                                  status="NEEDS_OBJECT")
         source = self.traffic.get_exchange(operation.exchange_id)
         if source is None or source.request.body_evidence_id is None:
             return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                               status="NEEDS_TEMPLATE")
         try:
             external = self._external_id(item)
+            parent_external = self._external_id(parent) if parent else None
             expected_url = mutation.write.template(test_name=item.test_name,
-                                                   object_id=external).url
+                                                   object_id=external,
+                                                   parent_id=parent_external).url
             observed_url = self._request_url(source, self.evidence)
             raw = self.evidence.read_content(
                 source.request.body_evidence_id, allow_sensitive=True, max_bytes=8192)
@@ -1047,20 +1096,37 @@ class AuthorizationSpecialist:
             body = json.loads(raw, object_pairs_hook=unique_json_pairs)
             if observed_url != expected_url or not isinstance(body, dict):
                 raise ValueError
-            if mutation.write.method == "POST":
+            if mutation.write.method == "POST" and operation.protocol == "GRAPHQL":
                 expected = mutation.write.template(test_name="hackbot-test-control",
-                                                   object_id=external)
+                                                   object_id=external,
+                                                   parent_id=parent_external)
                 expected_body = json.loads(expected.body or b"{}")
                 variables = body.get("variables")
                 if (set(body) != set(expected_body) or
                         body.get("query") != expected_body["query"] or
                         body.get("operationName") != expected_body["operationName"] or
                         not isinstance(variables, dict) or
-                        set(variables) != {"id", "name"} or
+                        set(variables) != ({"parentId", "id", "name"} if nested else
+                                           {"id", "name"}) or
                         variables.get("id") != external or
+                        (nested and variables.get("parentId") != parent_external) or
                         not isinstance(variables.get("name"), str) or
                         not variables["name"].startswith("hackbot-test-")):
                     raise ValueError
+                if nested:
+                    response = source.response
+                    if response is None or not response.body_evidence_id:
+                        raise ValueError
+                    raw_response = self.evidence.read_content(
+                        response.body_evidence_id, allow_sensitive=True, max_bytes=8192)
+                    if hashlib.sha256(raw_response).hexdigest() != response.body_hash:
+                        raise ValueError
+                    result = json.loads(raw_response, object_pairs_hook=unique_json_pairs)
+                    data = result.get("data") if isinstance(result, dict) else None
+                    node = next(iter(data.values())) if isinstance(data, dict) and len(data) == 1 else None
+                    if (not isinstance(node, dict) or node.get("id") != external or
+                            node.get("parentId") != parent_external):
+                        raise ValueError
             elif (set(body) != {mutation.field} or
                   not isinstance(body[mutation.field], str) or
                   not body[mutation.field].startswith("hackbot-test-")):
@@ -1080,7 +1146,9 @@ class AuthorizationSpecialist:
                     item.recipe_id, item.recipe_hash, mutation.mutation_type.value,
                     mutation.write.method, mutation.readback.operation,
                     mutation.write.operation, owner.identity_id, owner.session_id or "",
-                    foreign.identity_id, foreign.session_id, candidate.boundary.value))
+                    foreign.identity_id, foreign.session_id, candidate.boundary.value,
+                    parent.id if parent else None,
+                    foreign_parent.id if foreign_parent else None))
         except (LookupError, ValueError):
             return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                               status="NEEDS_MANUAL_REVIEW",
@@ -1090,6 +1158,13 @@ class AuthorizationSpecialist:
             object_type=item.object_type, recipe_id=item.recipe_id,
             identity_id=item.creator_identity_id, tenant_id=item.tenant_id,
             parent_id=item.parent_id, test_object_id=item.id)
+        for required in (parent, foreign_parent):
+            if required is not None:
+                self.objects.add_requirement(
+                    plan_id=str(plan["id"]), target_id=candidate.target_id,
+                    object_type=required.object_type, recipe_id=required.recipe_id,
+                    identity_id=required.creator_identity_id, tenant_id=required.tenant_id,
+                    parent_id=required.parent_id, test_object_id=required.id)
         return self.ledger.link_candidate(candidate.id, candidate.target_id,
                                           status="PLANNED", hypothesis_id=hypothesis.id,
                                           plan_id=str(plan["id"]))

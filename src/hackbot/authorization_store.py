@@ -24,6 +24,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def candidate_dedupe_key(target_id: str, boundary: str, object_id: str,
+                         operation_key: str, actor_id: str | None) -> str:
+    parts = (target_id, boundary, object_id, operation_key, actor_id or "ANONYMOUS")
+    return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
 class AuthorizationMode(StrEnum):
     MANUAL = "MANUAL"
     PLAN_ONLY = "PLAN_ONLY"
@@ -238,6 +244,15 @@ class AuthorizationStore:
         with self.store._connection() as db:
             row = db.execute("SELECT * FROM authorization_candidates WHERE candidate_id=? AND target_id=?",
                              (candidate_id, target_id)).fetchone()
+        return self._candidate(row) if row else None
+
+    def find_candidate_by_dedupe(self, target_id: str, dedupe_key: str
+                                 ) -> AuthorizationCandidate | None:
+        if not _HASH.fullmatch(dedupe_key):
+            raise ValueError("invalid authorization dedupe key")
+        with self.store._connection() as db:
+            row = db.execute("SELECT * FROM authorization_candidates WHERE target_id=? "
+                             "AND dedupe_key=?", (target_id, dedupe_key)).fetchone()
         return self._candidate(row) if row else None
 
     def list_candidates(self, target_id: str, *, limit: int = 20,

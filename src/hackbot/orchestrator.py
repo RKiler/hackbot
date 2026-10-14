@@ -12,9 +12,11 @@ from urllib.parse import urlsplit
 from typing import Any
 
 from .authorization_binding import resolve_authorization_request, resolve_exposure_read
+from .api_binding import resolve_api_batch, resolve_api_read
+from .api_registry import APIOperationRegistry
 from .mutation_binding import (MutationStage, ResolvedMutationStage,
                                mutation_fingerprint, resolve_mutation_stage)
-from .mutation_results import MutationResultStore, MutationStatus
+from .mutation_results import MutationResultStore, MutationStatus, value_hash
 from .object_recipes import RecipeCatalog, json_pointer, unique_json_pairs
 from .auth import AuthMechanism, AuthStatus
 from .domxss_browser import (DOMBrowserExperimentExecutor, DOMExperimentBinding,
@@ -39,8 +41,8 @@ from .store import EvidenceFactStore
 from .target_loader import TargetPackageRepository
 from .target_policy import PolicyDecision
 from .traffic import TrafficStore
-from .test_objects import ObjectRegistry
-from .typed_mutations import MutationPhase, TypedMutation
+from .test_objects import ObjectRegistry, ObjectState
+from .typed_mutations import MutationPhase, MutationType, TypedMutation
 
 
 _MAP = {
@@ -81,7 +83,8 @@ class PlanOrchestrator:
                  mutations: MutationResultStore | None = None,
                  dom: DOMBrowserExperimentExecutor | None = None,
                  messages: PostMessageBrowserExperimentExecutor | None = None,
-                 exposure: ExposureSpecialist | None = None) -> None:
+                 exposure: ExposureSpecialist | None = None,
+                 api_operations: APIOperationRegistry | None = None) -> None:
         self.runs, self.targets, self.hypotheses = runs, targets, hypotheses
         self.context, self.checker, self.registry = context, checker, registry
         self.policy, self.approvals, self.executor = policy, approvals, executor
@@ -92,6 +95,7 @@ class PlanOrchestrator:
         self.dom = dom
         self.messages = messages
         self.exposure = exposure
+        self.api_operations = api_operations
 
     def _exposure_binding_valid(self, package, frozen: object) -> bool:
         if self.exposure is None or not isinstance(frozen, dict):
@@ -307,7 +311,8 @@ class PlanOrchestrator:
                 expected_role = ("BOUNDARY" if stage is MutationStage.BOUNDARY_MUTATE else
                                  "CONTROL" if stage in {MutationStage.BEFORE_READ,
                                                         MutationStage.OWNER_MUTATE,
-                                                        MutationStage.OWNER_READBACK} else "OTHER")
+                                                        MutationStage.OWNER_READBACK,
+                                                        MutationStage.TARGET_BEFORE_READ} else "OTHER")
                 expected_identity = owner if stage is not MutationStage.BOUNDARY_MUTATE else None
                 expected_operation = (resolved_mutation.recipe.write.operation if stage in {
                     MutationStage.OWNER_MUTATE, MutationStage.BOUNDARY_MUTATE} else
@@ -327,7 +332,89 @@ class PlanOrchestrator:
                         step.role != expected_role or
                         descriptor.get("role") != expected_role or
                         descriptor.get("category") != (
-                            "OBJECT_UPDATE" if template.method in {"PATCH", "PUT", "POST"} else "SAFE_READ")):
+                            "OBJECT_DELETE" if template.method == "DELETE" else
+                            "OBJECT_UPDATE" if template.method in {"PATCH", "PUT", "POST"} else
+                            "SAFE_READ")):
+                    raise ValueError
+            elif shape.get("binding") in {"API_OBSERVED_READ_V1", "API_OBSERVED_BATCH_V1"}:
+                if (self.objects is None or self.api_operations is None or
+                        descriptor.get("simulation_only") is not True):
+                    raise ValueError
+                package = self.targets.get_target_package(run.package_id)
+                frozen = snapshot.data.get("api_binding")
+                alternate_field_control = (isinstance(frozen, dict) and
+                    frozen.get("category") == "FIELD_AUTH" and step.action_slot == 1 and
+                    "actor_control_operation_id" in frozen and
+                    "actor_control_version_hash" in frozen)
+                if (package is None or package.target.id != run.target_id or
+                        not isinstance(frozen, dict) or
+                        shape.get("operation_id") != frozen.get(
+                            "actor_control_operation_id" if alternate_field_control else
+                            "operation_id") or
+                        shape.get("version_hash") != frozen.get(
+                            "actor_control_version_hash" if alternate_field_control else
+                            "version_hash") or
+                        shape.get("field_path") != (
+                            "" if alternate_field_control else frozen.get("field_path")) or
+                        descriptor.get("request_template_fingerprint") != shape.get("fingerprint") or
+                        descriptor.get("operation") != shape.get("operation_id") or
+                        descriptor.get("role") != step.role):
+                    raise ValueError
+                if frozen.get("category") == "NESTED_AUTH":
+                    child_id = frozen.get("nested_child_id")
+                    child = self.objects.get(child_id, run.target_id) if isinstance(child_id, str) else None
+                    candidate = self.api_operations.get_candidate(
+                        run.target_id, frozen.get("candidate_id", ""))
+                    if (child is None or candidate is None or
+                            candidate.child_object_id != child_id or
+                            candidate.field_path != frozen.get("nested_path") or
+                            child.parent_id != candidate.test_object_id or
+                            not child.disposable or not child.verified_at or
+                            self.objects.active_reservation(child.id) != run.id):
+                        raise ValueError("Nested API child is no longer reserved")
+                if shape["binding"] == "API_OBSERVED_BATCH_V1":
+                    candidate = self.api_operations.get_candidate(
+                        run.target_id, frozen.get("candidate_id", ""))
+                    companion = self.objects.get(shape.get("companion_object_id", ""),
+                                                 run.target_id)
+                    source_companion = self.objects.get(
+                        shape.get("source_companion_id", ""), run.target_id)
+                    if (frozen.get("category") != "BATCH_AUTH" or candidate is None or
+                            candidate.plan_id != run.plan_id or
+                            candidate.test_object_id != snapshot.data["request_templates"][0]["test_object_id"] or
+                            shape.get("root_key") != frozen.get("batch_root_key") or
+                            shape.get("id_type") != frozen.get("batch_id_type") or
+                            shape.get("envelope") != frozen.get("batch_envelope") or
+                            companion is None or source_companion is None or
+                            self.objects.active_reservation(companion.id) != run.id or
+                            self.objects.active_reservation(source_companion.id) != run.id or
+                            (shape.get("variant") == "FOREIGN" and
+                             descriptor.get("identity_id") != companion.creator_identity_id)):
+                        raise ValueError("Observed API batch controls are no longer bound")
+                    template, owned_hash = resolve_api_batch(
+                        shape, package=package, run_id=run.id,
+                        operations=self.api_operations, objects=self.objects,
+                        traffic=self.traffic, evidence=self.evidence)
+                else:
+                    template, owned_hash = resolve_api_read(
+                        shape, package=package, run_id=run.id,
+                        operations=self.api_operations, objects=self.objects,
+                        traffic=self.traffic, evidence=self.evidence)
+                item = self.objects.get(shape["test_object_id"], run.target_id)
+                variant = shape["variant"]
+                if (item is None or descriptor.get("object_ref_hash") != owned_hash or
+                        descriptor.get("object_type") != item.object_type or
+                        descriptor.get("method") != template.method or
+                        (variant == "FOREIGN") != (step.role == "BOUNDARY") or
+                        (variant == "OWNER") != (step.role == "CONTROL") or
+                        (variant == "INVALID_OBJECT") != (step.role == "OTHER") or
+                        bool(descriptor.get("cross_identity")) != (variant == "FOREIGN") or
+                        descriptor.get("control_kind") != (
+                            "INVALID_OBJECT" if variant == "INVALID_OBJECT" else None) or
+                        (variant == "FOREIGN" and
+                         descriptor.get("identity_id") == item.creator_identity_id) or
+                        (variant != "FOREIGN" and
+                         descriptor.get("identity_id") != item.creator_identity_id)):
                     raise ValueError
             elif shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
                                         "EXPOSURE_OBJECT_PATH_V1",
@@ -400,6 +487,12 @@ class PlanOrchestrator:
             actor = ActorMode(descriptor["actor"])
             if category not in _ACTIVE or actor not in {ActorMode.ANONYMOUS, ActorMode.AUTHENTICATED}:
                 raise ValueError
+            if shape.get("binding") in {"API_OBSERVED_READ_V1", "API_OBSERVED_BATCH_V1"} and (
+                    category is not (ActionCategory.AUTHORIZATION_TEST if
+                                     shape["variant"] == "FOREIGN" or template.method == "POST"
+                                     else ActionCategory.SAFE_READ) or
+                    actor is not ActorMode.AUTHENTICATED):
+                raise ValueError
             if shape.get("binding") in {"AUTHORIZATION_OBJECT_PATH_V1",
                                         "EXPOSURE_OBJECT_PATH_V1",
                                         "AUTHORIZATION_GRAPHQL_QUERY_V1",
@@ -444,7 +537,7 @@ class PlanOrchestrator:
                 disposable_intent=descriptor.get("disposable_intent", False),
                 cross_identity=descriptor.get("cross_identity", False), id=step.action_id,
                 side_effect_hint=resolved_mutation.recipe.side_effect if
-                resolved_mutation is not None and template.method in {"PATCH", "PUT", "POST"} else None,
+                resolved_mutation is not None and template.method in {"PATCH", "PUT", "POST", "DELETE"} else None,
                 vulnerability_class=vulnerability_class,
             )
             return _BoundAction(action, template, step.role, resolved_mutation)
@@ -480,8 +573,78 @@ class PlanOrchestrator:
                                    prerequisite_state=prereq_state,
                                    advance=status is RuntimeStepStatus.COMPLETED)
         if self.objects and updated.status in _TERMINAL:
-            self.objects.release_run(updated.id, updated.target_id)
+            try:
+                self._reconcile_delete_cleanup(updated)
+            finally:
+                self.objects.release_run(updated.id, updated.target_id)
         return self.runs.details(updated)
+
+    def _reconcile_delete_cleanup(self, run: PlanRun) -> None:
+        if self.objects is None or self.recipes is None or self.mutations is None:
+            return
+        snapshot = self.runs.snapshot(run.plan_id, run.target_id)
+        shapes = snapshot.data.get("request_templates", [])
+        if (len(shapes) != 8 or shapes[0].get("mutation_type") != "DELETE_DISPOSABLE" or
+                tuple(shape.get("stage") for shape in shapes) !=
+                ("BEFORE_READ", "OWNER_MUTATE", "OWNER_READBACK",
+                 "TARGET_BEFORE_READ", "BOUNDARY_MUTATE", "BOUNDARY_READBACK",
+                 "RESTORE", "RESTORE_READBACK")):
+            return
+        package = self.targets.get_target_package(run.package_id)
+        if package is None:
+            return
+        indexed = {step.action_slot: step for step in self.runs.steps(run.id)
+                   if step.action_slot is not None}
+        try:
+            bound = {slot: resolve_mutation_stage(
+                shapes[slot], package=package, run_id=run.id, objects=self.objects,
+                recipes=self.recipes, evidence=self.evidence)
+                     for slot in (0, 2, 3, 5, 7)}
+            control = bound[2].item
+            target = bound[7].item
+            results = {slot: self.runs.result(indexed[slot].id)
+                       for slot in (0, 2, 3, 5, 7)}
+            owner_write = self.mutations.for_phase(run.id, control.id,
+                                                   MutationPhase.OWNER_CONTROL)
+            boundary_write = self.mutations.for_phase(run.id, target.id,
+                                                      MutationPhase.BOUNDARY)
+            cleanup_write = self.mutations.for_phase(run.id, target.id,
+                                                     MutationPhase.RESTORE)
+            def observed(slot: int) -> str | None:
+                result = results[slot]
+                if result is None or len(result.exchange_ids) != 1:
+                    return None
+                return self._mutation_readback(bound[slot], result.exchange_ids[0])
+
+            control_clean = (owner_write is not None and owner_write.verified_effect and
+                             observed(0) == "present" and observed(2) == "absent")
+            target_clean = (control_clean and boundary_write is not None and
+                            boundary_write.status in {MutationStatus.VERIFIED,
+                                                      MutationStatus.DENIED} and
+                            ((cleanup_write is not None and
+                              cleanup_write.status in {MutationStatus.VERIFIED,
+                                                       MutationStatus.DENIED} and
+                              cleanup_write.after_value_hash == value_hash("absent")) or
+                             (cleanup_write is None and boundary_write.verified_effect and
+                              indexed[6].safe_reason == "DELETE_ALREADY_ABSENT")) and
+                            observed(3) == "present" and
+                            observed(5) in {"present", "absent"} and
+                            observed(7) == "absent")
+            for item, slot, clean in ((control, 2, control_clean),
+                                      (target, 7, target_clean)):
+                if not clean:
+                    continue
+                result = results[slot]
+                assert result is not None
+                self.objects.transition(
+                    item.id, run.target_id, frozenset({ObjectState.IN_USE}),
+                    ObjectState.CLEANED, "PLAN_DELETE_ABSENCE_VERIFIED",
+                    action_id=indexed[slot].action_id,
+                    exchange_id=result.exchange_ids[0],
+                    evidence_ids=result.evidence_ids[:16],
+                    source="PLAN_ORCHESTRATOR")
+        except (KeyError, TypeError, ValueError, LookupError):
+            return
 
     def _record_execution_evidence(self, run: PlanRun, step: RuntimeStep,
                                    execution: ExecutionResult) -> tuple[str, ...]:
@@ -504,11 +667,16 @@ class PlanOrchestrator:
             return None
         exchange = self.traffic.get_exchange(exchange_id)
         recipe = self.recipes.get(bound.item.package_id, bound.item.recipe_id)
+        deleting = bound.recipe.mutation_type is MutationType.DELETE_DISPOSABLE
         if (exchange is None or recipe is None or recipe.sha256 != bound.item.recipe_hash or
                 exchange.target_id != bound.item.target_id or exchange.response is None or
-                exchange.response.record.status_code != 200 or
-                not exchange.response.body_evidence_id or
+                exchange.request.record.method != "GET" or
                 not bound.item.external_id_evidence_id):
+            return None
+        if deleting and exchange.response.record.status_code in {404, 410}:
+            return "absent"
+        if (exchange.response.record.status_code != 200 or
+                not exchange.response.body_evidence_id):
             return None
         response_ref = exchange.response.body_evidence_id
         record = self.evidence.get_evidence(response_ref)
@@ -526,6 +694,8 @@ class PlanOrchestrator:
                     json_pointer(data, recipe.verify_owner_pointer) != recipe.expected_owner or
                     json_pointer(data, recipe.verify_tenant_pointer) != recipe.expected_tenant):
                 return None
+            if deleting:
+                return "present"
             value = json_pointer(data, bound.recipe.readback_pointer)
             return value if isinstance(value, str) and len(value) <= 80 else None
         except (KeyError, IndexError, TypeError, ValueError, UnicodeError, PermissionError):
@@ -546,7 +716,14 @@ class PlanOrchestrator:
                     not isinstance(owner.get("session_id"), str)):
                 return None
             shape = dict(snapshot.data["request_templates"][step.action_slot])
-            shape["stage"] = MutationStage.OWNER_READBACK.value
+            shape["stage"] = (
+                MutationStage.BOUNDARY_READBACK.value
+                if mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE and
+                mutation.stage is MutationStage.BOUNDARY_MUTATE else
+                MutationStage.RESTORE_READBACK.value
+                if mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE and
+                mutation.stage is MutationStage.RESTORE else
+                MutationStage.OWNER_READBACK.value)
             shape["method"] = "GET"
             shape["fingerprint"] = mutation_fingerprint(shape)
             package = self.targets.get_target_package(run.package_id)
@@ -571,7 +748,9 @@ class PlanOrchestrator:
                 continue_dispatch=lambda: self.runs.should_dispatch(run.id),
                 on_dispatch=lambda exchange_id: self.runs.account_dispatch(
                     run.id, step.id, exchange_id))
-            if (observed.error is None and observed.status_code == 200 and
+            allowed_status = ({200, 404, 410} if mutation.recipe.mutation_type is
+                              MutationType.DELETE_DISPOSABLE else {200})
+            if (observed.error is None and observed.status_code in allowed_status and
                     len(observed.exchange_ids) == 1):
                 value = self._mutation_readback(resolved, observed.exchange_ids[0])
                 self.mutations.readback(
@@ -802,8 +981,25 @@ class PlanOrchestrator:
                                     reason="ACTION_BINDING_INVALID", waiting=RunStatus.BLOCKED)
             action, template = bound.action, bound.template
             mutation = bound.mutation
+            if (mutation is not None and self.mutations is not None and
+                    mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE and
+                    mutation.stage is MutationStage.RESTORE):
+                boundary_record = self.mutations.for_phase(
+                    run.id, mutation.item.id, MutationPhase.BOUNDARY)
+                boundary_step = next((item for item in self.runs.steps(run.id)
+                                      if item.action_slot == 5), None)
+                boundary_result = self.runs.result(boundary_step.id) if boundary_step else None
+                if (boundary_record is not None and boundary_record.verified_effect and
+                        boundary_result is not None and len(boundary_result.exchange_ids) == 1 and
+                        self._mutation_readback(
+                            mutation, boundary_result.exchange_ids[0]) == "absent"):
+                    return self._finish(
+                        run, step, status=RuntimeStepStatus.COMPLETED,
+                        reason="DELETE_ALREADY_ABSENT",
+                        result=self._result(step, "No cleanup write; owner read-back proved absence.",
+                                            evidence_ids=boundary_result.evidence_ids[:8]))
             token_header = (mutation.recipe.csrf_header if mutation is not None and
-                            template.method in {"PATCH", "PUT", "POST"} else None)
+                            template.method in {"PATCH", "PUT", "POST", "DELETE"} else None)
             if token_header is not None and self.executor.token_resolver is None:
                 return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                     reason="BLOCKED_TOKEN_REQUIRED", waiting=RunStatus.BLOCKED)
@@ -815,18 +1011,32 @@ class PlanOrchestrator:
                     result = self.runs.result(baseline.id) if baseline else None
                     observed = self._mutation_readback(
                         mutation, result.exchange_ids[-1] if result and result.exchange_ids else None)
-                    if observed != mutation.item.test_name:
+                    baseline = ("present" if mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE
+                                else mutation.item.test_name)
+                    if observed != baseline:
                         return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                             reason="OWNER_BASELINE_UNVERIFIED", waiting=RunStatus.BLOCKED)
                 if stage is MutationStage.BOUNDARY_MUTATE:
-                    control = self.mutations.for_phase(run.id, mutation.item.id,
+                    control_item = mutation.delete_control_item or mutation.item
+                    control = self.mutations.for_phase(run.id, control_item.id,
                                                        MutationPhase.OWNER_CONTROL)
                     if control is None or not control.verified_effect:
                         return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                             reason="OWNER_MUTATION_CONTROL_UNVERIFIED",
                                             waiting=RunStatus.BLOCKED)
+                    if mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE:
+                        target_step = next((item for item in self.runs.steps(run.id)
+                                            if item.action_slot == 3), None)
+                        target_result = self.runs.result(target_step.id) if target_step else None
+                        if (target_result is None or not target_result.exchange_ids or
+                                self._mutation_readback(
+                                    mutation, target_result.exchange_ids[-1]) != "present"):
+                            return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
+                                                reason="TARGET_BASELINE_UNVERIFIED",
+                                                waiting=RunStatus.BLOCKED)
                 if stage is MutationStage.RESTORE:
-                    control = self.mutations.for_phase(run.id, mutation.item.id,
+                    control_item = mutation.delete_control_item or mutation.item
+                    control = self.mutations.for_phase(run.id, control_item.id,
                                                        MutationPhase.OWNER_CONTROL)
                     boundary = self.mutations.for_phase(run.id, mutation.item.id,
                                                         MutationPhase.BOUNDARY)
@@ -871,8 +1081,10 @@ class PlanOrchestrator:
                     boundary_record = self.mutations.for_phase(run.id, mutation.item.id,
                                                                MutationPhase.BOUNDARY)
                     if boundary_record and boundary_record.verified_effect:
-                        before_value = TypedMutation.test_value(run.id, mutation.item.id,
-                                                                MutationPhase.BOUNDARY)
+                        before_value = ("absent" if mutation.recipe.mutation_type is
+                                        MutationType.DELETE_DISPOSABLE else
+                                        TypedMutation.test_value(run.id, mutation.item.id,
+                                                                 MutationPhase.BOUNDARY))
                 mutation_record = self.mutations.start(
                     mutation.typed_mutation(action.identity_id or "", action.operation or ""),
                     run_id=run.id, phase=phase, action_id=step.action_id,
@@ -938,20 +1150,39 @@ class PlanOrchestrator:
                                     "EXECUTION_FAILED", result=result, consumed=consumed,
                                     waiting=RunStatus.WAITING_HUMAN if mutating and consumed else RunStatus.FAILED)
             if mutation is not None and self.mutations is not None and mutation.stage in {
-                    MutationStage.BEFORE_READ, MutationStage.OWNER_READBACK,
+                    MutationStage.BEFORE_READ, MutationStage.TARGET_BEFORE_READ,
+                    MutationStage.OWNER_READBACK,
                     MutationStage.BOUNDARY_READBACK, MutationStage.RESTORE_READBACK}:
                 observed = self._mutation_readback(
                     mutation, execution.exchange_ids[-1] if execution.exchange_ids else None)
-                if mutation.stage is MutationStage.BEFORE_READ:
-                    if observed != mutation.item.test_name:
+                if mutation.stage in {MutationStage.BEFORE_READ,
+                                      MutationStage.TARGET_BEFORE_READ}:
+                    baseline = ("present" if mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE
+                                else mutation.item.test_name)
+                    if observed != baseline:
                         return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
-                                            reason="OWNER_BASELINE_UNVERIFIED", result=result,
+                                            reason=("TARGET_BASELINE_UNVERIFIED" if mutation.stage is
+                                                    MutationStage.TARGET_BEFORE_READ else
+                                                    "OWNER_BASELINE_UNVERIFIED"), result=result,
                                             consumed=consumed, waiting=RunStatus.BLOCKED)
                 else:
                     phase = (MutationPhase.OWNER_CONTROL if mutation.stage is MutationStage.OWNER_READBACK
                              else MutationPhase.BOUNDARY if mutation.stage is MutationStage.BOUNDARY_READBACK
                              else MutationPhase.RESTORE)
                     record = self.mutations.for_phase(run.id, mutation.item.id, phase)
+                    if (record is None and mutation.stage is MutationStage.RESTORE_READBACK and
+                            mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE):
+                        skipped = next((item for item in self.runs.steps(run.id)
+                                        if item.action_slot == 6), None)
+                        boundary_record = self.mutations.for_phase(
+                            run.id, mutation.item.id, MutationPhase.BOUNDARY)
+                        if (skipped is not None and skipped.status is RuntimeStepStatus.COMPLETED and
+                                skipped.safe_reason == "DELETE_ALREADY_ABSENT" and
+                                boundary_record is not None and boundary_record.verified_effect and
+                                observed == "absent"):
+                            return self._finish(run, step, status=RuntimeStepStatus.COMPLETED,
+                                                reason="DELETE_FINAL_ABSENCE_VERIFIED",
+                                                result=result, consumed=consumed)
                     if record is None or not execution.exchange_ids:
                         return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                             reason="MUTATION_READBACK_MISSING", result=result,
@@ -964,12 +1195,20 @@ class PlanOrchestrator:
                         return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                             reason="OWNER_MUTATION_CONTROL_UNVERIFIED", result=result,
                                             consumed=consumed, waiting=RunStatus.BLOCKED)
-                    if mutation.stage is MutationStage.RESTORE_READBACK and not verified.verified_effect:
+                    delete_absent = (mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE and
+                                     verified.after_value_hash == value_hash("absent") and
+                                     verified.status in {MutationStatus.VERIFIED, MutationStatus.DENIED})
+                    if (mutation.stage is MutationStage.RESTORE_READBACK and
+                            not (verified.verified_effect or delete_absent)):
                         return self._finish(run, step, status=RuntimeStepStatus.FAILED,
                                             reason="RESTORE_UNVERIFIED", result=result,
                                             consumed=consumed, waiting=RunStatus.WAITING_HUMAN)
-            if step.role == "CONTROL" and (execution.status_code is None or
-                                            not 200 <= execution.status_code < 300):
+            delete_absence = (mutation is not None and
+                              mutation.recipe.mutation_type is MutationType.DELETE_DISPOSABLE and
+                              mutation.stage is MutationStage.OWNER_READBACK and
+                              execution.status_code in {404, 410})
+            if step.role == "CONTROL" and not delete_absence and (
+                    execution.status_code is None or not 200 <= execution.status_code < 300):
                 return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                     reason="CONTROL_NOT_SUCCESSFUL", result=result, consumed=consumed,
                                     waiting=RunStatus.BLOCKED)

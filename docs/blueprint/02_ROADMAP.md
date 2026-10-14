@@ -1,8 +1,8 @@
 # Implementation Roadmap
 
-This is the authoritative phase numbering after the Phase 23 roadmap review. Phases 0-25 are complete; Phases 26-33 remain in the order below. Earlier blueprint labels and phase-specific next-step recommendations are historical where they conflict with this sequence. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
+This is the authoritative Phase 24-33 sequence from the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 were complete at that review. Phases 24-26 were delivered afterward; Phases 27-33 remain. Completion status may advance, but the phase numbers below do not change. Future sessions must use this numbering rather than conflicting older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
-## Completed phases (0-25)
+## Complete at reconciliation (0-23)
 
 | Phase | Delivered focus |
 | --- | --- |
@@ -30,16 +30,22 @@ This is the authoritative phase numbering after the Phase 23 roadmap review. Pha
 | 21 | DOM XSS specialist |
 | 22 | postMessage / MessagePort specialist |
 | 23 | Sensitive exposure specialist |
-| 24 | Cold-start bootstrap |
-| 25 | Target and normal-behaviour learning |
 
 Completion of a phase does not imply complete coverage of its bug class. In particular, Phase 12 profiling is passive and bounded; Phase 16 orchestrates one plan, not cross-specialist campaigns; and Phases 19-20 support only narrow, observed GraphQL authorization cases.
 
-## Remaining phases (26-33)
+## Reconciled sequence (24-33)
 
-Implement in this order. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
+Phases 24-26 have been delivered. Implement Phases 27-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
 
-### Phase 26 - GraphQL/API specialist expansion
+### Phase 24 - Cold-start bootstrap (complete)
+
+Build bounded target context when recon coverage is absent or thin, without treating discovery as active-testing authorization.
+
+### Phase 25 - Target/normal-behaviour learning (complete)
+
+Learn observed workflows, operations, roles, and object relationships from trusted, existing traffic without treating observations as policy or findings.
+
+### Phase 26 - GraphQL/API specialist expansion (complete)
 
 Expand beyond the existing narrow single-ID GraphQL query and typed rename mutation. Use observed operations and schemas to cover operation, field, nested-object, mutation, bulk, and API authorization boundaries with owned controls and independent validation.
 
@@ -73,7 +79,7 @@ Evaluate against local or recorded cases and measure precision, false positives,
 
 ## Superseded blueprint labels
 
-The original roadmap's labels and any phase-specific next-step recommendations that conflict with the sequence above are superseded. In particular:
+The original roadmap's labels and any phase-specific next-step recommendations that conflict with the sequence above are historical, not instructions to start work under those numbers. In particular:
 
 | Older label or recommendation | Authoritative disposition |
 | --- | --- |

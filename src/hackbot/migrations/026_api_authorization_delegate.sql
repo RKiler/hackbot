@@ -1,0 +1,2 @@
+ALTER TABLE api_candidates ADD COLUMN authorization_candidate_id TEXT REFERENCES authorization_candidates(candidate_id);
+CREATE INDEX api_candidates_authorization_delegate ON api_candidates(authorization_candidate_id);

@@ -1006,6 +1006,9 @@ frame.addEventListener('load',()=>{{
         orchestrator, run_id, _, _ = self._build(mode="foreign")
         self._finish(orchestrator, run_id)
         with sqlite3.connect(self.evidence.db_path) as db:
+            for table in ("api_inventory_progress", "api_specialist_runs", "api_candidates", "api_operations"):
+                db.execute(f"DROP TABLE {table}")
+            db.execute("DROP INDEX api_js_artifacts_target_hash_state")
             for table in ("behaviour_observations", "behaviour_workflows", "behaviour_expectations",
                           "behaviour_profiles", "behaviour_runs", "bootstrap_observations",
                           "bootstrap_discovery_states", "bootstrap_runs"):
@@ -1036,7 +1039,7 @@ frame.addEventListener('load',()=>{{
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 24)
+        self.assertEqual(version, 33)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)

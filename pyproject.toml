@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Standalone foundation for evidence-driven security research"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6,<7", "requests>=2.31,<3"]
+dependencies = ["PyYAML>=6,<7", "requests>=2.31,<3", "graphql-core~=3.2.0"]
 
 [project.optional-dependencies]
 recon = ["psycopg2-binary>=2.9,<3"]
@@ -23,5 +23,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 hackbot = ["migrations/*.sql", "dom_ast.cjs", "dom_map.cjs", "js_ast_common.cjs",
-           "message_ast.cjs", "ui/*", "skill_catalog/core/*/*/SKILL.md",
+           "message_ast.cjs", "api_ast.cjs", "ui/*", "skill_catalog/core/*/*/SKILL.md",
            "skill_catalog/imported/*/SKILL.md", "skill_catalog/personal/*/SKILL.md"]

@@ -60,9 +60,15 @@ class TypedMutation:
     evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if (self.mutation_type is not MutationType.RENAME or
-                self.side_effect is not SideEffect.SAFE_UPDATE or
-                self.field != "name" or self.cleanup_strategy != "RESTORE"):
+        rename = (self.mutation_type is MutationType.RENAME and
+                  self.side_effect is SideEffect.SAFE_UPDATE and
+                  self.field == "name" and self.cleanup_strategy == "RESTORE")
+        delete = (self.mutation_type is MutationType.DELETE_DISPOSABLE and
+                  self.side_effect is SideEffect.SAFE_DELETE and
+                  self.field == "existence" and
+                  self.value_label == self.expected_readback == "absent" and
+                  self.cleanup_strategy == "DELETE_AND_VERIFY")
+        if not (rename or delete):
             raise ValueError("unsafe mutation classification")
         if (not _TARGET_ID.fullmatch(self.target_id) or
                 not _OBJECT_ID.fullmatch(self.test_object_id) or

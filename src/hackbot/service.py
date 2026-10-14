@@ -20,6 +20,8 @@ from . import __version__
 from .auth import AuthContextManager, AuthMechanism
 from .authorization import AuthorizationSpecialist
 from .authorization_store import AuthorizationMode, AuthorizationStore, HuntStatus
+from .api_registry import APIOperationRegistry
+from .api_specialist import APIAnalysisLimits, APISpecialist
 from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
 from .browser_playwright import PlaywrightBrowserDriver
@@ -124,6 +126,7 @@ class BugHunterRuntime:
         self.bootstrap_store = BootstrapStore(self.store)
         self.behaviour_store = BehaviourStore(self.store)
         self.exposure_store = ExposureStore(self.store)
+        self.api_operations = APIOperationRegistry(self.store)
         self.postmessage_store = PostMessageStore(self.store, self.domxss_store)
         self.skills = SkillRegistry(config.skills.root if config.skills else Path(__file__).resolve().parent / "skill_catalog")
         self.skill_checker = PrerequisiteChecker()
@@ -198,7 +201,8 @@ class BugHunterRuntime:
             identities=self.registry, hypotheses=self.hypotheses,
             results=self.validations, registry=self.validator_registry,
             dom=self.domxss_store, messages=self.postmessage_store,
-            targets=self.targets, exposure=self.exposure)
+            targets=self.targets, exposure=self.exposure,
+            api_operations=self.api_operations)
         self.orchestrator = PlanOrchestrator(
             runs=self.run_store, targets=self.targets, hypotheses=self.hypotheses,
             context=self.skill_context, checker=self.skill_checker, registry=self.skills,
@@ -206,7 +210,7 @@ class BugHunterRuntime:
             traffic=self.traffic, evidence=self.store, objects=self.objects,
             recipes=self.object_factory.recipes, mutations=self.mutation_results,
             dom=self.domxss_browser, messages=self.postmessage_browser,
-            exposure=self.exposure)
+            exposure=self.exposure, api_operations=self.api_operations)
         self.authorization_ledger = AuthorizationStore(self.store)
         self.authorization = AuthorizationSpecialist(
             identities=self.registry, browser=self.browser, objects=self.objects,
@@ -215,6 +219,10 @@ class BugHunterRuntime:
             router=self.skill_router, planner=self.skill_planner,
             orchestrator=self.orchestrator, validator=self.validator,
             factory=self.object_factory, behaviour=self.behaviour_store)
+        self.api = APISpecialist(
+            registry=self.api_operations, traffic=self.traffic, evidence=self.store,
+            js=self.domxss_store, behaviour=self.behaviour_store,
+            recon=self.recon, authorization=self.authorization)
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         while self.objects.reconcile():
@@ -1496,6 +1504,102 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             feature=data["feature"], action=data.get("action"), expected_access=data["expected_access"],
             provenance=data.get("provenance", "RESEARCHER"))
         return jsonify({"saved": True}), 201
+
+    @app.get("/v1/api/<package_id>/coverage")
+    def api_coverage(package_id: str):
+        package = service.package(package_id)
+        counts = service.api_operations.counts(package.target.id)
+        types = service.api_operations.operation_type_counts(package.target.id)
+        progress = service.api_operations.progress(package.target.id, package.id)
+        return jsonify({"counts": counts, "metrics": service.api_operations.metrics(package.target.id),
+                        "queries": types.get("GRAPHQL_QUERY", 0),
+                        "mutations": types.get("GRAPHQL_MUTATION", 0),
+                        "surface_types": sorted(types),
+                        "inventory_more": {"traffic": progress.traffic_cursor is not None,
+                                           "js": progress.js_cursor is not None,
+                                           "operations": progress.operation_cursor is not None},
+                        "coverage_note": "Observed and current-JS operations only; schema coverage is not exhaustive."})
+
+    @app.get("/v1/api/<package_id>/operations")
+    def api_operations(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        state = request.args.get("state", "CURRENT")
+        items, next_cursor = service.api_operations.page_operations(
+            package.target.id, limit=page.limit, state=state, cursor=page.cursor)
+        return jsonify({"items": [item.to_dict() for item in items],
+                        "next_cursor": next_cursor})
+
+    @app.get("/v1/api/<package_id>/operations/<operation_id>")
+    def api_operation_detail(package_id: str, operation_id: str):
+        package = service.package(package_id)
+        item = service.api_operations.get_operation(package.target.id, operation_id)
+        if item is None:
+            raise LookupError("API operation not found")
+        candidates, next_cursor = service.api_operations.page_candidates(
+            package.target.id, limit=50, operation_id=item.id)
+        return jsonify({"operation": item.to_dict(),
+                        "candidates": [entry.to_dict() for entry in candidates],
+                        "next_cursor": next_cursor})
+
+    @app.get("/v1/api/<package_id>/candidates")
+    def api_candidates(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse()
+        operation_id = request.args.get("operation_id")
+        if operation_id and service.api_operations.get_operation(package.target.id,
+                                                                  operation_id) is None:
+            raise LookupError("API operation not found")
+        items, next_cursor = service.api_operations.page_candidates(
+            package.target.id, limit=page.limit, cursor=page.cursor,
+            operation_id=operation_id)
+        return jsonify({"items": [item.to_dict() for item in items],
+                        "next_cursor": next_cursor})
+
+    @app.get("/v1/api/<package_id>/candidates/<candidate_id>")
+    def api_candidate_detail(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        item = service.api_operations.get_candidate(package.target.id, candidate_id)
+        if item is None:
+            raise LookupError("API candidate not found")
+        operation = service.api_operations.get_operation(package.target.id, item.operation_id)
+        return jsonify({"candidate": item.to_dict(),
+                        "operation": operation.to_dict() if operation else None})
+
+    @app.post("/v1/api/<package_id>/analyze")
+    def api_analyze(package_id: str):
+        package = service.package(package_id)
+        body = _body(frozenset({"limits", "mode", "operation_id"}))
+        raw_limits = body.get("limits") or {}
+        if not isinstance(raw_limits, dict) or set(raw_limits) - set(APIAnalysisLimits.__dataclass_fields__):
+            raise ValueError("Invalid API analysis limits")
+        limits = APIAnalysisLimits(**raw_limits)
+        mode = body.get("mode", "PLAN_ONLY")
+        operation_id = body.get("operation_id")
+        if operation_id is not None and not isinstance(operation_id, str):
+            raise ValueError("Invalid API operation ID")
+        candidates = service.api.generate(package, limits=limits, mode=mode,
+                                          operation_id=operation_id)
+        return jsonify({"items": [item.to_dict() for item in candidates],
+                        "coverage": service.api_operations.counts(package.target.id)}), 201
+
+    @app.post("/v1/api/<package_id>/candidates/<candidate_id>/prepare")
+    def api_prepare_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        _body(frozenset())
+        return jsonify(service.api.prepare_candidate(package, candidate_id).to_dict())
+
+    @app.post("/v1/api/<package_id>/candidates/<candidate_id>/start")
+    def api_start_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        _body(frozenset())
+        return jsonify(service.api.start_candidate(package, candidate_id)), 201
+
+    @app.post("/v1/api/<package_id>/candidates/<candidate_id>/advance")
+    def api_advance_candidate(package_id: str, candidate_id: str):
+        package = service.package(package_id)
+        _body(frozenset())
+        return jsonify(service.api.advance_candidate(package, candidate_id))
 
     @app.get("/v1/authorization/<package_id>/profile")
     def authorization_profile(package_id: str):
