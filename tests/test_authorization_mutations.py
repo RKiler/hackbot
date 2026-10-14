@@ -30,6 +30,7 @@ from hackbot.validator import DeterministicValidatorEngine
 from hackbot.traffic import CapturedRequest, CapturedResponse
 from hackbot.test_objects import ObjectState
 from tests.test_authorization import AuthorizationSpecialistTests as _AuthorizationFixture
+from tests.schema_utils import drop_phase28_schema
 
 
 class AuthorizationMutationFixtureTests(unittest.TestCase):
@@ -259,6 +260,7 @@ class AuthorizationMutationFixtureTests(unittest.TestCase):
         legacy = files("hackbot").joinpath(
             "migrations", "016_authorization_mutations.sql").read_text()
         with sqlite3.connect(self.case.fx.store.db_path) as connection:
+            drop_phase28_schema(connection)
             columns = [row[1] for row in connection.execute(
                 "PRAGMA table_info(authorization_mutation_results)")]
             rows = connection.execute("SELECT * FROM authorization_mutation_results").fetchall()

@@ -338,6 +338,61 @@ class APIOperationRegistry:
                              (target_id, operation_id)).fetchone()
         return self._operation(row) if row else None
 
+    def current_js_successors(self, target_id: str, operation_id: str,
+                              *, limit: int = 3) -> tuple[APIOperation, ...]:
+        """Find exact same-surface replacements, never parallel observed documents."""
+        if type(limit) is not int or not 1 <= limit <= 5:
+            raise ValueError("Invalid API successor limit")
+        old = self.get_operation(target_id, operation_id)
+        if (old is None or old.state != "STALE" or old.exchange_ids or
+                not old.source_asset_hash):
+            return ()
+        refs = [ref[3:] for ref in old.source_refs if ref.startswith("JS:DOMART-")]
+        if len(refs) != 1:
+            return ()
+        with self.store._connection() as db:
+            prior = db.execute("SELECT recon_asset_id,asset_url_sha256,artifact_sha256 "
+                               "FROM dom_js_artifacts WHERE target_id=? AND artifact_id=?",
+                               (target_id, refs[0])).fetchone()
+            if (prior is None or prior["artifact_sha256"] != old.source_asset_hash or
+                    prior["recon_asset_id"] is None):
+                return ()
+            rows = db.execute("SELECT op.*,asset.artifact_id AS successor_asset_id FROM "
+                "api_operations op JOIN dom_js_artifacts asset ON "
+                "asset.target_id=op.target_id AND asset.artifact_sha256=op.source_asset_hash "
+                "WHERE op.target_id=? AND op.package_id=? AND op.operation_key=? "
+                "AND op.operation_id!=? AND op.state='CURRENT' AND op.exchange_ids_json='[]' "
+                "AND asset.state='CURRENT' AND asset.recon_sha256=asset.artifact_sha256 "
+                "AND asset.recon_asset_id=? AND asset.asset_url_sha256=? "
+                "ORDER BY op.last_seen DESC,op.operation_id DESC LIMIT ?",
+                (target_id, old.package_id, old.operation_key, operation_id,
+                 prior["recon_asset_id"], prior["asset_url_sha256"], limit)).fetchall()
+        return tuple(self._operation(row) for row in rows
+                     if "JS:" + row["successor_asset_id"] in
+                     json.loads(row["source_refs_json"]))
+
+    def current_js_replacement_available(self, target_id: str, operation_id: str) -> bool:
+        """Whether an exact recon JS replacement can justify one retry."""
+        old = self.get_operation(target_id, operation_id)
+        if old is None or old.exchange_ids or not old.source_asset_hash:
+            return False
+        refs = [ref[3:] for ref in old.source_refs if ref.startswith("JS:DOMART-")]
+        if len(refs) != 1:
+            return False
+        with self.store._connection() as db:
+            prior = db.execute("SELECT recon_asset_id,asset_url_sha256,artifact_sha256 "
+                               "FROM dom_js_artifacts WHERE target_id=? AND artifact_id=?",
+                               (target_id, refs[0])).fetchone()
+            if (prior is None or prior["recon_asset_id"] is None or
+                    prior["artifact_sha256"] != old.source_asset_hash):
+                return False
+            replacement = db.execute("SELECT 1 FROM dom_js_artifacts WHERE target_id=? "
+                "AND recon_asset_id=? AND asset_url_sha256=? AND artifact_sha256!=? "
+                "AND state='CURRENT' AND recon_sha256=artifact_sha256 LIMIT 1",
+                (target_id, prior["recon_asset_id"], prior["asset_url_sha256"],
+                 prior["artifact_sha256"])).fetchone()
+        return replacement is not None
+
     def find_current_operation(self, target_id: str, *, endpoint: str, method: str,
                                name: str, kind: APIOperationType,
                                version_hash: str) -> APIOperation | None:

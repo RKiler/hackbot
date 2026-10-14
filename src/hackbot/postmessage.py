@@ -8,7 +8,7 @@ import hashlib
 import json
 from urllib.parse import urlsplit
 
-from .domxss import DOMAssetLead, DOMXSSSpecialist
+from .domxss import DOMAcquisitionStatus, DOMAssetLead, DOMXSSSpecialist
 from .domxss_static import DOMStaticAnalyzer
 from .hypotheses import Hypothesis, HypothesisSource, HypothesisStatus, HypothesisStore
 from .logging import SecretRedactor
@@ -59,22 +59,37 @@ class PostMessageSpecialist:
         return tuple(leads[:self.MAX_ASSETS])
 
     def analyze_asset(self, package_id: str, recon_asset_id: int):
-        package = self._package(package_id)
         lead = next((item for item in self.inventory(package_id)
                      if item.asset.asset_id == recon_asset_id), None)
         if lead is None:
             raise ValueError("Asset is not in the bounded first-party inventory")
-        acquired = self.dom.acquire(package_id, lead.asset)
-        if acquired.artifact is None:
+        return self.refresh_observed_asset(package_id, recon_asset_id,
+                                           recent_change="RECENT_DELTA" in lead.reasons)
+
+    def refresh_observed_asset(self, package_id: str, recon_asset_id: int,
+                               *, recent_change: bool = False,
+                               include_source_map: bool = True):
+        """Refresh one pinned recon asset through Phase 21 policy-gated acquisition."""
+        package = self._package(package_id)
+        recon_target = self.dom.recon.resolve_target(package.target.root_domain)
+        if recon_target is None:
+            raise ValueError("Recon target is unavailable")
+        asset = self.dom.recon.get_js_asset(recon_target.domain_id, recon_asset_id)
+        if (asset is None or asset.asset_id != recon_asset_id or
+                package.scope.evaluate_url(asset.asset_url).result is not ScopeResult.IN_SCOPE):
+            raise ValueError("Observed in-scope JavaScript asset is required")
+        acquired = self.dom.acquire(package_id, asset)
+        if (acquired.artifact is None or acquired.status not in {
+                DOMAcquisitionStatus.RETRIEVED, DOMAcquisitionStatus.REUSED}):
             return acquired.status.value, None, None, acquired.reason_code
         analysis_id, analysis = self.store.analyze_asset(
             package.target.id, acquired.artifact.artifact_id, self.analyzer,
-            recent_change="RECENT_DELTA" in lead.reasons)
+            recent_change=recent_change)
         if any("DOM_WRITE" in item.sensitive_operations for item in analysis.candidates):
             self.dom.store.analyze_asset(package.target.id, acquired.artifact.artifact_id,
                                          DOMStaticAnalyzer())
-        if any(item.priority >= 75 for item in analysis.candidates):
-            mapped = self.dom.acquire_source_map(package_id, lead.asset, acquired.artifact)
+        if include_source_map and any(item.priority >= 75 for item in analysis.candidates):
+            mapped = self.dom.acquire_source_map(package_id, asset, acquired.artifact)
             if mapped.source_map is not None:
                 for item in analysis.candidates:
                     if item.priority >= 75:

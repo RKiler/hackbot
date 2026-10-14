@@ -77,7 +77,7 @@ QUALITY = {
 }
 RESEARCH_VERSION = "1"
 _SAFE_TERM = re.compile(r"[A-Za-z][A-Za-z0-9 ._+/#-]{1,119}\Z")
-_ID = re.compile(r"(?:HYP|EXP|APIC)-[0-9a-f]{32}\Z")
+_ID = re.compile(r"(?:HYP|EXP|APIC|PLCAND)-[0-9a-f]{32}\Z")
 _SENSITIVE = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:password|cookie|secret|token|api[_-]?key)\s*[:=]\s*\S+|"
     r"[A-Za-z0-9_-]{28,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}|"
@@ -409,6 +409,20 @@ class ResearchStore:
                     return KnowledgeGap(gap_ref, target_id, GapType.NEW_API_STYLE,
                                         row["operation_type"].replace("_", " ").lower() + " authorization",
                                         row["operation_type"], row["category"], "api", None, row["score"])
+            elif prefix == "planner" and identifier.startswith("PLCAND-"):
+                row = db.execute("SELECT category,specialist,priority,gaps_json,hypothesis_id "
+                                 "FROM planner_candidates WHERE target_id=? AND candidate_id=? "
+                                 "AND status IN ('SELECTED','NEEDS_REFRESH','WAITING')",
+                                 (target_id, identifier)).fetchone()
+                if row:
+                    gaps = json.loads(row["gaps_json"])
+                    if "UNKNOWN_PROTOCOL" in gaps or "MISSING_RESEARCH" in gaps:
+                        kind = (GapType.UNKNOWN_PROTOCOL if "UNKNOWN_PROTOCOL" in gaps
+                                else GapType.SKILL_GAP)
+                        return KnowledgeGap(gap_ref, target_id, kind,
+                            "observed " + row["category"].replace("_", " ").lower() +
+                            " security boundary", None, row["category"],
+                            row["specialist"].lower(), row["hypothesis_id"], row["priority"])
         raise LookupError("structured research gap not found")
 
     def cached(self, cache_key: str) -> dict[str, object] | None:

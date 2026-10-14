@@ -50,6 +50,12 @@ from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAc
 from .policy_store import PolicyStore
 from .permit_store import PolicyPermitStore
 from .plan_runs import PlanRunStore, RunStatus
+from .planner import CrossSpecialistPlanner
+from .planner_context import PlannerContextBuilder
+from .planner_models import (CandidateOverride, CandidateStatus, PlannerLimits,
+                             PlannerMode, PlannerStatus, PlannerTaskStatus, Specialist)
+from .planner_runner import PlannerRunner
+from .planner_store import MAX_RUN_TASKS, PlannerStore
 from .orchestrator import PlanOrchestrator
 from .object_factory import ObjectFactory
 from .mutation_results import MutationResultStore
@@ -240,6 +246,29 @@ class BugHunterRuntime:
             registry=self.api_operations, traffic=self.traffic, evidence=self.store,
             js=self.domxss_store, behaviour=self.behaviour_store,
             recon=self.recon, authorization=self.authorization)
+        self.planner_store = PlannerStore(self.store)
+        self.planner_context = PlannerContextBuilder(
+            hypotheses=self.hypotheses, behaviour=self.behaviour_store,
+            bootstrap=self.bootstrap_store, identities=self.registry,
+            browser=self.browser, objects=self.objects, traffic=self.traffic,
+            research=self.research_store, validations=self.validations, recon=self.recon)
+        self.planner = CrossSpecialistPlanner(
+            store=self.planner_store, context=self.planner_context,
+            hypotheses=self.hypotheses, authorization=self.authorization_ledger,
+            api=self.api_operations, dom=self.domxss_store,
+            messages=self.postmessage_store, exposure=self.exposure_store,
+            traffic=self.traffic, validations=self.validations,
+            skill_context=self.skill_context, skill_router=self.skill_router)
+        self.planner_runner = PlannerRunner(
+            planner=self.planner, store=self.planner_store,
+            hypotheses=self.hypotheses, contexts=self.skill_context,
+            router=self.skill_router, skill_planner=self.skill_planner,
+            authorization=self.authorization, api=self.api,
+            dom=self.domxss, messages=self.postmessage, exposure=self.exposure,
+            research=self.research, objects=self.objects, object_factory=self.object_factory,
+            browser=self.browser, orchestrator=self.orchestrator, validator=self.validator)
+        self._planner_lock = Lock()
+        self._planner_threads: dict[str, Thread] = {}
         self.logger = create_logger(level=config.log_level)
         self._vnc_ready = vnc_ready or self._probe_vnc
         while self.objects.reconcile():
@@ -253,6 +282,71 @@ class BugHunterRuntime:
             pass
         while self.authorization_ledger.reconcile_runs():
             pass
+        self.planner_store.reconcile_interrupted()
+        cursor = ""
+        while True:
+            recoverable = self.planner_store.restartable(after_run_id=cursor)
+            if not recoverable:
+                break
+            for run in recoverable:
+                try:
+                    package = self.package(run.package_id)
+                    self.planner_runner._current(package, run)
+                    ambiguous = {task.candidate_id for task in self.planner_store.tasks(
+                        run.target_id, run.id, limit=MAX_RUN_TASKS)
+                        if task.status is PlannerTaskStatus.WAITING
+                        and task.reason_code == "AMBIGUOUS_RESTART"}
+                    for candidate in self.planner_store.candidates(
+                            run.target_id, run.id, limit=run.limits.portfolio):
+                        if candidate.status in {CandidateStatus.SELECTED,
+                                                CandidateStatus.NEEDS_REFRESH} and candidate.id not in ambiguous:
+                            self.planner.build_tasks(run, candidate)
+                    self.launch_planner(run.package_id, run.id)
+                except (LookupError, ValueError):
+                    self.planner_store.transition(run.target_id, run.id,
+                                                  PlannerStatus.PAUSED,
+                                                  "RECOVERY_PREREQUISITE_CHANGED")
+            cursor = recoverable[-1].id
+            if len(recoverable) < 50:
+                break
+
+    def launch_planner(self, package_id: str, run_id: str) -> None:
+        with self._planner_lock:
+            existing = self._planner_threads.get(run_id)
+            if existing and existing.is_alive():
+                return
+            thread = Thread(target=self._planner_work, args=(package_id, run_id), daemon=True,
+                            name="planner-" + run_id[-8:])
+            self._planner_threads[run_id] = thread
+            thread.start()
+
+    def _planner_work(self, package_id: str, run_id: str) -> None:
+        try:
+            for _ in range(MAX_RUN_TASKS * 8):
+                with self._planner_lock:
+                    package = self.package(package_id)
+                    result = self.planner_runner.advance(package, run_id)
+                if result["run"]["status"] not in {"READY", "RUNNING"} or result["task"] is None:
+                    break
+            else:
+                with self._planner_lock:
+                    run = self.planner_store.get(self.package(package_id).target.id, run_id)
+                    if run and run.status in {PlannerStatus.READY, PlannerStatus.RUNNING}:
+                        self.planner_runner.pause(self.package(package_id), run_id)
+                self.logger.warning("planner_step_limit_reached")
+        except Exception:
+            self.logger.error("planner_worker_failed")
+            with self._planner_lock:
+                try:
+                    package = self.package(package_id)
+                    run = self.planner_store.get(package.target.id, run_id)
+                    if run and run.status in {PlannerStatus.READY, PlannerStatus.RUNNING}:
+                        self.planner_runner.pause(package, run_id)
+                except Exception:
+                    pass
+        finally:
+            with self._planner_lock:
+                self._planner_threads.pop(run_id, None)
 
     def _probe_vnc(self) -> bool:
         if not self.config.browser.vnc_url:
@@ -1643,6 +1737,138 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if not service.research_store.cancel(package.target.id, request_id):
             raise LookupError("active research request not found")
         return jsonify({"request_id": request_id, "status": "CANCELLED"})
+
+    @app.get("/v1/planner/<package_id>/runs")
+    def planner_runs(package_id: str):
+        package = service.package(package_id)
+        page = PageRequest.parse(maximum=50)
+        if page.cursor:
+            raise ValueError("planner run cursor is not supported")
+        return jsonify({"items": [item.to_dict() for item in
+                        service.planner_store.list(package.target.id, limit=page.limit)]})
+
+    @app.post("/v1/planner/<package_id>/runs")
+    def planner_start(package_id: str):
+        package = service.package(package_id)
+        payload = _body(frozenset({"mode", "limits"}))
+        mode = PlannerMode(payload.get("mode", PlannerMode.ANALYZE_ONLY.value))
+        raw_limits = payload.get("limits", {})
+        if not isinstance(raw_limits, dict) or set(raw_limits) - set(PlannerLimits.__dataclass_fields__):
+            raise ValueError("invalid planner limits")
+        limits = PlannerLimits(**raw_limits)
+        run = service.planner.start(package, mode=mode, limits=limits)
+        if mode is not PlannerMode.ANALYZE_ONLY:
+            service.launch_planner(package.id, run.id)
+        return jsonify(run.to_dict()), 201
+
+    @app.get("/v1/planner/<package_id>/runs/<run_id>")
+    def planner_detail(package_id: str, run_id: str):
+        package = service.package(package_id)
+        run = service.planner_store.get(package.target.id, run_id)
+        if run is None:
+            raise LookupError("planner run not found")
+        candidates = service.planner_store.candidates(package.target.id, run_id,
+                                                       limit=min(200, run.limits.portfolio))
+        tasks = service.planner_store.tasks(package.target.id, run_id, limit=MAX_RUN_TASKS)
+        login_requirements = []
+        for item in tasks:
+            if item.reason_code != "LOGIN_REQUIRED" or not item.result_ref:
+                continue
+            identity_id = item.result_ref if item.result_ref.startswith("IDENTITY-") else None
+            if item.result_ref.startswith("TESTOBJ-"):
+                owned = service.objects.get(item.result_ref, package.target.id)
+                if owned is not None and owned.package_id == package.id:
+                    identity_id = owned.creator_identity_id
+            identity = (service.registry.get_identity(package.target.id, identity_id)
+                        if identity_id else None)
+            if identity is not None:
+                login_requirements.append({"task_id": item.id, "identity_id": identity.id,
+                                           "account_alias": identity.alias})
+        research_briefs = tuple(dict.fromkeys(
+            item.result_ref for item in tasks
+            if item.result_ref and item.result_ref.startswith("RBRF-") and (
+                item.task_type.value == "REQUEST_RESEARCH" and item.status.value == "COMPLETED"
+                or item.task_type.value == "CREATE_PLAN" and item.status.value == "WAITING")))
+        return jsonify({"run": run.to_dict(),
+                        "metrics": service.planner_store.metrics(package.target.id, run_id),
+                        "candidates": [item.to_dict() for item in candidates],
+                        "tasks": [item.to_dict() for item in tasks],
+                        "login_requirements": login_requirements,
+                        "events": service.planner_store.events(package.target.id, run_id, limit=50),
+                        "findings": [item.finding_id for item in candidates if item.finding_id],
+                        "research_briefs": research_briefs})
+
+    @app.post("/v1/planner/<package_id>/runs/<run_id>/advance")
+    def planner_advance(package_id: str, run_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        with service._planner_lock:
+            result = service.planner_runner.advance(package, run_id)
+        return jsonify(result)
+
+    @app.post("/v1/planner/<package_id>/runs/<run_id>/pause")
+    def planner_pause(package_id: str, run_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        with service._planner_lock:
+            run = service.planner_runner.pause(package, run_id)
+        return jsonify(run.to_dict())
+
+    @app.post("/v1/planner/<package_id>/runs/<run_id>/resume")
+    def planner_resume(package_id: str, run_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        with service._planner_lock:
+            run = service.planner_runner.resume(package, run_id)
+        if run.status.value in {"READY", "RUNNING"}:
+            service.launch_planner(package.id, run_id)
+        return jsonify(run.to_dict())
+
+    @app.post("/v1/planner/<package_id>/runs/<run_id>/cancel")
+    def planner_cancel(package_id: str, run_id: str):
+        _body(frozenset())
+        package = service.package(package_id)
+        with service._planner_lock:
+            run = service.planner_runner.cancel(package, run_id)
+        return jsonify(run.to_dict())
+
+    @app.get("/v1/planner/<package_id>/runs/<run_id>/candidates")
+    def planner_candidates(package_id: str, run_id: str):
+        package = service.package(package_id)
+        if service.planner_store.get(package.target.id, run_id) is None:
+            raise LookupError("planner run not found")
+        return jsonify({"items": [item.to_dict() for item in
+                        service.planner_store.candidates(package.target.id, run_id, limit=200)]})
+
+    @app.get("/v1/planner/<package_id>/runs/<run_id>/candidates/<candidate_id>/relationships")
+    def planner_relationships(package_id: str, run_id: str, candidate_id: str):
+        package = service.package(package_id)
+        if service.planner_store.candidate(package.target.id, run_id, candidate_id) is None:
+            raise LookupError("planner candidate not found")
+        return jsonify({"items": service.planner_store.relationships(
+            package.target.id, run_id, candidate_id)})
+
+    @app.get("/v1/planner/<package_id>/runs/<run_id>/tasks")
+    def planner_tasks(package_id: str, run_id: str):
+        package = service.package(package_id)
+        if service.planner_store.get(package.target.id, run_id) is None:
+            raise LookupError("planner run not found")
+        return jsonify({"items": [item.to_dict() for item in
+                        service.planner_store.tasks(package.target.id, run_id, limit=MAX_RUN_TASKS)]})
+
+    @app.post("/v1/planner/<package_id>/runs/<run_id>/candidates/<candidate_id>/override")
+    def planner_override(package_id: str, run_id: str, candidate_id: str):
+        payload = _body(frozenset({"choice", "specialist", "skill_id"}))
+        choice = CandidateOverride(payload["choice"])
+        specialist = Specialist(payload["specialist"]) if payload.get("specialist") else None
+        skill_id = payload.get("skill_id")
+        if skill_id is not None and not isinstance(skill_id, str):
+            raise ValueError("invalid skill override")
+        package = service.package(package_id)
+        with service._planner_lock:
+            item = service.planner_runner.override(package, run_id, candidate_id, choice,
+                                                   specialist=specialist, skill_id=skill_id)
+        return jsonify(item.to_dict())
 
     @app.get("/v1/api/<package_id>/coverage")
     def api_coverage(package_id: str):

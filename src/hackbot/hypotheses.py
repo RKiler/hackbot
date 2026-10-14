@@ -122,10 +122,14 @@ class HypothesisStore:
         return profile_id
 
     def latest_profile(self, target_id: str) -> TargetProfile | None:
+        record = self.latest_profile_record(target_id)
+        return record[1] if record else None
+
+    def latest_profile_record(self, target_id: str) -> tuple[str, TargetProfile] | None:
         with self.evidence._connection() as db:
-            row = db.execute("SELECT profile_json FROM target_profiles WHERE target_id=? "
+            row = db.execute("SELECT profile_id,profile_json FROM target_profiles WHERE target_id=? "
                              "ORDER BY generated_at DESC,profile_id DESC LIMIT 1", (target_id,)).fetchone()
-        return TargetProfile.from_dict(json.loads(row[0])) if row else None
+        return (row["profile_id"], TargetProfile.from_dict(json.loads(row["profile_json"]))) if row else None
 
     def evidence_for_signal(self, target_id: str, signal: SurfaceSignal) -> tuple[str, ...]:
         if signal.evidence_ids:

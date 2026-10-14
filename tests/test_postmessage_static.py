@@ -8,16 +8,20 @@ from pathlib import Path
 import shutil
 import sqlite3
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 from hackbot.artifacts import ArtifactStore
 from hackbot.config import StoreSettings
 from hackbot.domxss_store import DOMXSSStore
+from hackbot.domxss import DOMAcquisition, DOMAcquisitionStatus
 from hackbot.domxss_static import DOMStaticAnalyzer
 from hackbot.identity_registry import IdentityRegistry
 from hackbot.postmessage_static import (ANALYZER_VERSION, MessageAnalysis,
                                        PostMessageStaticAnalyzer, MessageCandidateStatus)
 from hackbot.postmessage_store import PostMessageStore
+from hackbot.postmessage import PostMessageSpecialist
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
 
@@ -308,6 +312,50 @@ class PostMessageStoreTests(unittest.TestCase):
         item = analysis.candidates[0]
         self.record("https://app.example.test/a.js", TWO_STAGE + b"// changed")
         self.assertIsNone(self.messages.current_asset(self.target, item.candidate_id))
+
+    def test_exact_observed_refresh_rejects_out_of_scope_and_skips_source_map(self) -> None:
+        asset = self.record("https://app.example.test/a.js")
+        recon_asset = SimpleNamespace(asset_id=42, asset_url="https://app.example.test/a.js")
+        recon = SimpleNamespace(
+            resolve_target=Mock(return_value=SimpleNamespace(domain_id=9)),
+            get_js_asset=Mock(return_value=recon_asset))
+        dom = SimpleNamespace(
+            recon=recon, store=self.dom,
+            acquire=Mock(return_value=DOMAcquisition(DOMAcquisitionStatus.REUSED, asset, ())),
+            acquire_source_map=Mock())
+        specialist = PostMessageSpecialist(
+            dom=dom,
+            targets=SimpleNamespace(get_target_package=lambda _: self.package),
+            store=self.messages)
+        status, analysis_id, analysis, reason = specialist.refresh_observed_asset(
+            self.package.id, 42, include_source_map=False)
+        self.assertEqual(status, "REUSED")
+        self.assertIsNone(reason)
+        self.assertIsNotNone(analysis_id)
+        self.assertTrue(analysis.candidates)
+        recon.get_js_asset.assert_called_once_with(9, 42)
+        dom.acquire.assert_called_once_with(self.package.id, recon_asset)
+        dom.acquire_source_map.assert_not_called()
+
+        dom.acquire.return_value = DOMAcquisition(
+            DOMAcquisitionStatus.HASH_DRIFT, asset, (), "RECON_HASH_DRIFT")
+        drift_status, drift_id, drift_analysis, drift_reason = specialist.refresh_observed_asset(
+            self.package.id, 42, include_source_map=False)
+        self.assertEqual((drift_status, drift_id, drift_analysis, drift_reason),
+                         ("HASH_DRIFT", None, None, "RECON_HASH_DRIFT"))
+
+        recon.get_js_asset.return_value = SimpleNamespace(
+            asset_id=42, asset_url="https://unrelated.example.net/a.js")
+        dom.acquire.reset_mock()
+        with self.assertRaises(ValueError):
+            specialist.refresh_observed_asset(self.package.id, 42, include_source_map=False)
+        dom.acquire.assert_not_called()
+
+        recon.get_js_asset.return_value = SimpleNamespace(
+            asset_id=43, asset_url="https://app.example.test/a.js")
+        with self.assertRaises(ValueError):
+            specialist.refresh_observed_asset(self.package.id, 42, include_source_map=False)
+        dom.acquire.assert_not_called()
 
     def test_failed_parser_analysis_is_retried_without_losing_identity(self) -> None:
         asset = self.record("https://app.example.test/retry.js")

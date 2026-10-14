@@ -22,7 +22,7 @@ from .hypotheses import (Hypothesis, HypothesisSource, HypothesisStatus, Hypothe
 from .identity import IdentityStatus, MembershipStatus
 from .identity_registry import IdentityRegistry
 from .orchestrator import PlanOrchestrator
-from .object_factory import ObjectFactory
+from .object_factory import ObjectFactory, ObjectFactoryResult
 from .object_recipes import unique_json_pairs
 from .plan_runs import RunStatus
 from .profile import TargetProfile
@@ -681,7 +681,8 @@ class AuthorizationSpecialist:
             tuple(dict.fromkeys((*operation.evidence_ids, *owned.evidence_ids)))[:16],
             (*owned.facts, *self._protected_artifact_facts(candidate.target_id, owned))[:8], now, now))
 
-    def prepare(self, candidate_id: str, package: TargetPackage) -> AuthorizationCandidate:
+    def prepare(self, candidate_id: str, package: TargetPackage, *,
+                allow_setup: bool = True) -> AuthorizationCandidate:
         """Create a bounded Phase 15 plan; this method never dispatches traffic."""
         if self.context is None or self.router is None or self.planner is None:
             raise ValueError("authorization planning is unavailable")
@@ -774,7 +775,7 @@ class AuthorizationSpecialist:
         if (foreign_control is None and candidate.boundary in {
                 Boundary.CROSS_TENANT, Boundary.HORIZONTAL, Boundary.GRAPHQL_OBJECT,
                 Boundary.GRAPHQL_MUTATION} and
-                hunt.mode is AuthorizationMode.BOUNDED_AUTONOMOUS):
+                hunt.mode is AuthorizationMode.BOUNDED_AUTONOMOUS and allow_setup):
             self._resolve_control_with_factory(package, owned, foreign, hunt.id)
             surface = self.profile(package)
             foreign_control = next((item for item in surface.operations if
@@ -1172,17 +1173,17 @@ class AuthorizationSpecialist:
     def _resolve_control_with_factory(self, package: TargetPackage,
                                       owned: AuthorizationObject,
                                       foreign: AuthorizationActor,
-                                      hunt_id: str) -> None:
+                                      hunt_id: str) -> ObjectFactoryResult | None:
         if (self.factory is None or foreign.session_id is None or
                 len(foreign.observed_tenants) != 1 or
                 package.rules.automated_testing_allowed is not True or
                 package.autonomy.create_disposable_objects is not PolicyDecision.ALLOW or
                 package.autonomy.state_changing is not PolicyDecision.ALLOW):
-            return
+            return None
         tenant_id = foreign.observed_tenants[0]
         tenant = self.identities.get_tenant(package.target.id, tenant_id)
         if tenant is None:
-            return
+            return None
         for metadata in self.factory.recipes.list_for_package(package.id)[:12]:
             if metadata["object_type"] != owned.object_type:
                 continue
@@ -1197,7 +1198,59 @@ class AuthorizationSpecialist:
                                           purpose="Owned authorization comparison control")
             if result.created_new and result.item is not None:
                 self.ledger.link_created_object(hunt_id, package.target.id, result.item.id)
-            return
+            return result
+        return None
+
+    def comparison_control_ready(self, candidate_id: str, package: TargetPackage) -> bool:
+        candidate = self.ledger.get_candidate(candidate_id, package.target.id)
+        if candidate is None or candidate.boundary not in {Boundary.CROSS_TENANT,
+                                                            Boundary.HORIZONTAL}:
+            return False
+        surface = self.profile(package)
+        owner = next((item for item in surface.operations
+                      if item.exchange_id == candidate.owner_exchange_id
+                      and item.object_id == candidate.test_object_id
+                      and item.protocol == "REST" and item.method in {"GET", "HEAD"}
+                      and item.semantic_owner_success), None)
+        if owner is None:
+            return False
+        actor = next((item for item in surface.actors
+                      if item.identity_id == candidate.boundary_identity_id), None)
+        if actor is None:
+            return False
+        foreign = next((item for item in surface.operations
+                        if item.key == owner.key and item.method == owner.method
+                        and item.owner_identity_id == candidate.boundary_identity_id
+                        and item.object_id != candidate.test_object_id
+                        and item.semantic_owner_success), None)
+        return bool(foreign and any(item.id == foreign.object_id and
+                                   item.owner_identity_id == candidate.boundary_identity_id and
+                                   item.tenant_id in actor.observed_tenants
+                                   for item in surface.objects))
+
+    def ensure_comparison_control(self, candidate_id: str,
+                                  package: TargetPackage) -> ObjectFactoryResult | None:
+        candidate = self.ledger.get_candidate(candidate_id, package.target.id)
+        if candidate is None or candidate.boundary not in {Boundary.CROSS_TENANT,
+                                                            Boundary.HORIZONTAL}:
+            return None
+        hunt = self.ledger.get_hunt(candidate.hunt_id, package.target.id)
+        if (hunt is None or hunt.package_id != package.id or
+                hunt.mode is not AuthorizationMode.BOUNDED_AUTONOMOUS or
+                hunt.status is not HuntStatus.READY):
+            return None
+        surface = self.profile(package)
+        owned = next((item for item in surface.objects
+                      if item.id == candidate.test_object_id), None)
+        foreign = next((item for item in surface.actors
+                        if item.identity_id == candidate.boundary_identity_id), None)
+        if (owned is None or foreign is None or not foreign.session_id or
+                not any(item.exchange_id == candidate.owner_exchange_id
+                        and item.object_id == owned.id and item.protocol == "REST"
+                        and item.method in {"GET", "HEAD"} and item.semantic_owner_success
+                        for item in surface.operations)):
+            return None
+        return self._resolve_control_with_factory(package, owned, foreign, hunt.id)
 
     def cleanup_created_objects(self, hunt_id: str, target_id: str) -> dict[str, int]:
         """Attempt cleanup only for objects this hunt created, never reused fixtures."""

@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-This is the authoritative Phase 24-33 sequence from the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 were complete at that review. Phases 24-27 were delivered afterward; Phases 28-33 remain. Completion status may advance, but the phase numbers below do not change. Future sessions must use this numbering rather than conflicting older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
+This is the authoritative Phase 24-33 sequence from the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 are complete. Phases 24-28 were delivered afterward; Phases 29-33 remain. Completion status may advance, but the phase numbers below do not change. Future sessions must use this numbering rather than conflicting older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
 ## Complete at reconciliation (0-23)
 
@@ -35,7 +35,7 @@ Completion of a phase does not imply complete coverage of its bug class. In part
 
 ## Reconciled sequence (24-33)
 
-Phases 24-27 have been delivered. Implement Phases 28-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
+Phases 24-28 have been delivered. Implement Phases 29-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
 
 ### Phase 24 - Cold-start bootstrap (complete)
 
@@ -53,7 +53,7 @@ Expand beyond the existing narrow single-ID GraphQL query and typed rename mutat
 
 Research specific knowledge gaps using bounded, source-backed retrieval. Cache concise ResearchBriefs, attribute sources, and keep outside material advisory rather than authoritative for scope, execution, or findings.
 
-### Phase 28 - Cross-specialist planner
+### Phase 28 - Cross-specialist planner (complete)
 
 Select minimal evidence context, rank hypotheses, route specialists and skills, manage request/token budgets and backtracking, and invoke existing validators. This is distinct from the completed Phase 16 single-plan orchestrator.
 

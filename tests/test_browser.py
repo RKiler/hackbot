@@ -25,6 +25,7 @@ from hackbot.identity_registry import IdentityRegistry
 from hackbot.secrets import RoutedSecretProvider, SecretValue
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
+from tests.schema_utils import drop_phase28_schema
 
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
@@ -324,6 +325,7 @@ class BrowserTests(unittest.TestCase):
     def test_v3_to_v4_migration_preserves_auth_metadata(self):
         identity, context = self.manual("preserved")
         with sqlite3.connect(self.store.db_path) as connection:
+            drop_phase28_schema(connection)
             for table in ("api_inventory_progress", "api_specialist_runs", "api_candidates", "api_operations"):
                 connection.execute(f"DROP TABLE {table}")
             for table in ("behaviour_observations", "behaviour_workflows", "behaviour_expectations",
@@ -376,7 +378,7 @@ class BrowserTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=3")
         self.store.initialize()
         with sqlite3.connect(self.store.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
         self.assertEqual(self.auth.get(self.target, identity.id).id, context.id)
 
     def test_playwright_import_adapter_rejects_foreign_or_malformed_before_cookies(self):

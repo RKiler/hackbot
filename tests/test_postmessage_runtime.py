@@ -49,6 +49,7 @@ from hackbot.skill_plans import (MessagePlanBinding, PrerequisiteChecker,
 from hackbot.skills import SkillRegistry
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import TargetPackageRepository, load_target_package
+from tests.schema_utils import drop_phase28_schema
 from hackbot.test_objects import CleanupStrategy, ObjectRegistry, ObjectState
 from hackbot.traffic import (CapturePacket, CapturedRequest, CapturedResponse,
                              TrafficStore)
@@ -1006,6 +1007,7 @@ frame.addEventListener('load',()=>{{
         orchestrator, run_id, _, _ = self._build(mode="foreign")
         self._finish(orchestrator, run_id)
         with sqlite3.connect(self.evidence.db_path) as db:
+            drop_phase28_schema(db)
             for table in ("api_inventory_progress", "api_specialist_runs", "api_candidates", "api_operations"):
                 db.execute(f"DROP TABLE {table}")
             db.execute("DROP INDEX api_js_artifacts_target_hash_state")
@@ -1039,7 +1041,7 @@ frame.addEventListener('load',()=>{{
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 34)
+        self.assertEqual(version, 36)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)

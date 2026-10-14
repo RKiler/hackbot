@@ -16,6 +16,13 @@ from hackbot.config import SecretBindingConfig, SecretSettings
 from hackbot.domain import ObservationState, Principal, Role, Tenant
 from hackbot.evidence import EvidenceProvenance, Sensitivity
 from hackbot.hypotheses import HypothesisStore
+from hackbot.planner import CrossSpecialistPlanner, _Signal, _candidate_state
+from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLimits,
+                                    PlannerMode, PlannerStatus, PlannerTaskStatus,
+                                    PlannerTaskType, Specialist)
+from hackbot.planner_runner import PlannerRunner
+from hackbot.planner_store import PlannerStore
+from hackbot.policy import policy_version
 from hackbot.identity import IdentityStatus, MembershipStatus
 from hackbot.response_compare import ResponseComparator
 from hackbot.recon import Page
@@ -204,6 +211,159 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(duplicate.status, ValidationStatus.DUPLICATE_CANDIDATE)
         self.assertEqual(original.id, finding.id)
         self.assertEqual(self.results.stats(self.target)["findings"], 1)
+        ledger = PlannerStore(self.fx.store)
+        run = ledger.create(self.fx.package, PlannerMode.BOUNDED_AUTONOMOUS,
+                            PlannerLimits(), policy_version(self.fx.package))
+        ledger.transition(self.target, run.id, PlannerStatus.LOADING_CONTEXT,
+                          "CONTEXT_STARTED")
+        candidate = PlannerCandidate(
+            "PLCAND-" + "e" * 32, run.id, self.target, "HYPOTHESIS",
+            self.work.hypotheses.id, self.work.hypotheses.id,
+            Specialist.AUTHORIZATION, "CROSS_TENANT", digest("duplicate-root"),
+            digest("duplicate-surface"), 85, 70, 85, 5, 0, 0,
+            "LOW", 80, "CURRENT", status=CandidateStatus.SELECTED)
+        run = ledger.save_portfolio(run, (candidate,), {}, digest("duplicate-state"))
+        second_child = self.work.runs.get(second_run, self.target)
+        candidate = ledger.update_candidate(
+            self.target, run.id, candidate.id, status=CandidateStatus.RUNNING,
+            hypothesis_id=self.work.hypotheses.id, plan_id=second_child.plan_id,
+            plan_run_id=second_run)
+        task = ledger.add_task(run, candidate, PlannerTaskType.VALIDATE_RUN)
+        claimed = ledger.claim_task(self.target, run.id, task.id)
+        runner = PlannerRunner(
+            planner=None, store=ledger, hypotheses=None, contexts=None, router=None,
+            skill_planner=None, authorization=None, api=None, dom=None, messages=None,
+            exposure=None, research=None, objects=None, object_factory=None,
+            browser=None, orchestrator=SimpleNamespace(runs=self.work.runs),
+            validator=self.validator)
+        runner._validate(run, claimed, candidate)
+        disposition = ledger.candidate(self.target, run.id, candidate.id)
+        self.assertEqual(disposition.status, CandidateStatus.DUPLICATE)
+        self.assertEqual(disposition.validation_id, duplicate.id)
+        self.assertIsNone(disposition.finding_id)
+        self.assertEqual(ledger.get(self.target, run.id).manual_reviews, 0)
+        self.assertEqual(ledger.get(self.target, run.id).findings, 0)
+        self.assertEqual(ledger.branch_memory(self.target, candidate.root_cause_key,
+                                              run.context_hash)[0]["outcome"], "DUPLICATE")
+
+    def test_planner_child_confirmation_retains_full_policy_audit_chain(self):
+        child_id = self.auth_run()
+        child = self.work.runs.get(child_id, self.target)
+        ledger = PlannerStore(self.fx.store)
+        run = ledger.create(self.fx.package, PlannerMode.BOUNDED_AUTONOMOUS,
+                            PlannerLimits(), policy_version(self.fx.package))
+        ledger.transition(self.target, run.id, PlannerStatus.LOADING_CONTEXT,
+                          "CONTEXT_STARTED")
+        root = digest("planner-confirmed-root")
+        candidate = PlannerCandidate(
+            "PLCAND-" + "a" * 32, run.id, self.target, "HYPOTHESIS",
+            self.work.hypotheses.id, self.work.hypotheses.id,
+            Specialist.AUTHORIZATION, "CROSS_TENANT", root, digest("surface"),
+            90, 85, 90, 5, 0, 0, "LOW", 90, "CURRENT",
+            status=CandidateStatus.SELECTED)
+        sibling = replace(candidate, id="PLCAND-" + "b" * 32,
+                          source_kind="AUTHORIZATION", source_id="AUTHC-" + "c" * 32)
+        run = ledger.save_portfolio(run, (candidate, sibling), {}, digest("state"))
+        candidate = ledger.update_candidate(
+            self.target, run.id, candidate.id,
+            hypothesis_id=self.work.hypotheses.id, plan_id=child.plan_id,
+            plan_run_id=child_id, status=CandidateStatus.RUNNING)
+        validate_task = ledger.add_task(run, candidate, PlannerTaskType.VALIDATE_RUN)
+        claimed = ledger.claim_task(self.target, run.id, validate_task.id)
+        runner = PlannerRunner(
+            planner=None, store=ledger, hypotheses=None, contexts=None, router=None,
+            skill_planner=None, authorization=None, api=None, dom=None, messages=None,
+            exposure=None, research=None, objects=None, object_factory=None,
+            browser=None, orchestrator=SimpleNamespace(runs=self.work.runs),
+            validator=self.validator)
+        runner._validate(run, claimed, candidate)
+        confirmed = ledger.candidate(self.target, run.id, candidate.id)
+        self.assertEqual(confirmed.status, CandidateStatus.VALIDATED)
+        self.assertIsNotNone(confirmed.finding_id)
+        self.assertEqual(ledger.candidate(self.target, run.id, sibling.id).status,
+                         CandidateStatus.DUPLICATE)
+        self.assertEqual(ledger.branch_memory(self.target, root, run.context_hash)[0]["outcome"],
+                         "CONFIRMED")
+        self.assertEqual(ledger.task(self.target, run.id, validate_task.id).status,
+                         PlannerTaskStatus.COMPLETED)
+        self.assertGreater(ledger.metrics(self.target, run.id)["child_request_slots_consumed"], 0)
+        with self.fx.store._connection() as db:
+            chain = db.execute(
+                "SELECT pr.run_id AS planner_run_id,c.candidate_id,t.task_id,"
+                "f.finding_id,v.validation_id,r.run_id,p.plan_id,p.skill_id,"
+                "h.hypothesis_id,d.decision_id,pm.permit_id,e.exchange_id "
+                "FROM planner_runs pr JOIN planner_candidates c ON c.run_id=pr.run_id "
+                "JOIN planner_tasks t ON t.candidate_id=c.candidate_id "
+                "JOIN findings f ON f.finding_id=c.finding_id "
+                "JOIN validations v ON v.validation_id=f.validation_id "
+                "JOIN plan_runs r ON r.run_id=v.run_id "
+                "JOIN skill_plans p ON p.plan_id=r.plan_id "
+                "JOIN hypotheses h ON h.hypothesis_id=p.hypothesis_id "
+                "JOIN plan_run_steps s ON s.run_id=r.run_id AND s.role='BOUNDARY' "
+                "JOIN policy_decisions d ON d.decision_id=s.decision_id "
+                "JOIN executor_permits pm ON pm.permit_id=s.permit_id "
+                "JOIN executor_events ev ON ev.permit_id=pm.permit_id "
+                "JOIN traffic_exchanges e ON e.exchange_id=ev.exchange_id "
+                "WHERE pr.run_id=? AND c.candidate_id=? "
+                "AND t.task_type='VALIDATE_RUN' AND ev.event_type='REQUEST_SENT' LIMIT 1",
+                (run.id, candidate.id)).fetchone()
+        self.assertIsNotNone(chain)
+        self.assertEqual(chain["run_id"], child_id)
+        self.assertEqual(chain["finding_id"], confirmed.finding_id)
+
+    def test_planner_remembers_real_rejection_for_unchanged_target_state(self):
+        child_id = self.auth_run(boundary_path="/validated/denied")
+        child = self.work.runs.get(child_id, self.target)
+        ledger = PlannerStore(self.fx.store)
+        run = ledger.create(self.fx.package, PlannerMode.BOUNDED_AUTONOMOUS,
+                            PlannerLimits(), policy_version(self.fx.package))
+        ledger.transition(self.target, run.id, PlannerStatus.LOADING_CONTEXT,
+                          "CONTEXT_STARTED")
+        signal = _Signal("HYPOTHESIS", self.work.hypotheses.id,
+                         Specialist.AUTHORIZATION, "CROSS_TENANT",
+                         "https://fixture.test/validated/denied", "CROSS_TENANT",
+                         90, 80, 2, "CURRENT", "LOW", 5, 0, 0, (), ())
+        context = SimpleNamespace(snapshot_hash=digest("same-target-state"),
+                                  verified_identity_ids=(), tenant_ids=(),
+                                  ready_object_ids=(), confirmed_hypothesis_ids=())
+        candidate = PlannerCandidate(
+            "PLCAND-" + "d" * 32, run.id, self.target, "HYPOTHESIS",
+            self.work.hypotheses.id, self.work.hypotheses.id,
+            Specialist.AUTHORIZATION, "CROSS_TENANT", signal.root_key(self.target),
+            digest("denied-surface"), 90, 80, 90, 5, 0, 0,
+            "LOW", 80, "CURRENT", status=CandidateStatus.SELECTED,
+            state_hash=_candidate_state(run, context, signal, None))
+        state_hash = digest("same-target-state")
+        run = ledger.save_portfolio(run, (candidate,), {}, state_hash)
+        candidate = ledger.update_candidate(
+            self.target, run.id, candidate.id, status=CandidateStatus.RUNNING,
+            hypothesis_id=self.work.hypotheses.id, plan_id=child.plan_id,
+            plan_run_id=child_id)
+        task = ledger.add_task(run, candidate, PlannerTaskType.VALIDATE_RUN)
+        claimed = ledger.claim_task(self.target, run.id, task.id)
+        runner = PlannerRunner(
+            planner=None, store=ledger, hypotheses=None, contexts=None, router=None,
+            skill_planner=None, authorization=None, api=None, dom=None, messages=None,
+            exposure=None, research=None, objects=None, object_factory=None,
+            browser=None, orchestrator=SimpleNamespace(runs=self.work.runs),
+            validator=self.validator)
+        runner._validate(run, claimed, candidate)
+        self.assertEqual(ledger.candidate(self.target, run.id, candidate.id).status,
+                         CandidateStatus.REJECTED)
+        self.assertEqual(ledger.branch_memory(self.target, candidate.root_cause_key,
+                                              candidate.state_hash)[0]["outcome"], "REJECTED")
+        ledger.transition(self.target, run.id, PlannerStatus.COMPLETED, "ALL_BRANCHES_SETTLED")
+        next_run = ledger.create(self.fx.package, PlannerMode.ANALYZE_ONLY,
+                                 PlannerLimits(), policy_version(self.fx.package))
+        planner = CrossSpecialistPlanner(
+            store=ledger, context=SimpleNamespace(research=SimpleNamespace(
+                list=lambda *_args, **_kwargs: {"items": []})),
+            hypotheses=HypothesisStore(self.fx.store), authorization=None,
+            api=None, dom=None, messages=None, exposure=None, traffic=None,
+            validations=None, skill_context=None, skill_router=None)
+        ranked = planner._rank(next_run, context, (signal,))
+        self.assertEqual(ranked[0].status, CandidateStatus.SKIPPED)
+        self.assertIn("PRIOR_BRANCH_OUTCOME", ranked[0].reason_codes)
 
     def test_denied_public_and_control_failure_never_confirm(self):
         denied = self.auth_run(boundary_path="/validated/denied")

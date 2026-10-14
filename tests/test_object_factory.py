@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hackbot.config import ObjectSettings
 from hackbot.domain import Tenant
@@ -11,6 +13,11 @@ from hackbot.identity import MembershipStatus
 from hackbot.object_factory import ObjectFactory
 from hackbot.object_recipes import ObjectRecipe, RecipeCatalog
 from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction, SideEffect
+from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLimits,
+                                    PlannerMode, PlannerStatus, PlannerTaskType, Specialist)
+from hackbot.planner_runner import PlannerRunner
+from hackbot.planner_store import PlannerStore
+from hackbot.policy import policy_version
 from hackbot.target_policy import PolicyDecision
 from hackbot.test_objects import CleanupStrategy, ObjectRegistry, ObjectState
 
@@ -132,6 +139,56 @@ class ObjectFactoryTests(ExecutorTests):
         self.assertEqual(self.objects.stats(item.target_id)["cleanup_pending"], 0)
         self.assertEqual(self.factory.cleanup(item.id, item.target_id,
                                                session_id=session.id).outcome, "NOT_CLEANABLE")
+
+    def test_planner_object_prerequisite_uses_real_factory_and_readback(self):
+        identity, session, tenant = self.account("tenant_a_admin", "tenant-a")
+        self.recipe()
+        recipe = self.catalog.get(self.package.id, "project")
+        planned = self.objects.plan(
+            target_id=self.package.target.id, package_id=self.package.id,
+            object_type="project", creator_identity_id=identity.id,
+            tenant_id=tenant.id, recipe_id=recipe.id, recipe_hash=recipe.sha256,
+            test_name="hackbot-test-planner", cleanup_strategy=CleanupStrategy.AUTO_CLEANUP)
+        planner_store = PlannerStore(self.store)
+        run = planner_store.create(self.package, PlannerMode.BOUNDED_AUTONOMOUS,
+            PlannerLimits(requests=10, cleanup_reserve=2), policy_version(self.package))
+        planner_store.transition(run.target_id, run.id, PlannerStatus.LOADING_CONTEXT,
+                                 "CONTEXT_STARTED")
+        candidate = PlannerCandidate(
+            "PLCAND-" + "a" * 32, run.id, run.target_id, "AUTHORIZATION",
+            "AUTHC-" + "a" * 32, None, Specialist.AUTHORIZATION, "CROSS_TENANT",
+            "b" * 64, "c" * 64, 85, 75, 85, 4, 0, 0,
+            "LOW", 75, "CURRENT", status=CandidateStatus.SELECTED)
+        run = planner_store.save_portfolio(run, (candidate,), {}, "d" * 64)
+        create = planner_store.add_task(run, candidate,
+            PlannerTaskType.CREATE_DISPOSABLE_OBJECT, budget={"requests": 4})
+        resolve = planner_store.add_task(run, candidate, PlannerTaskType.RESOLVE_OBJECT,
+                                          dependencies=(create.id,))
+        runner = PlannerRunner(
+            planner=SimpleNamespace(), store=planner_store,
+            hypotheses=SimpleNamespace(), contexts=SimpleNamespace(),
+            router=SimpleNamespace(), skill_planner=SimpleNamespace(),
+            authorization=SimpleNamespace(), api=SimpleNamespace(), dom=None,
+            messages=None, exposure=SimpleNamespace(), research=SimpleNamespace(),
+            objects=self.objects, object_factory=self.factory, browser=self.browser,
+            orchestrator=SimpleNamespace(), validator=SimpleNamespace())
+        try:
+            with patch.object(runner, "_source", return_value=SimpleNamespace(
+                    test_object_id=planned.id)), patch.object(runner, "_fresh", return_value=True):
+                first = runner.advance(self.package, run.id)
+                second = runner.advance(self.package, run.id)
+            self.assertEqual(first["task"]["reason_code"], "OBJECT_CREATED")
+            self.assertEqual(second["task"]["reason_code"], "OWNED_OBJECT_READY")
+            current = self.objects.get(planned.id, run.target_id)
+            self.assertEqual(current.state, ObjectState.READY)
+            self.assertIsNotNone(current.verified_at)
+            self.assertEqual(len(self.server.fixture_objects), 1)
+            self.assertEqual(planner_store.get(run.target_id, run.id).usage.requests, 4)
+        finally:
+            current = self.objects.get(planned.id, run.target_id)
+            if current and current.state in {ObjectState.READY, ObjectState.IN_USE}:
+                self.factory.cleanup(planned.id, run.target_id, session_id=session.id)
+        self.assertEqual(self.server.fixture_objects, {})
 
     def test_parent_requires_verified_owned_object(self):
         identity, session, tenant = self.account("tenant_a_admin", "tenant-a")

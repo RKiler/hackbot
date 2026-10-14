@@ -19,6 +19,7 @@ from hackbot.api_graphql import (GraphQLResult, classify_result, encode_observed
 from hackbot.api_registry import APIOperationRegistry, APIOperationType
 from hackbot.artifacts import ArtifactStore
 from hackbot.config import StoreSettings
+from hackbot.domxss_store import DOMXSSStore
 from hackbot.identity_registry import IdentityRegistry
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
@@ -239,6 +240,43 @@ class APIOperationRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.get_operation(target, first.id).state, "CURRENT")
         self.assertEqual(self.registry.get_operation(target, second.id).state, "CURRENT")
         self.assertEqual(self.registry.counts(target)["operations_current"], 2)
+
+    def test_js_successor_requires_same_current_recon_asset(self):
+        target = self.package.target.id
+        assets = DOMXSSStore(self.evidence)
+        url = "https://app.example.test/bundle.js"
+
+        def asset(body: bytes, asset_id: int, asset_url: str):
+            return assets.record_artifact(
+                target_id=target, asset_url=asset_url, body=body,
+                recon_asset_id=asset_id, recon_sha256=hashlib.sha256(body).hexdigest(),
+                source="FIXTURE")
+
+        def operation(record, document: bytes, *, exchange_ids=()):
+            return self.registry.upsert_operation(
+                target_id=target, package_id=self.package.id, name="GetNode",
+                kind=APIOperationType.GRAPHQL_QUERY, endpoint="", method="POST",
+                version_hash=hashlib.sha256(document).hexdigest(),
+                source_asset_hash=record.artifact_sha256,
+                source_refs=("JS:" + record.artifact_id,),
+                exchange_ids=exchange_ids)
+
+        old_asset = asset(b"const old = 1", 42, url)
+        old = operation(old_asset, b"query GetNode{node{id}}")
+        foreign_asset = asset(b"const other = 3", 43,
+                              "https://app.example.test/other.js")
+        self.assertFalse(self.registry.current_js_replacement_available(target, old.id))
+        new_asset = asset(b"const newer = 2", 42, url)
+        self.assertTrue(self.registry.current_js_replacement_available(target, old.id))
+        self.assertEqual(self.registry.expire_missing_js_operations(target), 1)
+        next_operation = operation(new_asset, b"query GetNode{node{id name}}")
+        operation(foreign_asset, b"query GetNode{node{id email}}")
+        operation(new_asset, b"query GetNode{node{id address}}",
+                  exchange_ids=("EXCHANGE-" + "a" * 32,))
+        self.assertEqual(
+            tuple(item.id for item in self.registry.current_js_successors(target, old.id)),
+            (next_operation.id,))
+        self.assertEqual(self.registry.current_js_successors(target, next_operation.id), ())
 
     def test_bounds_and_no_raw_operation_body_in_metadata(self):
         target = self.package.target.id

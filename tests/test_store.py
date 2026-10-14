@@ -17,6 +17,7 @@ from hackbot.evidence import (
 from hackbot.logging import create_logger
 from hackbot.recon import Provenance
 from hackbot.store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
+from tests.schema_utils import drop_phase28_schema
 
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
@@ -59,7 +60,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 34)
+        self.assertEqual(version, 36)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -81,6 +82,7 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-phase27-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             for table in ("research_hypothesis_links", "research_skill_proposals",
                           "research_brief_sources", "research_sources", "research_briefs",
                           "research_requests"):
@@ -88,7 +90,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=33")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE "
                 "type='table' AND name='research_briefs'").fetchone())
             self.assertEqual(connection.execute("SELECT count(*) FROM evidence WHERE evidence_id=?",
@@ -98,12 +100,13 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-phase26-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             connection.execute("DROP TABLE api_inventory_progress")
             connection.execute("DROP INDEX api_js_artifacts_target_hash_state")
             connection.execute("PRAGMA user_version=29")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' "
                 "AND name='api_js_artifacts_target_hash_state'").fetchone())
@@ -115,12 +118,13 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-inventory-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             connection.execute("DROP TABLE api_inventory_progress")
             connection.execute("DROP INDEX dom_js_artifacts_target_current_page")
             connection.execute("PRAGMA user_version=30")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='api_inventory_progress'").fetchone())
@@ -135,6 +139,7 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-local-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             for table in ("api_inventory_progress", "api_specialist_runs", "api_candidates", "api_operations"):
                 connection.execute(f"DROP TABLE {table}")
             for table in ("behaviour_observations", "behaviour_workflows", "behaviour_expectations",
@@ -160,7 +165,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=14")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)
@@ -173,12 +178,13 @@ class StoreTests(unittest.TestCase):
         legacy = files("hackbot").joinpath(
             "migrations", "016_authorization_mutations.sql").read_text()
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             connection.execute("DROP TABLE authorization_mutation_results")
             connection.executescript(legacy)
             connection.execute("PRAGMA user_version=31")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             schema = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='authorization_mutation_results'").fetchone()[0]
@@ -188,12 +194,13 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         original = self._evidence(content=b"preserved-delete-source-evidence")
         with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
             connection.execute("DROP INDEX authorization_mutations_delete_exchange")
             connection.execute("DROP INDEX test_object_operations_cleanup_exchange")
             connection.execute("PRAGMA user_version=32")
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
             names = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'")}
             self.assertIn("authorization_mutations_delete_exchange", names)
