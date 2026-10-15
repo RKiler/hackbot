@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
+import hashlib
 import json
 import re
 import sqlite3
@@ -292,6 +293,19 @@ class ValidationStore:
             for check in result.checks:
                 db.execute("INSERT INTO validation_checks VALUES (?,?,?,?)",
                            (result.id, check.code, check.outcome.value, _json(check.evidence_ids)))
+            if (result.status is ValidationStatus.NEEDS_MANUAL_REVIEW and
+                    result.source == "DETERMINISTIC" and result.supporting_evidence_ids and
+                    any(check.outcome is CheckOutcome.PASS for check in result.checks) and
+                    "MESSAGE_SYNTHETIC_FIXTURE_ONLY" not in result.reason_codes):
+                db.execute(
+                    "INSERT INTO notification_events(event_id,target_id,event_type,source_kind,source_id,"
+                    "finding_id,validation_id,priority,workflow_version,dedupe_key,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("NOTIF-" + uuid.uuid4().hex, result.target_id, "MANUAL_REVIEW_REQUIRED",
+                     "VALIDATION", result.id, None, result.id, "NORMAL", 0,
+                     hashlib.sha256(f"MANUAL_REVIEW_REQUIRED:{result.id}:0".encode("ascii")).hexdigest(),
+                     result.created_at),
+                )
             if duplicate is not None:
                 db.execute("INSERT INTO finding_duplicates VALUES (?,?,?)",
                            (result.id, duplicate["finding_id"], result.created_at))
@@ -317,6 +331,17 @@ class ValidationStore:
                        (finding_id, finding.surface_fingerprint, result.id, result.created_at))
             db.execute("INSERT INTO finding_status_events(finding_id,status,reason_code,occurred_at) "
                        "VALUES (?,?,?,?)", (finding_id, "CONFIRMED", "VALIDATOR_CONFIRMED", result.created_at))
+            dedupe_key = hashlib.sha256(
+                f"CONFIRMED_FINDING:{finding_id}:0".encode("ascii")
+            ).hexdigest()
+            db.execute(
+                "INSERT INTO notification_events(event_id,target_id,event_type,source_kind,source_id,"
+                "finding_id,validation_id,priority,workflow_version,dedupe_key,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("NOTIF-" + uuid.uuid4().hex, result.target_id, "CONFIRMED_FINDING",
+                 "FINDING", finding_id, finding_id, result.id, "HIGH", 0, dedupe_key,
+                 result.created_at),
+            )
             row = db.execute("SELECT * FROM findings WHERE finding_id=?", (finding_id,)).fetchone()
             return result, self._finding(db, row)
 

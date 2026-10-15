@@ -10,11 +10,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from hackbot.artifacts import ArtifactStore
 from hackbot.auth import AuthContextManager
 from hackbot.browser import IdentityObservation, IdentityVerificationRule
 from hackbot.config import SecretBindingConfig, SecretSettings
 from hackbot.domain import ObservationState, Principal, Role, Tenant
 from hackbot.evidence import EvidenceProvenance, Sensitivity
+from hackbot.finding_workflow import FindingWorkflow
 from hackbot.hypotheses import HypothesisStore
 from hackbot.planner import CrossSpecialistPlanner, _Signal, _candidate_state
 from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLimits,
@@ -22,10 +24,12 @@ from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLi
                                     PlannerTaskType, Specialist)
 from hackbot.planner_runner import PlannerRunner
 from hackbot.planner_store import PlannerStore
+from hackbot.notification_store import NotificationStore
 from hackbot.policy import policy_version
 from hackbot.identity import IdentityStatus, MembershipStatus
 from hackbot.response_compare import ResponseComparator
 from hackbot.recon import Page
+from hackbot.reports import ReportStore
 from hackbot.secrets import RoutedSecretProvider
 from hackbot.validation_store import ValidationStatus, ValidationStore
 from hackbot.validator import DeterministicValidatorEngine
@@ -499,6 +503,11 @@ class ValidatorTests(unittest.TestCase):
             return self.fx.package
         service = SimpleNamespace(package=scoped_package, run_store=self.work.runs,
                                   validator=self.validator, validations=self.results,
+                                  store=self.fx.store,
+                                  report_store=ReportStore(self.fx.store, ArtifactStore(
+                                      self.fx.root / "artifacts" / "reports")),
+                                  workflow=FindingWorkflow(self.fx.store, self.results),
+                                  notification_store=NotificationStore(self.fx.store),
                                   audit=lambda event, **kwargs: events.append(event),
                                   logger=SimpleNamespace(error=lambda *args, **kwargs: None))
         client = create_app(runtime=service).test_client()

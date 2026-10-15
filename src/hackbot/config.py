@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import ipaddress
@@ -56,6 +56,63 @@ class AppConfig:
     skills: SkillSettings | None = None
     objects: ObjectSettings | None = None
     research: ResearchSettings | None = None
+    notifications: NotificationSettings | None = None
+
+
+_SECRET_REF = r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?"
+
+
+@dataclass(frozen=True)
+class NotificationSettings:
+    discord_secret_ref: str | None = field(default=None, repr=False)
+    smtp_host: str | None = None
+    smtp_port: int = 465
+    smtp_sender: str | None = None
+    smtp_recipient: str | None = None
+    smtp_username: str | None = None
+    smtp_password_ref: str | None = field(default=None, repr=False)
+    console_enabled: bool = False
+    manual_review_enabled: bool = False
+    triage_enabled: bool = False
+    hourly_cap: int = 30
+    target_daily_cap: int = 10
+    dashboard_base_url: str | None = None
+
+    def __post_init__(self) -> None:
+        for ref in (self.discord_secret_ref, self.smtp_password_ref):
+            if ref is not None and (not isinstance(ref, str) or not re.fullmatch(_SECRET_REF, ref)):
+                raise ConfigError("Invalid notification secret reference")
+        if (type(self.smtp_port) is not int or not 1 <= self.smtp_port <= 65535 or
+                type(self.hourly_cap) is not int or not 1 <= self.hourly_cap <= 100 or
+                type(self.target_daily_cap) is not int or not 1 <= self.target_daily_cap <= 100):
+            raise ConfigError("Invalid notification limits")
+        if any(type(value) is not bool for value in
+               (self.console_enabled, self.manual_review_enabled, self.triage_enabled)):
+            raise ConfigError("Invalid notification switches")
+        smtp_fields = (self.smtp_sender, self.smtp_recipient)
+        if self.smtp_host is not None:
+            if not isinstance(self.smtp_host, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", self.smtp_host):
+                raise ConfigError("Invalid SMTP host")
+            if any(not isinstance(value, str) or not re.fullmatch(
+                    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+", value)
+                   for value in smtp_fields):
+                raise ConfigError("Invalid SMTP address")
+        elif any(value is not None for value in (*smtp_fields, self.smtp_username, self.smtp_password_ref)):
+            raise ConfigError("SMTP settings require a host")
+        if self.smtp_username is not None and (
+                not isinstance(self.smtp_username, str) or len(self.smtp_username) > 254 or
+                self.smtp_password_ref is None):
+            raise ConfigError("SMTP authentication requires a secret reference")
+        if self.dashboard_base_url is not None:
+            try:
+                parsed = urlsplit(self.dashboard_base_url)
+                valid = (parsed.scheme == "https" and bool(parsed.hostname) and
+                         not parsed.username and not parsed.password and not parsed.query and
+                         not parsed.fragment and parsed.path in {"", "/"})
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ConfigError("Invalid notification dashboard URL")
 
 
 @dataclass(frozen=True)
@@ -339,7 +396,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects", "research"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects", "research", "notifications"}), "top-level")
     skills_table = _table(top.get("skills", {}), frozenset({"root"}), "skills")
     objects_table = _table(top.get("objects", {}), frozenset({"recipe_root", "name_prefix",
         "max_creation_depth", "max_objects_per_plan", "max_objects_per_target_hour",
@@ -359,6 +416,11 @@ def load_config(
     targets_table = _table(top.get("targets", {}), frozenset({"root"}), "targets")
     secrets_table = _table(top.get("secrets", {}), frozenset({"allowed_env_prefixes", "references"}), "secrets")
     research_table = _table(top.get("research", {}), frozenset({"enabled", "search_secret_ref", "allowed_source_hosts"}), "research")
+    notifications_table = _table(top.get("notifications", {}), frozenset({
+        "discord_secret_ref", "smtp_host", "smtp_port", "smtp_sender", "smtp_recipient",
+        "smtp_username", "smtp_password_ref", "console_enabled", "manual_review_enabled",
+        "triage_enabled", "hourly_cap", "target_daily_cap", "dashboard_base_url",
+    }), "notifications")
     browser_table = _table(top.get("browser", {}),
                            frozenset({"profile_root", "display", "vnc_url", "chromium_executable",
                                       "max_sessions", "max_page_size"}),
@@ -528,4 +590,5 @@ def load_config(
             search_secret_ref=research_table.get("search_secret_ref"),
             allowed_source_hosts=tuple(research_table.get("allowed_source_hosts", ())),
         ),
+        notifications=NotificationSettings(**notifications_table),
     )

@@ -8,12 +8,13 @@ import hashlib
 import importlib.util
 import json
 import socket
+import uuid
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 from . import __version__
@@ -31,7 +32,7 @@ from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, Bootstra
 from .behaviour import BehaviourStore, LearningLimits, LearningStatus, NormalBehaviourLearner
 from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
 from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
-from .config import AppConfig, ConfigError, ExecutorSettings, ObjectSettings, load_config
+from .config import AppConfig, ConfigError, ExecutorSettings, NotificationSettings, ObjectSettings, load_config
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
 from .domxss_store import DOMXSSStore
@@ -44,7 +45,10 @@ from .postmessage_store import PostMessageStore
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
+from .finding_workflow import FindingWorkflow
 from .logging import SecretRedactor, create_logger
+from .notification_store import NotificationPriority, NotificationStore, NotificationType
+from .notifications import ConsoleNotifier, DiscordNotifier, NotificationManager, SMTPNotifier
 from .policy import PolicyEngine, policy_version
 from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect
 from .policy_store import PolicyStore
@@ -67,12 +71,14 @@ from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .research import ResearchBudget, ResearchCoordinator, ResearchStatus, ResearchStore
 from .research_sources import BraveWebResearchProvider, FindingKnowledgeProvider, SkillKnowledgeProvider
+from .reports import ReportGenerator, ReportStore
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
 from .skill_plans import (DOMPlanBinding, MessagePlanBinding, PrerequisiteChecker, SkillContextBuilder,
                           SkillPlanStore, SkillPlanner, SkillRouter)
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
+from .artifacts import ArtifactStore
 from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
 from .target_policy import RiskLevel
@@ -218,6 +224,14 @@ class BugHunterRuntime:
         self._behaviour_threads: dict[str, Thread] = {}
         self.mutation_results = MutationResultStore(self.store)
         self.validations = ValidationStore(self.store)
+        self.workflow = FindingWorkflow(self.store, self.validations)
+        self.notification_store = NotificationStore(self.store)
+        self.report_store = ReportStore(self.store, ArtifactStore(config.paths.artifacts / "reports"))
+        self.report_generator = ReportGenerator(
+            store=self.store, drafts=self.report_store, validations=self.validations,
+            runs=self.run_store, traffic=self.traffic, targets=self.targets,
+            objects=self.objects, dom=self.domxss_store, messages=self.postmessage_store,
+            exposure=self.exposure_store, api=self.api_operations)
         self.validator_registry = ValidatorRegistry()
         self.validator = DeterministicValidatorEngine(
             runs=self.run_store, traffic=self.traffic, evidence=self.store,
@@ -270,6 +284,21 @@ class BugHunterRuntime:
         self._planner_lock = Lock()
         self._planner_threads: dict[str, Thread] = {}
         self.logger = create_logger(level=config.log_level)
+        notification_settings = config.notifications or NotificationSettings()
+        providers = []
+        if notification_settings.discord_secret_ref:
+            providers.append(DiscordNotifier(self.auth.secrets,
+                                             notification_settings.discord_secret_ref))
+        if notification_settings.smtp_host:
+            providers.append(SMTPNotifier(notification_settings, self.auth.secrets))
+        if notification_settings.console_enabled:
+            providers.append(ConsoleNotifier(self.logger))
+        self.notifications = NotificationManager(
+            self.notification_store, self.validations, self.run_store, self.traffic,
+            notification_settings, tuple(providers))
+        self.notification_store.reconcile_inflight()
+        self._notification_wakeup = Event()
+        self._notification_thread: Thread | None = None
         self._vnc_ready = vnc_ready or self._probe_vnc
         while self.objects.reconcile():
             pass
@@ -309,6 +338,46 @@ class BugHunterRuntime:
             cursor = recoverable[-1].id
             if len(recoverable) < 50:
                 break
+        if providers:
+            self._notification_thread = Thread(target=self._notification_work, daemon=True,
+                                               name="bughunter-notifications")
+            self._notification_thread.start()
+            self._notification_wakeup.set()
+
+    def _notification_work(self) -> None:
+        while True:
+            self._notification_wakeup.wait(timeout=15)
+            self._notification_wakeup.clear()
+            try:
+                self.notifications.process(max_messages=20)
+            except Exception:
+                self.logger.error("notification_worker_failed")
+
+    def record_planner_notification(self, target_id: str, run_id: str,
+                                    result: dict[str, object]) -> None:
+        run = result.get("run")
+        task = result.get("task")
+        if not isinstance(run, dict) or run.get("id") != run_id:
+            return
+        reason = task.get("reason_code") if isinstance(task, dict) else result.get("reason")
+        try:
+            if run.get("status") == "WAITING_LOGIN" and reason == "LOGIN_REQUIRED":
+                self.notification_store.enqueue(
+                    target_id=target_id, event_type=NotificationType.AUTH_REQUIRES_LOGIN,
+                    source_kind="PLANNER", source_id=run_id,
+                    priority=NotificationPriority.NORMAL)
+                self._notification_wakeup.set()
+            if run.get("status") == "COMPLETED" and any(
+                    item.finding_id and self.validations.get_finding(item.finding_id, target_id)
+                    for item in self.planner_store.candidates(target_id, run_id, limit=200)):
+                self.notification_store.enqueue(
+                    target_id=target_id,
+                    event_type=NotificationType.PLANNER_COMPLETED_WITH_FINDINGS,
+                    source_kind="PLANNER", source_id=run_id,
+                    priority=NotificationPriority.NORMAL)
+                self._notification_wakeup.set()
+        except (LookupError, ValueError, OSError):
+            self.logger.error("planner_notification_record_failed")
 
     def launch_planner(self, package_id: str, run_id: str) -> None:
         with self._planner_lock:
@@ -326,6 +395,7 @@ class BugHunterRuntime:
                 with self._planner_lock:
                     package = self.package(package_id)
                     result = self.planner_runner.advance(package, run_id)
+                    self.record_planner_notification(package.target.id, run_id, result)
                 if result["run"]["status"] not in {"READY", "RUNNING"} or result["task"] is None:
                     break
             else:
@@ -473,13 +543,16 @@ class BugHunterRuntime:
         with self.store._connection() as connection:
             connection.execute("SELECT 1").fetchone()
         browser_installed = importlib.util.find_spec("playwright") is not None
-        return {"status": "ok", "version": __version__, "checks": {
+        notifier = self.notifications.status()
+        degraded = notifier["delivery"]["failed"] > 0 or notifier["delivery"]["needs_review"] > 0
+        return {"status": "degraded" if degraded else "ok", "version": __version__, "checks": {
             "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
             "traffic_store": "ok", "orchestrator": "ready", "validator": "ready",
             "object_factory": "ready", "object_cleanup_pending": self.objects.stats()["cleanup_pending"],
             "object_orphans": self.objects.stats()["orphaned"],
             "burp": self.burp.availability().value,
+            "notifier": "degraded" if degraded else ("configured" if self.notifications.providers else "disabled"),
         }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
 
     def overview(self) -> dict[str, object]:
@@ -500,6 +573,8 @@ class BugHunterRuntime:
                 break
         return {"targets": count, "targets_truncated": cursor is not None, **counts,
                 "plan_runs": self.run_store.stats(), "validation": self.validations.stats(),
+                "notifications": self.notifications.status(), "reports": self.report_store.stats(),
+                "finding_outcomes": self.workflow.metrics(),
                 "objects": self.objects.stats(),
                 "burp": self.burp.availability().value, "activity": self.activity(PageRequest(8, None))["items"]}
 
@@ -665,7 +740,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     """WSGI factory. Bind with exactly one worker on a private Unix socket."""
     service = runtime or BugHunterRuntime(config or load_config())
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 16_384
+    app.config["MAX_CONTENT_LENGTH"] = 70_000
     app.config["JSON_SORT_KEYS"] = True
 
     @app.after_request
@@ -721,6 +796,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "burp": service.burp.status(),
                         "orchestrator": {"mode": "explicit_one_step", **service.run_store.stats()},
                         "validator": {"mode": "deterministic_evidence_only", **service.validations.stats()},
+                        "notifications": service.notifications.status(),
+                        "reports": service.report_store.stats(),
                         "object_factory": {"mode": "known_recipes_only", **service.objects.stats()},
                         "recon_integration": "configured_read_only" if service.recon else "not_connected"})
 
@@ -1421,6 +1498,15 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             raise ValueError("verified session required")
         result = service.object_factory.cleanup(object_id, package.target.id,
                                                 session_id=body["session_id"])
+        if result.outcome in {"CLEANUP_FAILED", "MANUAL_CLEANUP_REQUIRED"} and result.item:
+            try:
+                service.notification_store.enqueue(
+                    target_id=package.target.id, event_type=NotificationType.CLEANUP_FAILURE,
+                    source_kind="OBJECT", source_id=object_id,
+                    priority=NotificationPriority.HIGH)
+                service._notification_wakeup.set()
+            except (LookupError, ValueError, OSError):
+                service.logger.error("cleanup_notification_record_failed")
         return jsonify(result.to_dict()), 200 if result.outcome == "CLEANED" else 202
 
     @app.post("/v1/objects/<object_id>/create")
@@ -1804,6 +1890,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         package = service.package(package_id)
         with service._planner_lock:
             result = service.planner_runner.advance(package, run_id)
+            service.record_planner_notification(package.target.id, run_id, result)
         return jsonify(result)
 
     @app.post("/v1/planner/<package_id>/runs/<run_id>/pause")
@@ -2314,6 +2401,10 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         service.audit(event, target_id=package.target.id)
         if result.status is ValidationStatus.CONFIRMED and finding is not None:
             service.audit("finding_created", target_id=package.target.id)
+        if result.status in {ValidationStatus.CONFIRMED, ValidationStatus.NEEDS_MANUAL_REVIEW}:
+            wakeup = getattr(service, "_notification_wakeup", None)
+            if wakeup is not None:
+                wakeup.set()
         return jsonify({"validation": result.to_dict(),
                         "finding": finding.to_dict() if finding else None,
                         "request_sent": False})
@@ -2343,8 +2434,25 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         page = PageRequest.parse()
         raw = request.args.get("status")
         status = FindingStatus(raw) if raw else None
-        return jsonify(service.validations.list_findings(package.target.id, limit=page.limit,
-                                                         cursor=page.cursor, status=status))
+        result = service.validations.list_findings(package.target.id, limit=page.limit,
+                                                    cursor=page.cursor, status=status)
+        for item in result["items"]:
+            latest = service.report_store.latest(item["id"], package.target.id)
+            attempt = service.report_store.latest_attempt(item["id"], package.target.id)
+            item["latest_draft"] = latest.to_dict() if latest else None
+            item["report_readiness"] = attempt["readiness"] if attempt else "NOT_GENERATED"
+            with service.store._connection() as db:
+                submission = db.execute("SELECT platform,external_report_id,submitted_at,"
+                    "triage_status,reward_amount,reward_currency FROM finding_submission_metadata "
+                    "WHERE finding_id=?", (item["id"],)).fetchone()
+                notification = db.execute("SELECT d.status FROM notification_events e "
+                    "LEFT JOIN notification_deliveries d ON d.event_id=e.event_id "
+                    "WHERE e.finding_id=? AND e.event_type='CONFIRMED_FINDING' "
+                    "ORDER BY d.sent_at DESC LIMIT 1", (item["id"],)).fetchone()
+            item["submission"] = dict(submission) if submission else None
+            item["notification_status"] = (notification[0] if notification and notification[0]
+                                           else "NOT_CONFIGURED")
+        return jsonify(result)
 
     @app.get("/v1/findings/<finding_id>")
     def finding_detail(finding_id: str):
@@ -2353,8 +2461,106 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if finding is None:
             raise LookupError("finding not found")
         result = service.validations.get(finding.validation_id, package.target.id)
+        latest = service.report_store.latest(finding_id, package.target.id)
+        attempt = service.report_store.latest_attempt(finding_id, package.target.id)
         return jsonify({"finding": finding.to_dict(),
-                        "validation": result.to_dict() if result else None})
+                        "validation": result.to_dict() if result else None,
+                        "workflow": service.workflow.detail(finding_id, package.target.id),
+                        "latest_draft": latest.to_dict() if latest else None,
+                        "report_attempt": attempt,
+                        "notifications": service.notification_store.for_finding(
+                            finding_id, package.target.id, limit=20)})
+
+    @app.post("/v1/findings/<finding_id>/workflow")
+    def finding_transition(finding_id: str):
+        body = _body(frozenset({"target", "status", "expected_version", "actor_alias", "note",
+                                "platform", "program", "external_report_id",
+                                "external_duplicate_ref", "reward_amount", "reward_currency",
+                                "triage_status"}))
+        package = service.package(body.get("target", ""))
+        status = FindingStatus(body.get("status", ""))
+        result = service.workflow.transition(
+            finding_id, package.target.id, status,
+            expected_version=body.get("expected_version"),
+            actor_alias=body.get("actor_alias"), note=body.get("note"),
+            platform=body.get("platform"), program=body.get("program"),
+            external_report_id=body.get("external_report_id"),
+            external_duplicate_ref=body.get("external_duplicate_ref"),
+            reward_amount=body.get("reward_amount"),
+            reward_currency=body.get("reward_currency"),
+            triage_status=body.get("triage_status"))
+        service._notification_wakeup.set()
+        return jsonify(result)
+
+    @app.post("/v1/findings/<finding_id>/report")
+    def generate_report(finding_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        return jsonify(service.report_generator.generate(finding_id, package.target.id).to_dict())
+
+    @app.get("/v1/reports")
+    def list_reports():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        result = service.report_store.list(package.target.id, limit=page.limit,
+                                           cursor=page.cursor)
+        for item in result["items"]:
+            finding = service.validations.get_finding(item["finding_id"], package.target.id)
+            item["finding_title"] = finding.title if finding else None
+            item["category"] = finding.category if finding else None
+            item["workflow_state"] = finding.status.value if finding else None
+        return jsonify(result)
+
+    @app.get("/v1/reports/<report_id>")
+    def report_detail(report_id: str):
+        package = service.package(request.args.get("target", ""))
+        draft = service.report_store.get(report_id, package.target.id)
+        if draft is None:
+            raise LookupError("report not found")
+        return jsonify({"report": draft.to_dict(),
+                        "markdown": service.report_store.markdown(report_id, package.target.id)})
+
+    @app.get("/v1/reports/<report_id>/download")
+    def download_report(report_id: str):
+        package = service.package(request.args.get("target", ""))
+        content = service.report_store.markdown(report_id, package.target.id)
+        response = Response(content, content_type="text/plain; charset=utf-8")
+        response.headers["Content-Disposition"] = f'attachment; filename="{report_id}.md"'
+        return response
+
+    @app.post("/v1/reports/<report_id>/edit")
+    def edit_report(report_id: str):
+        body = _body(frozenset({"target", "content", "expected_version", "researcher_reviewed"}))
+        package = service.package(body.get("target", ""))
+        draft = service.report_store.edit(
+            report_id, package.target.id, body.get("content"),
+            expected_version=body.get("expected_version"),
+            researcher_reviewed=body.get("researcher_reviewed", False))
+        return jsonify({"report": draft.to_dict()})
+
+    @app.get("/v1/notifications/status")
+    def notification_status():
+        package = service.package(request.args.get("target", ""))
+        return jsonify(service.notifications.status(package.target.id))
+
+    @app.get("/v1/notifications")
+    def notification_history():
+        package = service.package(request.args.get("target", ""))
+        page = PageRequest.parse()
+        return jsonify(service.notification_store.list_events(package.target.id,
+                                                               limit=page.limit,
+                                                               cursor=page.cursor))
+
+    @app.post("/v1/notifications/test")
+    def notification_test():
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        event = service.notification_store.enqueue(
+            target_id=package.target.id, event_type=NotificationType.TEST,
+            source_kind="TEST", source_id="TEST-" + uuid.uuid4().hex,
+            priority=NotificationPriority.LOW)
+        service._notification_wakeup.set()
+        return jsonify({"event": event.to_dict(), "label": "TEST"})
 
     @app.post("/v1/runs/<run_id>/advance")
     def advance_plan_run(run_id: str):

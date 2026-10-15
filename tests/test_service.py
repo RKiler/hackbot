@@ -25,6 +25,9 @@ from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
 from hackbot.postmessage_static import PostMessageStaticAnalyzer
 from hackbot.service import BugHunterRuntime, create_app
+from hackbot.planner_models import PlannerLimits, PlannerMode, PlannerStatus
+from hackbot.notification_store import DeliveryStatus, NotificationPriority, NotificationType
+from hackbot.policy import policy_version
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
 
 
@@ -87,6 +90,51 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets?limit=999").status_code, 400)
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
+
+    def test_phase29_private_report_and_notification_routes(self):
+        self.assertEqual(self.get("/v1/reports?target=example")["items"], [])
+        self.assertEqual(self.get("/v1/notifications?target=example")["items"], [])
+        status = self.get("/v1/notifications/status?target=example")
+        self.assertFalse(status["discord_configured"])
+        self.assertFalse(status["smtp_configured"])
+        self.assertEqual(self.client.post("/v1/findings/FINDING-" + "a" * 32 + "/report",
+                                          json={"target": "example"}).status_code, 404)
+        self.assertEqual(self.client.get("/v1/reports/REPORT-" + "a" * 32 +
+                                         "/download?target=example").status_code, 404)
+        test = self.client.post("/v1/notifications/test", json={"target": "example"})
+        self.assertEqual(test.status_code, 200)
+        self.assertEqual(test.get_json()["label"], "TEST")
+        events = self.get("/v1/notifications?target=example")["items"]
+        self.assertEqual([item["event_type"] for item in events], ["TEST"])
+
+    def test_phase29_planner_login_alert_is_deduped(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.planner_store.create(
+            package, PlannerMode.PLAN_ONLY, PlannerLimits(), policy_version(package))
+        waiting = self.runtime.planner_store.transition(
+            self.target, run.id, PlannerStatus.WAITING_LOGIN, "LOGIN_REQUIRED")
+        observation = {"run": waiting.to_dict(), "task": {"reason_code": "LOGIN_REQUIRED"}}
+        self.runtime.record_planner_notification(self.target, run.id, observation)
+        self.runtime.record_planner_notification(self.target, run.id, observation)
+        events = self.runtime.notification_store.list_events(self.target)["items"]
+        self.assertEqual([item["event_type"] for item in events], ["AUTH_REQUIRES_LOGIN"])
+        self.assertEqual(self.runtime.notification_store.stats(self.target)["deduped"], 1)
+
+    def test_phase29_failed_notifier_degrades_health_without_service_failure(self):
+        event = self.runtime.notification_store.enqueue(
+            target_id=self.target, event_type=NotificationType.TEST,
+            source_kind="TEST", source_id="TEST-" + uuid.uuid4().hex,
+            priority=NotificationPriority.LOW)
+        self.runtime.notification_store.prepare_deliveries(event.id, ("fixture",))
+        claimed = self.runtime.notification_store.claim("fixture")
+        self.assertIsNotNone(claimed)
+        self.runtime.notification_store.finish(claimed[0].id, DeliveryStatus.FAILED,
+                                               error_code="FIXTURE_FAILURE")
+        health = self.get("/v1/health")
+        self.assertEqual(health["status"], "degraded")
+        self.assertEqual(health["checks"]["notifier"], "degraded")
+        self.assertEqual(health["checks"]["bughunter_store"], "ok")
 
     def test_behaviour_read_api_and_expectation_validation(self):
         base = "/v1/targets/example/behaviour"

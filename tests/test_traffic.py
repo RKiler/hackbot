@@ -425,7 +425,7 @@ class TrafficTests(unittest.TestCase):
 
     def test_schema_indexes_migration_and_no_production_dependency(self):
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
             indexes = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'traffic_%'")}
             for name in ("traffic_exchanges_target_recent_idx", "traffic_exchanges_identity_recent_idx",
@@ -491,7 +491,7 @@ class TrafficTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=4")
         self.traffic.initialize()
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 36)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
             self.assertEqual(connection.execute("SELECT package_id FROM registry_targets WHERE target_id=?",
                                                 (self.target,)).fetchone()[0], self.package.id)
 

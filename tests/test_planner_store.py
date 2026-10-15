@@ -36,6 +36,7 @@ from hackbot.target_package import PackageStatus
 from hackbot.target_policy import PolicyDecision
 from hackbot.test_objects import ObjectState
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
+from tests.schema_utils import drop_phase29_schema
 
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
@@ -350,6 +351,7 @@ class PlannerStoreTests(unittest.TestCase):
     def test_version_35_candidate_upgrade_keeps_existing_portfolio(self):
         run, (candidate,) = self.portfolio()
         with sqlite3.connect(self.runtime.store.db_path) as db:
+            drop_phase29_schema(db)
             db.execute("DROP TABLE planner_candidate_assessments")
             db.execute("PRAGMA user_version=35")
         self.runtime.store.initialize()
@@ -357,7 +359,7 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.assessment.potential_impact, "UNSPECIFIED")
         with sqlite3.connect(self.runtime.store.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 36)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 37)
 
     def test_candidate_assessment_is_immutable(self):
         run, (candidate,) = self.portfolio()

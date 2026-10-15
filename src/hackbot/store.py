@@ -41,7 +41,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 36
+_SCHEMA_VERSION = 37
 
 
 def _now() -> datetime:
@@ -178,6 +178,7 @@ class EvidenceFactStore:
                 (34, "034_research_coordinator.sql"),
                 (35, "035_cross_specialist_planner.sql"),
                 (36, "036_planner_candidate_assessment.sql"),
+                (37, "037_notifications_reports.sql"),
             ):
                 if version >= target_version:
                     continue
@@ -235,6 +236,9 @@ class EvidenceFactStore:
                              "planner_tasks",
                              "planner_budget_reservations", "planner_task_dependencies",
                              "planner_events", "planner_branch_memory"})
+            expected.update({"finding_submission_metadata", "notification_events",
+                             "notification_deliveries", "notification_attempts",
+                             "report_drafts", "report_attempts"})
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),
