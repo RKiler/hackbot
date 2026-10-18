@@ -397,6 +397,25 @@ class PostgresReconRepository:
             r["first_run"], _prov("scan_snapshots", r, "scan_finished_at", "completed_scan"),
         ), "scan_finished_at")
 
+    @staticmethod
+    def _asset_event(row: Mapping[str, Any]) -> ReconAssetEvent:
+        return ReconAssetEvent(
+            row["id"], row["domain_id"], row["event_type"], row["entity_type"],
+            row["entity_id"], row["location"], row["severity"],
+            _prov("asset_events", row, "last_seen", "recon_event"),
+            row.get("first_seen"), row.get("content_sha256"),
+        )
+
+    def get_asset_event(self, domain_id: int, event_id: int) -> ReconAssetEvent | None:
+        _id(domain_id)
+        _id(event_id)
+        rows = self._read("""
+            SELECT id,domain_id,event_type,entity_type,entity_id,location,severity,
+                   first_seen,last_seen,payload->>'sha256' AS content_sha256
+            FROM asset_events WHERE id=%s AND domain_id=%s LIMIT 1
+        """, (event_id, domain_id))
+        return self._asset_event(rows[0]) if rows else None
+
     def list_asset_events(self, domain_id: int, window_start: datetime, window_end: datetime, *, limit: int = 20, cursor: str | None = None) -> Page[ReconAssetEvent]:
         _id(domain_id)
         if (not isinstance(window_start, datetime) or not isinstance(window_end, datetime)
@@ -410,12 +429,9 @@ class PostgresReconRepository:
         params = ((domain_id, window_start, window_end, *position, fetch_limit)
                   if position else (domain_id, window_start, window_end, fetch_limit))
         rows = self._read(f"""
-            SELECT id,domain_id,event_type,entity_type,entity_id,location,severity,last_seen
+            SELECT id,domain_id,event_type,entity_type,entity_id,location,severity,
+                   first_seen,last_seen,payload->>'sha256' AS content_sha256
             FROM asset_events WHERE domain_id=%s AND last_seen>=%s AND last_seen<%s {condition}
             ORDER BY last_seen DESC,id DESC LIMIT %s
         """, params)
-        return self._page(rows, limit, "asset_events", scope, lambda r: ReconAssetEvent(
-            r["id"], r["domain_id"], r["event_type"], r["entity_type"],
-            r["entity_id"], r["location"], r["severity"],
-            _prov("asset_events", r, "last_seen", "recon_event"),
-        ))
+        return self._page(rows, limit, "asset_events", scope, self._asset_event)

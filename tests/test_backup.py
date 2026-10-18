@@ -684,12 +684,12 @@ class BackupTests(unittest.TestCase):
         restored.initialize(allow_existing_migration=True)
         self.assertEqual(restored.read_content(evidence_id, allow_sensitive=True), b"schema34-evidence")
         with sqlite3.connect(staged / "state.sqlite3") as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 48)
         shutil.rmtree(staged)
         original_hash = hashlib.sha256(legacy_db.read_bytes()).hexdigest()
         rehearsal = manager.rehearse_upgrade(created.backup_id)
         self.assertEqual(rehearsal["from_schema"], 34)
-        self.assertEqual(rehearsal["to_schema"], 47)
+        self.assertEqual(rehearsal["to_schema"], 48)
         self.assertEqual(rehearsal["preserved_counts"]["evidence"], 1)
         self.assertTrue(rehearsal["json_reference_audit"]["matches"])
         self.assertGreater(rehearsal["json_reference_audit"]["scanned_values"], 0)
@@ -725,7 +725,7 @@ class BackupTests(unittest.TestCase):
                 upgraded.initialize(allow_existing_migration=True)
                 self.assertEqual(upgraded.read_content(evidence_id, allow_sensitive=True), value)
                 with sqlite3.connect(database) as db:
-                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 48)
                     self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                     self.assertIsNone(db.execute("PRAGMA foreign_key_check").fetchone())
 

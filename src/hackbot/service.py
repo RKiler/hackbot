@@ -38,6 +38,9 @@ from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
 from .campaign import CampaignCoordinator
 from .campaign_models import (CampaignLimits, CampaignPreset, CampaignStatus,
                               TERMINAL_CAMPAIGN_STATUSES)
+from .delta_coordinator import DeltaCoordinator
+from .delta_models import ContinuousSettings, DeltaCadence, DeltaStatus
+from .delta_scheduler import DeltaScheduler
 from .config import (AppConfig, ConfigError, ExecutorSettings, NotificationSettings,
                      ObjectSettings, ResourceSettings, load_config)
 from .domxss import DOMXSSSpecialist
@@ -352,6 +355,8 @@ class BugHunterRuntime:
         self.campaign = CampaignCoordinator(self)
         self._campaign_lock = Lock()
         self._campaign_threads: dict[str, Thread] = {}
+        self.delta = DeltaCoordinator(self)
+        self.delta_scheduler = DeltaScheduler(self, self.delta)
         self.logger = create_logger(level=config.log_level)
         notification_settings = config.notifications or NotificationSettings()
         providers = []
@@ -1162,6 +1167,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 70_000
     app.config["JSON_SORT_KEYS"] = True
+    if runtime is None:
+        service.delta_scheduler.start()
 
     @app.after_request
     def no_store(response):
@@ -2302,6 +2309,84 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         counts = service.campaign.store.finding_counts(tuple(item.id for item in campaigns))
         return jsonify({"items": [{**item.to_dict(), "finding_count": counts.get(item.id, 0)}
                                   for item in campaigns]})
+
+    @app.get("/v1/continuous/status")
+    def continuous_status():
+        return jsonify({"mode": "explicit_opt_in", **service.delta.deltas.stats()})
+
+    @app.get("/v1/continuous/targets/<package_id>")
+    def continuous_target(package_id: str):
+        package = service.package(package_id)
+        state = service.delta.deltas.get(package.target.id)
+        return jsonify(state or {"target_id": package.target.id,
+                                 "enabled": False, "status": "DISABLED",
+                                 "settings": ContinuousSettings().to_dict()})
+
+    @app.post("/v1/continuous/targets/<package_id>/settings")
+    def continuous_settings(package_id: str):
+        package = service.package(package_id)
+        data = _body(frozenset({"enabled", "cadence", "minimum_relevance",
+                                "cooldown_seconds", "daily_campaign_cap",
+                                "request_cap", "allowed_specialists"}))
+        current = service.delta.deltas.settings(package.target.id) or ContinuousSettings()
+        values = current.to_dict()
+        values.update(data)
+        values["cadence"] = DeltaCadence(values["cadence"])
+        if not isinstance(values["allowed_specialists"], list):
+            raise ValueError("Invalid continuous specialists")
+        values["allowed_specialists"] = tuple(
+            Specialist(item) for item in values["allowed_specialists"])
+        return jsonify(service.delta.deltas.configure(package, ContinuousSettings(**values)))
+
+    @app.post("/v1/continuous/targets/<package_id>/pause")
+    def continuous_pause(package_id: str):
+        _body(frozenset())
+        return jsonify(service.delta.deltas.pause(service.package(package_id)))
+
+    @app.post("/v1/continuous/targets/<package_id>/resume")
+    def continuous_resume(package_id: str):
+        _body(frozenset())
+        return jsonify(service.delta.deltas.resume(service.package(package_id)))
+
+    @app.post("/v1/continuous/targets/<package_id>/check")
+    def continuous_check(package_id: str):
+        _body(frozenset())
+        return jsonify(service.delta.check(service.package(package_id)))
+
+    @app.get("/v1/deltas")
+    def delta_list():
+        page = PageRequest.parse(maximum=100)
+        package_id = request.args.get("target")
+        target_id = service.package(package_id).target.id if package_id else None
+        raw_status = request.args.get("status")
+        status_filter = DeltaStatus(raw_status) if raw_status else None
+        return jsonify(service.delta.deltas.page_candidates(
+            target_id=target_id, status=status_filter, limit=page.limit,
+            before=page.cursor))
+
+    @app.get("/v1/deltas/<delta_id>")
+    def delta_detail(delta_id: str):
+        package_id = request.args.get("target")
+        if not package_id:
+            raise ValueError("Delta detail requires a target")
+        package = service.package(package_id)
+        item = service.delta.deltas.get_candidate(package.target.id, delta_id)
+        if item is None:
+            raise LookupError("Delta not found")
+        item["hypothesis_ids"] = service.delta.deltas.hypothesis_ids(
+            package.target.id, delta_id)
+        return jsonify(item)
+
+    @app.post("/v1/deltas/<delta_id>/campaigns")
+    def delta_campaign_start(delta_id: str):
+        data = _body(frozenset({"target", "mode"}))
+        package_id = data.get("target")
+        if not isinstance(package_id, str):
+            raise ValueError("Focused campaign requires a target")
+        mode = PlannerMode(data.get("mode", PlannerMode.ANALYZE_ONLY.value))
+        result = service.delta.start_selected(service.package(package_id),
+                                              delta_id, mode=mode)
+        return jsonify(result), 201 if result["campaign_id"] else 200
 
     @app.post("/v1/campaigns")
     def campaign_start():

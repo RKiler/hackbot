@@ -53,6 +53,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "workflow-specialists": (
         "test_behaviour.py", "test_bootstrap.py", "test_planner_multisurface.py",
         "test_research.py", "test_campaign_flow.py", "test_campaign_store.py",
+        "test_phase32_delta.py",
     ),
     "execution-specialists": (
         "test_executor.py", "test_orchestrator.py", "test_typed_mutations.py",

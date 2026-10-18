@@ -111,6 +111,9 @@ def dom_guard_sql(db: sqlite3.Connection) -> str:
 def dom_guard_extension_sql(migration: str, *, table_prefix: str) -> str:
     """Cover new tables in the same transaction as their schema migration."""
     with sqlite3.connect(":memory:") as preview:
+        # Preview only the new schema; retirement triggers may target this
+        # pre-existing table from an earlier migration.
+        preview.execute("CREATE TABLE evidence_payload_retirements(evidence_id TEXT)")
         preview.executescript(migration)
         sources = {table: columns for table, columns in _sources(preview).items()
                    if table == "campaigns" or table.startswith(table_prefix)}

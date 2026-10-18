@@ -71,7 +71,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 47
+_SCHEMA_VERSION = 48
 
 
 def _now() -> datetime:
@@ -267,6 +267,7 @@ class EvidenceFactStore:
                 (45, "045_research_brief_retirement.sql"),
                 (46, "046_dom_retirement_guards.sql"),
                 (47, "047_campaign_coordination.sql"),
+                (48, "048_continuous_delta_hunting.sql"),
             ):
                 if version >= target_version:
                     continue
@@ -293,6 +294,13 @@ class EvidenceFactStore:
                     from .dom_guard_schema import dom_guard_extension_sql
                     migration += "\n" + dom_guard_extension_sql(
                         migration, table_prefix="campaign_")
+                if target_version == 48:
+                    from .dom_guard_schema import dom_guard_extension_sql
+                    base_migration = migration
+                    migration += "\n" + dom_guard_extension_sql(
+                        base_migration, table_prefix="delta_")
+                    migration += "\n" + dom_guard_extension_sql(
+                        base_migration, table_prefix="continuous_")
                 try:
                     connection.executescript(
                         "BEGIN IMMEDIATE;\n" + migration
@@ -361,6 +369,15 @@ class EvidenceFactStore:
             expected.update({"campaigns", "campaign_cycles", "campaign_work",
                              "campaign_task_claims", "campaign_events",
                              "campaign_suppressions", "campaign_objects"})
+            expected.update({"continuous_targets", "continuous_target_specialists",
+                             "continuous_target_events", "delta_watch_runs",
+                             "delta_observations", "delta_candidates",
+                             "delta_candidate_hints", "delta_candidate_tags",
+                             "delta_candidate_hypotheses",
+                             "delta_candidate_events", "delta_cooldowns",
+                             "delta_campaign_focus", "delta_campaign_focus_deltas",
+                             "delta_campaign_focus_hypotheses",
+                             "delta_campaign_focus_specialists", "delta_asset_refresh"})
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),

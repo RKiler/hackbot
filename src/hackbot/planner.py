@@ -554,9 +554,25 @@ class CrossSpecialistPlanner:
     def start(self, package: TargetPackage, *, mode: PlannerMode = PlannerMode.ANALYZE_ONLY,
               limits: PlannerLimits = PlannerLimits(),
               campaign_work_id: str | None = None,
-              suppressed_roots: frozenset[tuple[str, str]] = frozenset()) -> PlannerRun:
+              suppressed_roots: frozenset[tuple[str, str]] = frozenset(),
+              focused_hypothesis_ids: frozenset[str] | None = None,
+              focused_specialists: frozenset[str] | None = None) -> PlannerRun:
         if not isinstance(package, TargetPackage):
             raise ValueError("Authoritative Target Package is required")
+        if focused_hypothesis_ids is not None and (
+                not isinstance(focused_hypothesis_ids, frozenset) or
+                not 1 <= len(focused_hypothesis_ids) <= 8 or
+                any(not isinstance(item, str) or not item.startswith("HYP-")
+                    for item in focused_hypothesis_ids)):
+            raise ValueError("Invalid focused hypothesis seed")
+        if focused_specialists is not None and (
+                not isinstance(focused_specialists, frozenset) or
+                not 1 <= len(focused_specialists) <= 5 or
+                any(item not in {specialist.value for specialist in Specialist}
+                    for item in focused_specialists)):
+            raise ValueError("Invalid focused specialist seed")
+        if (focused_hypothesis_ids is None) != (focused_specialists is None):
+            raise ValueError("Focused seed requires hypotheses and specialists")
         run = self.store.create(package, mode, limits, policy_version(package),
                                 campaign_work_id=campaign_work_id)
         self.store.transition(run.target_id, run.id, PlannerStatus.LOADING_CONTEXT,
@@ -566,7 +582,29 @@ class CrossSpecialistPlanner:
                               "CONTEXT_READY", expected=(PlannerStatus.LOADING_CONTEXT,))
         run = self.store.get(run.target_id, run.id)
         assert run is not None
-        ranked = self._rank(run, context, self._signals(package, limits.portfolio))[:limits.portfolio]
+        signals = self._signals(package, limits.portfolio)
+        if focused_hypothesis_ids is not None:
+            signals = tuple(item for item in signals if
+                            item.hypothesis_id in focused_hypothesis_ids and
+                            item.specialist.value in focused_specialists)
+            covered = {item.hypothesis_id for item in signals}
+            for hypothesis_id in sorted(focused_hypothesis_ids - covered):
+                hypothesis = self.hypotheses.get(hypothesis_id, package.target.id)
+                if hypothesis is None or hypothesis.status.value in {"REJECTED", "BLOCKED"}:
+                    continue
+                specialist = _specialist(hypothesis.category)
+                if specialist is None or specialist.value not in focused_specialists:
+                    continue
+                signals += (_Signal("HYPOTHESIS", hypothesis.id, specialist,
+                    hypothesis.category, hypothesis.surface_key, hypothesis.boundary,
+                    hypothesis.priority, int(hypothesis.confidence * 100),
+                    len(hypothesis.evidence_ids), "UNKNOWN", "MEDIUM",
+                    5 if specialist in {Specialist.AUTHORIZATION,
+                                        Specialist.API_GRAPHQL} else 0,
+                    BROWSER_TRIAL_CAPS.get(specialist, 0), 0,
+                    tuple(dict.fromkeys(_gap(part) for part in hypothesis.missing)),
+                    tuple(hypothesis.evidence_ids[:6]), hypothesis.id),)
+        ranked = self._rank(run, context, signals)[:limits.portfolio]
         if suppressed_roots:
             ranked = tuple(replace(item, status=CandidateStatus.SKIPPED,
                                    reason_codes=(*item.reason_codes[:11], "CAMPAIGN_SUPPRESSED"))

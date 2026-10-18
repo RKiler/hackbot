@@ -3,8 +3,37 @@
 import sqlite3
 
 
+def drop_phase32_schema(connection: sqlite3.Connection) -> None:
+    """Remove continuous-delta tables before a schema-47 fixture."""
+    connection.execute("DROP TRIGGER IF EXISTS delta_candidate_evidence_no_retirement")
+    for (name,) in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND "
+        "(name LIKE 'retired_dom_link_delta_%' OR "
+        "name LIKE 'retired_dom_link_continuous_%')"
+    ).fetchall():
+        connection.execute(f'DROP TRIGGER "{name}"')
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='dom_retirement_guard_sources'"
+    ).fetchone():
+        connection.execute("DELETE FROM dom_retirement_guard_sources WHERE "
+                           "source_table LIKE 'delta_%' OR "
+                           "source_table LIKE 'continuous_%'")
+    for table in (
+        "delta_asset_refresh", "delta_campaign_focus_specialists",
+        "delta_campaign_focus_hypotheses", "delta_campaign_focus_deltas",
+        "delta_campaign_focus", "delta_cooldowns", "delta_candidate_events",
+        "delta_candidate_hypotheses", "delta_candidate_tags",
+        "delta_candidate_hints", "delta_candidates", "delta_observations",
+        "delta_watch_runs", "continuous_target_events",
+        "continuous_target_specialists", "continuous_targets",
+    ):
+        connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def drop_phase31_schema(connection: sqlite3.Connection) -> None:
     """Remove campaign tables before constructing a historical schema."""
+    drop_phase32_schema(connection)
     for table in (
         "campaign_objects", "campaign_suppressions", "campaign_events",
         "campaign_task_claims", "campaign_work", "campaign_cycles", "campaigns",

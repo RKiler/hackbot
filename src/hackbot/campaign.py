@@ -14,6 +14,7 @@ from .campaign_models import (
     CampaignWorkStatus, TERMINAL_CAMPAIGN_STATUSES,
 )
 from .campaign_store import CampaignStore
+from .delta_models import DeltaFocus
 from .planner_models import (
     CandidateStatus, PlannerLimits, PlannerMode, PlannerStatus, PlannerTaskType,
     TERMINAL_STATUSES,
@@ -46,10 +47,12 @@ class CampaignCoordinator:
         self.store = CampaignStore(runtime.store)
 
     def start(self, package: TargetPackage, *, mode: PlannerMode,
-              limits: CampaignLimits, requested_by: str = "operator") -> Campaign:
+              limits: CampaignLimits, requested_by: str = "operator",
+              focus: DeltaFocus | None = None) -> Campaign:
         self.runtime.resources.admit(WorkKind.CAMPAIGN, active=self.active_count())
         self.runtime.registry.register_target(package)
-        return self.store.create(package, mode, limits, policy_version(package), requested_by)
+        return self.store.create(package, mode, limits, policy_version(package),
+                                 requested_by, focus=focus)
 
     def active_count(self) -> int:
         with self.runtime.store._connection() as db:
@@ -184,6 +187,7 @@ class CampaignCoordinator:
         }
         return {
             "campaign": campaign.to_dict(), "remaining": remaining,
+            "delta_focus": self.store.delta_focus(package.target.id, campaign_id),
             "readiness": context.public_dict(),
             "resource": {"state": resource.state, "warnings": list(resource.warnings)},
             "capture": self.runtime.burp.status(campaign.target_id),
@@ -428,9 +432,16 @@ class CampaignCoordinator:
             requests=request_cap, browser_actions=browser_cap, tokens=token_cap,
             seconds=max(1, min(remaining["seconds"], 300)), candidates=8,
             per_specialist=3, cleanup_reserve=0)
+        focus = self.store.delta_focus(campaign.target_id, campaign.id)
         with self.runtime._planner_lock:
             run = self.runtime.planner.start(package, mode=campaign.mode,
                                              limits=limits, campaign_work_id=work.id,
+                                             focused_hypothesis_ids=(
+                                                 frozenset(focus["hypothesis_ids"])
+                                                 if focus else None),
+                                             focused_specialists=(
+                                                 frozenset(focus["specialists"])
+                                                 if focus else None),
                                              suppressed_roots=frozenset(
                                                  (item["root_key"], item["state_hash"])
                                                  for item in self.store.suppressions(
@@ -565,6 +576,8 @@ class CampaignCoordinator:
                                          CampaignStatus.RUNNING, "CYCLE_READY",
                                          package=package, policy_hash=current_hash)
         context, remaining = self._readiness(package, campaign)
+        if self.store.delta_focus(campaign.target_id, campaign.id) is not None:
+            return self._planner(package, campaign, remaining)
         if (campaign.current_cycle == 1 and context.profile_id is None and
                 not context.recent_exchange_ids and context.recon_status != "RECON_BACKED" and
                 self.runtime.bootstrap_store.list_runs(campaign.target_id, limit=1) == ()):

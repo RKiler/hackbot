@@ -15,8 +15,12 @@ from hackbot.artifacts import ArtifactStore
 from hackbot.auth import AuthContextManager
 from hackbot.browser import IdentityObservation, IdentityVerificationRule
 from hackbot.config import SecretBindingConfig, SecretSettings
+from hackbot.campaign_models import CampaignLimits, CampaignStatus, CampaignWorkKind
+from hackbot.campaign_store import CampaignStore
+from hackbot.delta_models import DeltaFocus, DeltaSignal, DeltaSource, DeltaType
+from hackbot.delta_store import DeltaStore
 from hackbot.domain import ObservationState, Principal, Role, Tenant
-from hackbot.evidence import EvidenceProvenance, Retention, Sensitivity
+from hackbot.evidence import EvidenceProvenance, EvidenceType, Retention, Sensitivity
 from hackbot.finding_workflow import FindingWorkflow
 from hackbot.hypotheses import HypothesisStore
 from hackbot.planner import CrossSpecialistPlanner, _Signal, _candidate_state
@@ -311,7 +315,7 @@ class ValidatorTests(unittest.TestCase):
         self.fx.store.initialize(allow_existing_migration=True)
         self.assertTrue(self.fx.store.get_evidence(held_id).retention.pinned)
         with self.fx.store._connection() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 48)
 
     def test_planner_child_confirmation_retains_full_policy_audit_chain(self):
         child_id = self.auth_run()
@@ -337,6 +341,38 @@ class ValidatorTests(unittest.TestCase):
             plan_run_id=child_id, status=CandidateStatus.RUNNING)
         validate_task = ledger.add_task(run, candidate, PlannerTaskType.VALIDATE_RUN)
         claimed = ledger.claim_task(self.target, run.id, validate_task.id)
+        delta_ledger = DeltaStore(self.fx.store)
+        delta_ledger.ensure(self.fx.package)
+        source_url = self.fx.base + "/validated/owned"
+        signal = DeltaSignal(
+            DeltaType.NEW_ENDPOINT, DeltaSource.RECON, "asset_events:1",
+            "endpoint", "1", digest(source_url), "127.0.0.1/validated/owned",
+            None, digest("fixture-endpoint"), datetime.now().astimezone().isoformat(),
+            90, (Specialist.AUTHORIZATION,), ("PRIVILEGED_NAME",))
+        watch_id = delta_ledger.begin_watch(self.fx.package, trigger="FIXTURE")
+        delta_ledger.finish_watch(self.fx.package, watch_id, source=DeltaSource.RECON,
+                                  signals=(signal,))
+        delta_id = delta_ledger.list_candidates(target_id=self.target)[0]["delta_id"]
+        passive = self.fx.store.create_evidence(
+            EvidenceType.RECON_RECORD, b"synthetic endpoint delta; not a finding",
+            source="FIXTURE", target_ref=self.target,
+            provenance=EvidenceProvenance(system="FIXTURE", entity="delta"))
+        delta_ledger.link_evidence(self.target, delta_id, passive.evidence_id)
+        delta_ledger.link_hypothesis(self.target, delta_id, self.work.hypotheses.id)
+        campaigns = CampaignStore(self.fx.store)
+        policy_hash = policy_version(self.fx.package)
+        focused = campaigns.create(
+            self.fx.package, PlannerMode.BOUNDED_AUTONOMOUS, CampaignLimits(),
+            policy_hash, "fixture", focus=DeltaFocus(
+                (delta_id,), (self.work.hypotheses.id,),
+                (Specialist.AUTHORIZATION,), digest(source_url), source_url))
+        campaigns.transition(self.target, focused.id, CampaignStatus.RUNNING,
+                             "FIXTURE_READY", package=self.fx.package,
+                             policy_hash=policy_hash)
+        campaigns.begin_cycle(self.fx.package, focused.id, policy_hash)
+        work = campaigns.reserve_work(self.target, focused.id,
+                                      CampaignWorkKind.PLANNER, requests=5)
+        campaigns.link_child(self.target, focused.id, work.id, run.id)
         runner = PlannerRunner(
             planner=None, store=ledger, hypotheses=None, contexts=None, router=None,
             skill_planner=None, authorization=None, api=None, dom=None, messages=None,
@@ -356,10 +392,17 @@ class ValidatorTests(unittest.TestCase):
         self.assertGreater(ledger.metrics(self.target, run.id)["child_request_slots_consumed"], 0)
         with self.fx.store._connection() as db:
             chain = db.execute(
-                "SELECT pr.run_id AS planner_run_id,c.candidate_id,t.task_id,"
+                "SELECT dc.delta_id,cmp.campaign_id,pr.run_id AS planner_run_id,"
+                "c.candidate_id,t.task_id,"
                 "f.finding_id,v.validation_id,r.run_id,p.plan_id,p.skill_id,"
                 "h.hypothesis_id,d.decision_id,pm.permit_id,e.exchange_id "
-                "FROM planner_runs pr JOIN planner_candidates c ON c.run_id=pr.run_id "
+                "FROM delta_candidates dc JOIN delta_campaign_focus_deltas fd "
+                "ON fd.delta_id=dc.delta_id "
+                "JOIN campaigns cmp ON cmp.campaign_id=fd.campaign_id "
+                "JOIN campaign_work cw ON cw.campaign_id=cmp.campaign_id "
+                "AND cw.kind='PLANNER' "
+                "JOIN planner_runs pr ON pr.run_id=cw.child_id "
+                "JOIN planner_candidates c ON c.run_id=pr.run_id "
                 "JOIN planner_tasks t ON t.candidate_id=c.candidate_id "
                 "JOIN findings f ON f.finding_id=c.finding_id "
                 "JOIN validations v ON v.validation_id=f.validation_id "
@@ -371,12 +414,15 @@ class ValidatorTests(unittest.TestCase):
                 "JOIN executor_permits pm ON pm.permit_id=s.permit_id "
                 "JOIN executor_events ev ON ev.permit_id=pm.permit_id "
                 "JOIN traffic_exchanges e ON e.exchange_id=ev.exchange_id "
-                "WHERE pr.run_id=? AND c.candidate_id=? "
+                "WHERE dc.delta_id=? AND pr.run_id=? AND c.candidate_id=? "
                 "AND t.task_type='VALIDATE_RUN' AND ev.event_type='REQUEST_SENT' LIMIT 1",
-                (run.id, candidate.id)).fetchone()
+                (delta_id, run.id, candidate.id)).fetchone()
         self.assertIsNotNone(chain)
+        self.assertEqual(chain["delta_id"], delta_id)
+        self.assertEqual(chain["campaign_id"], focused.id)
         self.assertEqual(chain["run_id"], child_id)
         self.assertEqual(chain["finding_id"], confirmed.finding_id)
+        self.assertEqual(delta_ledger.stats()["findings_from_deltas"], 1)
 
     def test_planner_remembers_real_rejection_for_unchanged_target_state(self):
         child_id = self.auth_run(boundary_path="/validated/denied")

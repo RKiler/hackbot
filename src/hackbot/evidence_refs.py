@@ -66,12 +66,14 @@ _APPROVED_DIRECT = frozenset({
     ("traffic_responses", "body_evidence_id"),
     ("traffic_responses", "observation_evidence_id"),
 })
+_PHASE32_DIRECT = frozenset({("delta_candidates", "evidence_id")})
 _DIRECT_GUARD_PREFIXES = frozenset({
     "evidence", "fact_evidence", "fact_status", "auth_context",
     "traffic_request", "traffic_response", "profile_source", "hypothesis",
     "test_object", "dom_js", "dom_map", "message_trial", "exposure_source",
     "bootstrap", "behaviour", "api_operation",
 })
+_PHASE32_GUARD_PREFIXES = frozenset({"delta_candidate"})
 
 
 def _quote(identifier: str) -> str:
@@ -104,12 +106,16 @@ def evidence_reference_inventory(
             found_ids - direct - _DECLARED_DIRECT - _SELF_IDENTIFIERS):
         raise EvidenceReferenceError("Evidence reference schema requires review")
     declared = _DECLARED_DIRECT & found_ids
-    if db.execute("PRAGMA user_version").fetchone()[0] >= 41:
-        if (direct | declared) - _IGNORED_DIRECT != _APPROVED_DIRECT:
+    schema_version = db.execute("PRAGMA user_version").fetchone()[0]
+    if schema_version >= 41:
+        approved = (_APPROVED_DIRECT | _PHASE32_DIRECT if schema_version >= 48
+                    else _APPROVED_DIRECT)
+        if (direct | declared) - _IGNORED_DIRECT != approved:
             raise EvidenceReferenceError("Evidence direct reference schema requires review")
         expected_direct_guards = {
             f"retired_link_{prefix}_{action}"
-            for prefix in _DIRECT_GUARD_PREFIXES
+            for prefix in (_DIRECT_GUARD_PREFIXES | _PHASE32_GUARD_PREFIXES
+                           if schema_version >= 48 else _DIRECT_GUARD_PREFIXES)
             for action in ("insert", "update")
         } | {
             "finding_evidence_no_retired_payload",

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import re
 import sqlite3
 import uuid
@@ -12,8 +13,10 @@ from .campaign_models import (
     CampaignWork, CampaignWorkKind, CampaignWorkStatus, TERMINAL_CAMPAIGN_STATUSES,
 )
 from .planner_models import PlannerMode
+from .delta_models import DeltaFocus
 from .store import EvidenceFactStore
 from .target_package import TargetPackage
+from .target_scope import ScopeResult
 
 
 _CAMPAIGN_ID = re.compile(r"CMP-[0-9a-f]{32}\Z")
@@ -97,7 +100,8 @@ class CampaignStore:
                    (campaign_id, cycle, work_id, event, reason, _now()))
 
     def create(self, package: TargetPackage, mode: PlannerMode, limits: CampaignLimits,
-               policy_hash: str, requested_by: str) -> Campaign:
+               policy_hash: str, requested_by: str,
+               focus: DeltaFocus | None = None) -> Campaign:
         if (package.status.value != "TRACKED" or not _ACTOR.fullmatch(requested_by)
                 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}:[0-9a-f]{64}", policy_hash)
                 or not isinstance(mode, PlannerMode) or not isinstance(limits, CampaignLimits)):
@@ -113,6 +117,72 @@ class CampaignStore:
                           "'BUDGET_EXHAUSTED','TIME_EXHAUSTED','CLEANUP_REQUIRED')",
                           (package.target.id,)).fetchone():
                 raise ValueError("An active campaign already owns this target")
+            cooldown_keys: list[tuple[str, str]] = []
+            if focus is not None:
+                if (not isinstance(focus, DeltaFocus) or
+                        package.scope.evaluate_url(focus.scope_url).result is not ScopeResult.IN_SCOPE):
+                    raise ValueError("Focused campaign requires current in-scope source")
+                target = db.execute("SELECT * FROM continuous_targets WHERE target_id=? "
+                                    "AND package_id=?", (package.target.id,
+                                                          package.id)).fetchone()
+                if target is None:
+                    raise ValueError("Continuous target not registered")
+                if focus.automatic and (not target["enabled"] or
+                    limits.requests > target["request_cap"] or limits.max_cycles != 1 or
+                    limits.research_requests != 0 or limits.setup_objects != 0):
+                    raise ValueError("Automatic campaign exceeds continuous settings")
+                if focus.automatic:
+                    today = datetime.now(timezone.utc).date().isoformat() + "T00:00:00+00:00"
+                    count = db.execute("SELECT count(*) FROM delta_campaign_focus "
+                                       "WHERE target_id=? AND automatic=1 AND created_at>=?",
+                                       (package.target.id, today)).fetchone()[0]
+                    if count >= target["daily_campaign_cap"]:
+                        raise ValueError("Daily focused-campaign cap reached")
+                allowed = {row[0] for row in db.execute(
+                    "SELECT specialist FROM continuous_target_specialists WHERE target_id=?",
+                    (package.target.id,))}
+                if focus.automatic and not {item.value for item in focus.specialists} <= allowed:
+                    raise ValueError("Specialist disabled for continuous target")
+                placeholders = ",".join("?" for _ in focus.delta_ids)
+                rows = db.execute(
+                    "SELECT delta_id,delta_type,entity_type,entity_id,location_hash,"
+                    "new_fingerprint,semantic_hash,relevance,status,evidence_id "
+                    f"FROM delta_candidates WHERE target_id=? AND delta_id IN ({placeholders})",
+                    (package.target.id, *focus.delta_ids)).fetchall()
+                if len(rows) != len(focus.delta_ids):
+                    raise ValueError("Focused delta set changed")
+                linked_hypotheses: set[str] = set()
+                linked_specialists: set[str] = set()
+                for row in rows:
+                    if (row["location_hash"] != focus.location_hash or
+                            row["status"] not in {"CLASSIFIED", "CAMPAIGN_READY"} or
+                            row["evidence_id"] is None or
+                            focus.automatic and row["relevance"] < target["minimum_relevance"]):
+                        raise ValueError("Delta is not campaign ready")
+                    if (focus.recon_asset_id is not None and
+                            (row["entity_type"] != "js_asset" or
+                             row["entity_id"] != str(focus.recon_asset_id))):
+                        raise ValueError("Focused asset does not match delta")
+                    linked_hypotheses.update(item[0] for item in db.execute(
+                        "SELECT hypothesis_id FROM delta_candidate_hypotheses WHERE delta_id=?",
+                        (row["delta_id"],)))
+                    linked_specialists.update(item[0] for item in db.execute(
+                        "SELECT specialist FROM delta_candidate_hints WHERE delta_id=?",
+                        (row["delta_id"],)))
+                    root_key = hashlib.sha256("\x1f".join((package.target.id,
+                        row["delta_type"], row["location_hash"])).encode()).hexdigest()
+                    state_hash = row["semantic_hash"] or row["new_fingerprint"]
+                    blocked = db.execute("SELECT 1 FROM delta_cooldowns WHERE target_id=? "
+                        "AND root_key=? AND state_hash=? AND next_allowed_at>?",
+                        (package.target.id, root_key, state_hash, at)).fetchone()
+                    if blocked:
+                        raise ValueError("Focused delta is cooling down")
+                    cooldown_keys.append((root_key, state_hash))
+                if (not set(focus.hypothesis_ids) <= linked_hypotheses or
+                        not {item.value for item in focus.specialists} <= linked_specialists):
+                    raise ValueError("Focused seed is not linked to selected deltas")
+                if hashlib.sha256(focus.scope_url.encode()).hexdigest() != focus.location_hash:
+                    raise ValueError("Focused source hash changed")
             db.execute(
                 "INSERT INTO campaigns(campaign_id,target_id,package_id,package_version,"
                 "policy_hash,mode,status,requested_by,max_cycles,seconds_limit,requests_limit,"
@@ -123,7 +193,40 @@ class CampaignStore:
                  limits.seconds, limits.requests, limits.browser_actions,
                  limits.research_requests, limits.tokens, limits.setup_objects,
                  limits.cleanup_reserve, CAMPAIGN_VERSION, at, at))
-            self._event(db, campaign_id, "CREATED", "EXPLICIT_START")
+            self._event(db, campaign_id, "CREATED",
+                        "DELTA_TRIGGER" if focus and focus.automatic else "EXPLICIT_START")
+            if focus is not None:
+                db.execute("INSERT INTO delta_campaign_focus(campaign_id,target_id,"
+                           "location_hash,recon_asset_id,automatic,created_at) "
+                           "VALUES (?,?,?,?,?,?)", (campaign_id, package.target.id,
+                           focus.location_hash, focus.recon_asset_id,
+                           int(focus.automatic), at))
+                db.executemany("INSERT INTO delta_campaign_focus_deltas VALUES (?,?)",
+                               ((campaign_id, item) for item in focus.delta_ids))
+                db.executemany("INSERT INTO delta_campaign_focus_hypotheses VALUES (?,?)",
+                               ((campaign_id, item) for item in focus.hypothesis_ids))
+                db.executemany("INSERT INTO delta_campaign_focus_specialists VALUES (?,?)",
+                               ((campaign_id, item.value) for item in focus.specialists))
+                status_by_id = {row["delta_id"]: row["status"] for row in rows}
+                for item in focus.delta_ids:
+                    db.execute("UPDATE delta_candidates SET status='CAMPAIGN_STARTED',"
+                               "campaign_id=?,updated_at=? WHERE target_id=? AND delta_id=?",
+                               (campaign_id, at, package.target.id, item))
+                    db.execute("INSERT INTO delta_candidate_events(delta_id,old_status,"
+                               "new_status,reason_code,changed_at) VALUES (?,?,?,?,?)",
+                               (item, status_by_id[item], "CAMPAIGN_STARTED",
+                                "FOCUSED_CAMPAIGN", at))
+                next_allowed = (datetime.fromisoformat(at) + timedelta(
+                    seconds=target["cooldown_seconds"])).isoformat()
+                db.executemany("INSERT INTO delta_cooldowns(target_id,root_key,state_hash,"
+                    "next_allowed_at,last_campaign_id,created_at) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(target_id,root_key,state_hash) DO UPDATE SET "
+                    "next_allowed_at=excluded.next_allowed_at,"
+                    "last_campaign_id=excluded.last_campaign_id",
+                    ((package.target.id, root, state, next_allowed, campaign_id, at)
+                     for root, state in cooldown_keys))
+                db.execute("UPDATE continuous_targets SET last_campaign_at=?,updated_at=? "
+                           "WHERE target_id=?", (at, at, package.target.id))
         result = self.get(package.target.id, campaign_id)
         assert result is not None
         return result
@@ -135,6 +238,28 @@ class CampaignStore:
             row = db.execute("SELECT * FROM campaigns WHERE target_id=? AND campaign_id=?",
                              (target_id, campaign_id)).fetchone()
         return self._campaign(row) if row else None
+
+    def delta_focus(self, target_id: str, campaign_id: str) -> dict[str, object] | None:
+        if not _CAMPAIGN_ID.fullmatch(campaign_id):
+            raise ValueError("Invalid campaign ID")
+        with self.store._connection() as db:
+            row = db.execute("SELECT campaign_id,target_id,location_hash,recon_asset_id,"
+                             "automatic,created_at FROM delta_campaign_focus WHERE "
+                             "campaign_id=? AND target_id=?", (campaign_id, target_id)).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["automatic"] = bool(result["automatic"])
+            result["delta_ids"] = tuple(item[0] for item in db.execute(
+                "SELECT delta_id FROM delta_campaign_focus_deltas WHERE campaign_id=? "
+                "ORDER BY delta_id", (campaign_id,)))
+            result["hypothesis_ids"] = tuple(item[0] for item in db.execute(
+                "SELECT hypothesis_id FROM delta_campaign_focus_hypotheses WHERE "
+                "campaign_id=? ORDER BY hypothesis_id", (campaign_id,)))
+            result["specialists"] = tuple(item[0] for item in db.execute(
+                "SELECT specialist FROM delta_campaign_focus_specialists WHERE "
+                "campaign_id=? ORDER BY specialist", (campaign_id,)))
+        return result
 
     def find(self, campaign_id: str) -> Campaign | None:
         if not _CAMPAIGN_ID.fullmatch(campaign_id):
