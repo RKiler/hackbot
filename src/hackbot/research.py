@@ -441,7 +441,8 @@ class ResearchStore:
             return dict(row) if row else None
 
     def create_request(self, gap: KnowledgeGap, budget: ResearchBudget, *, external: bool,
-                       private_target: bool, cache_key: str) -> str:
+                       private_target: bool, cache_key: str,
+                       campaign_work_id: str | None = None) -> str:
         request_id = "RREQ-" + uuid.uuid4().hex
         now = _now().isoformat()
         with self.evidence._connection() as db:
@@ -453,6 +454,11 @@ class ResearchStore:
                         json.dumps({"searches": 0, "sources": 0, "source_bytes": 0,
                                     "input_tokens_estimated": 0, "output_tokens_estimated": 0,
                                     "model_calls": 0})))
+            if campaign_work_id is not None:
+                from .campaign_models import CampaignWorkKind
+                from .campaign_store import link_created_child
+                link_created_child(db, campaign_work_id, kind=CampaignWorkKind.RESEARCH,
+                                   target_id=gap.target_id, child_id=request_id)
         return request_id
 
     def request(self, target_id: str, request_id: str) -> dict[str, object] | None:
@@ -705,7 +711,8 @@ class ResearchCoordinator:
 
     def submit(self, gap: KnowledgeGap, *, budget: ResearchBudget | None = None,
                external: bool = False, private_target: bool = True,
-               refresh: bool = False) -> dict[str, object]:
+               refresh: bool = False,
+               campaign_work_id: str | None = None) -> dict[str, object]:
         budget = budget or ResearchBudget()
         key = self.cache_key(gap, private_target=private_target)
         cached = self.store.cached(key)
@@ -713,8 +720,9 @@ class ResearchCoordinator:
         if active:
             return active
         try:
-            request_id = self.store.create_request(gap, budget, external=external,
-                                                   private_target=private_target, cache_key=key)
+            request_id = self.store.create_request(
+                gap, budget, external=external, private_target=private_target,
+                cache_key=key, campaign_work_id=campaign_work_id)
         except sqlite3.IntegrityError:
             active = self.store.active_for_cache(key, gap.target_id)
             if active:

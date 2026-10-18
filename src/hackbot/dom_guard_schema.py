@@ -108,6 +108,24 @@ def dom_guard_sql(db: sqlite3.Connection) -> str:
     return "\n".join(statements)
 
 
+def dom_guard_extension_sql(migration: str, *, table_prefix: str) -> str:
+    """Cover new tables in the same transaction as their schema migration."""
+    with sqlite3.connect(":memory:") as preview:
+        preview.executescript(migration)
+        sources = {table: columns for table, columns in _sources(preview).items()
+                   if table == "campaigns" or table.startswith(table_prefix)}
+    statements = []
+    for table, columns in sources.items():
+        for column in columns:
+            statements.append(
+                f"INSERT INTO {_q(_SOURCE_TABLE)} VALUES "
+                f"({_literal(table)},{_literal(column)});"
+            )
+        statements.extend(_trigger(table, columns, action)
+                          for action in ("insert", "update"))
+    return "\n".join(statements)
+
+
 def verify_dom_retirement_guards(db: sqlite3.Connection) -> None:
     if db.execute("PRAGMA user_version").fetchone()[0] < 46:
         raise ValueError("DOM retirement requires schema 46 guards")

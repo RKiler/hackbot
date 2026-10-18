@@ -159,7 +159,8 @@ class BehaviourStore:
     def __init__(self, evidence: EvidenceFactStore) -> None:
         self.evidence = evidence
 
-    def create_run(self, package: TargetPackage, limits: LearningLimits) -> BehaviourLearningRun:
+    def create_run(self, package: TargetPackage, limits: LearningLimits,
+                   *, campaign_work_id: str | None = None) -> BehaviourLearningRun:
         run_id = "LEARN-" + uuid.uuid4().hex
         with self.evidence._connection() as db:
             try:
@@ -167,6 +168,12 @@ class BehaviourStore:
                     (run_id,target_id,package_id,status,limits_json,created_at)
                     VALUES (?,?,?,?,?,?)""", (run_id, package.target.id, package.id,
                     LearningStatus.CREATED.value, json.dumps(asdict(limits)), _now()))
+                if campaign_work_id is not None:
+                    from .campaign_models import CampaignWorkKind
+                    from .campaign_store import link_created_child
+                    link_created_child(db, campaign_work_id,
+                                       kind=CampaignWorkKind.BEHAVIOUR,
+                                       target_id=package.target.id, child_id=run_id)
             except sqlite3.IntegrityError as exc:
                 raise ValueError("A learning run is already active for this target") from exc
         result = self.get_run(package.target.id, run_id)
@@ -553,11 +560,13 @@ class NormalBehaviourLearner:
             covered.update(dimensions)
         return tuple(selected)
 
-    def create(self, package: TargetPackage, limits: LearningLimits = LearningLimits()) -> BehaviourLearningRun:
+    def create(self, package: TargetPackage, limits: LearningLimits = LearningLimits(),
+               *, campaign_work_id: str | None = None) -> BehaviourLearningRun:
         if package.status is not PackageStatus.TRACKED:
             raise ValueError("Target is not active")
         self.identities.register_target(package)
-        return self.ledger.create_run(package, limits)
+        return self.ledger.create_run(package, limits,
+                                      campaign_work_id=campaign_work_id)
 
     def run(self, package: TargetPackage, run_id: str, *,
             target_profile: TargetProfile | None = None) -> BehaviourLearningRun:

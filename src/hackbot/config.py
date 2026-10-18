@@ -140,6 +140,7 @@ class BackupSettings:
 
 @dataclass(frozen=True)
 class ResourceSettings:
+    max_campaigns: int = 1
     max_planner_runs: int = 1
     max_plan_runs: int = 4
     max_browser_sessions: int = 4
@@ -158,7 +159,8 @@ class ResourceSettings:
     critical_load_per_cpu: float | None = None
 
     def __post_init__(self) -> None:
-        caps = (self.max_planner_runs, self.max_plan_runs, self.max_browser_sessions,
+        caps = (self.max_campaigns, self.max_planner_runs, self.max_plan_runs,
+                self.max_browser_sessions,
                 self.max_bootstrap_runs, self.max_learning_runs, self.max_research_requests)
         if any(type(value) is not int or not 1 <= value <= 64 for value in caps):
             raise ConfigError("Invalid runtime concurrency limit")

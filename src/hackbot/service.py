@@ -35,6 +35,9 @@ from .behaviour import BehaviourStore, LearningLimits, LearningStatus, NormalBeh
 from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
 from .burp_storage import inspect_burp_storage
 from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
+from .campaign import CampaignCoordinator
+from .campaign_models import (CampaignLimits, CampaignPreset, CampaignStatus,
+                              TERMINAL_CAMPAIGN_STATUSES)
 from .config import (AppConfig, ConfigError, ExecutorSettings, NotificationSettings,
                      ObjectSettings, ResourceSettings, load_config)
 from .domxss import DOMXSSSpecialist
@@ -346,6 +349,9 @@ class BugHunterRuntime:
             browser=self.browser, orchestrator=self.orchestrator, validator=self.validator)
         self._planner_lock = Lock()
         self._planner_threads: dict[str, Thread] = {}
+        self.campaign = CampaignCoordinator(self)
+        self._campaign_lock = Lock()
+        self._campaign_threads: dict[str, Thread] = {}
         self.logger = create_logger(level=config.log_level)
         notification_settings = config.notifications or NotificationSettings()
         providers = []
@@ -406,6 +412,7 @@ class BugHunterRuntime:
             cursor = recoverable[-1].id
             if len(recoverable) < 50:
                 break
+        self.campaign.store.reconcile_interrupted()
         if providers:
             self._notification_thread = Thread(target=self._notification_work, daemon=True,
                                                name="bughunter-notifications")
@@ -488,6 +495,54 @@ class BugHunterRuntime:
         finally:
             with self._planner_lock:
                 self._planner_threads.pop(run_id, None)
+
+    def launch_campaign(self, package_id: str, campaign_id: str) -> None:
+        with self._campaign_lock:
+            existing = self._campaign_threads.get(campaign_id)
+            if existing and existing.is_alive():
+                return
+            self.resources.admit(
+                WorkKind.CAMPAIGN,
+                active=sum(thread.is_alive() for key, thread in
+                           self._campaign_threads.items() if key != campaign_id))
+            thread = Thread(target=self._campaign_work,
+                            args=(package_id, campaign_id), daemon=True,
+                            name="campaign-" + campaign_id[-8:])
+            self._campaign_threads[campaign_id] = thread
+            thread.start()
+
+    def _campaign_work(self, package_id: str, campaign_id: str) -> None:
+        try:
+            for _ in range(MAX_RUN_TASKS * 8):
+                with self._campaign_lock:
+                    package = self.package(package_id)
+                    campaign = self.campaign.advance(package, campaign_id)
+                if campaign.status not in {CampaignStatus.CREATED,
+                                           CampaignStatus.ASSESSING_READINESS,
+                                           CampaignStatus.RUNNING}:
+                    break
+            else:
+                with self._campaign_lock:
+                    package = self.package(package_id)
+                    campaign = self.campaign.store.get(package.target.id, campaign_id)
+                    if campaign and campaign.status is CampaignStatus.RUNNING:
+                        self.campaign.pause(package, campaign_id)
+                self.logger.warning("campaign_step_limit_reached")
+        except Exception:
+            self.logger.error("campaign_worker_failed")
+            with self._campaign_lock:
+                try:
+                    package = self.package(package_id)
+                    campaign = self.campaign.store.get(package.target.id, campaign_id)
+                    if campaign and campaign.status not in TERMINAL_CAMPAIGN_STATUSES:
+                        self.campaign.store.transition(
+                            campaign.target_id, campaign.id,
+                            CampaignStatus.PAUSED, "WORKER_ERROR")
+                except Exception:
+                    self.logger.error("campaign_pause_failed")
+        finally:
+            with self._campaign_lock:
+                self._campaign_threads.pop(campaign_id, None)
 
     def _probe_vnc(self) -> bool:
         if not self.config.browser.vnc_url:
@@ -1198,6 +1253,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "burp": service.burp.status(),
                         "orchestrator": {"mode": "explicit_one_step", **service.run_store.stats()},
                         "validator": {"mode": "deterministic_evidence_only", **service.validations.stats()},
+                        "campaigns": {"mode": "explicit_bounded", **service.campaign.store.stats()},
                         "notifications": service.notifications.status(),
                         "reports": service.report_store.stats(),
                         "object_factory": {"mode": "known_recipes_only", **service.objects.stats()},
@@ -2235,6 +2291,86 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if not service.research_store.cancel(package.target.id, request_id):
             raise LookupError("active research request not found")
         return jsonify({"request_id": request_id, "status": "CANCELLED"})
+
+    @app.get("/v1/campaigns")
+    def campaign_list():
+        page = PageRequest.parse(maximum=50)
+        package_id = request.args.get("target")
+        target_id = service.package(package_id).target.id if package_id else None
+        campaigns = service.campaign.store.list(target_id=target_id,
+                                                limit=page.limit, before=page.cursor)
+        counts = service.campaign.store.finding_counts(tuple(item.id for item in campaigns))
+        return jsonify({"items": [{**item.to_dict(), "finding_count": counts.get(item.id, 0)}
+                                  for item in campaigns]})
+
+    @app.post("/v1/campaigns")
+    def campaign_start():
+        payload = _body(frozenset({"target", "mode", "preset", "limits"}))
+        package_id = payload.get("target")
+        if not isinstance(package_id, str):
+            raise ValueError("Campaign target is required")
+        package = service.package(package_id)
+        mode = PlannerMode(payload.get("mode", PlannerMode.ANALYZE_ONLY.value))
+        preset = CampaignPreset(payload.get("preset", CampaignPreset.SMALL.value))
+        if preset is CampaignPreset.CUSTOM:
+            raw = payload.get("limits")
+            if (not isinstance(raw, dict) or
+                    set(raw) != set(CampaignLimits.__dataclass_fields__)):
+                raise ValueError("Custom campaign limits require every field")
+            limits = CampaignLimits(**raw)
+        else:
+            if "limits" in payload:
+                raise ValueError("Preset limits cannot be overridden")
+            limits = CampaignLimits.preset(preset)
+        campaign = service.campaign.start(package, mode=mode, limits=limits,
+                                          requested_by="dashboard")
+        try:
+            service.launch_campaign(package.id, campaign.id)
+        except ResourceError as exc:
+            campaign = service.campaign.store.transition(
+                campaign.target_id, campaign.id, CampaignStatus.PAUSED,
+                exc.reason_code)
+        return jsonify(campaign.to_dict()), 201
+
+    def campaign_package(campaign_id: str) -> TargetPackage:
+        campaign = service.campaign.store.find(campaign_id)
+        if campaign is None:
+            raise LookupError("Campaign not found")
+        package = service.package(campaign.package_id)
+        if package.target.id != campaign.target_id:
+            raise LookupError("Campaign target mismatch")
+        return package
+
+    @app.get("/v1/campaigns/<campaign_id>")
+    def campaign_detail(campaign_id: str):
+        package = campaign_package(campaign_id)
+        return jsonify(service.campaign.detail(package, campaign_id))
+
+    @app.post("/v1/campaigns/<campaign_id>/pause")
+    def campaign_pause(campaign_id: str):
+        _body(frozenset())
+        package = campaign_package(campaign_id)
+        with service._campaign_lock:
+            result = service.campaign.pause(package, campaign_id)
+        return jsonify(result.to_dict())
+
+    @app.post("/v1/campaigns/<campaign_id>/resume")
+    def campaign_resume(campaign_id: str):
+        _body(frozenset())
+        package = campaign_package(campaign_id)
+        with service._campaign_lock:
+            result = service.campaign.resume(package, campaign_id)
+        if result.status in {CampaignStatus.RUNNING, CampaignStatus.ASSESSING_READINESS}:
+            service.launch_campaign(package.id, campaign_id)
+        return jsonify(result.to_dict())
+
+    @app.post("/v1/campaigns/<campaign_id>/cancel")
+    def campaign_cancel(campaign_id: str):
+        _body(frozenset())
+        package = campaign_package(campaign_id)
+        with service._campaign_lock:
+            result = service.campaign.cancel(package, campaign_id)
+        return jsonify(result.to_dict())
 
     @app.get("/v1/planner/<package_id>/runs")
     def planner_runs(package_id: str):

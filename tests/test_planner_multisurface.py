@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import replace
 import sqlite3
+from threading import Event, Lock
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,9 @@ from hackbot.api_specialist import APISpecialist
 from hackbot.authorization_store import AuthorizationMode, Boundary
 from hackbot.behaviour import BehaviourStore
 from hackbot.bootstrap_store import BootstrapStore
+from hackbot.campaign import CampaignCoordinator
+from hackbot.campaign_models import CampaignLimits, CampaignStatus, CampaignWorkKind
+from hackbot.campaign_store import CampaignStore
 from hackbot.domain import TrafficSource
 from hackbot.domxss_static import DOMStaticAnalyzer
 from hackbot.domxss_store import DOMXSSStore
@@ -22,6 +26,7 @@ from hackbot.exposure import ExposureSpecialist
 from hackbot.exposure_models import ExposureCategory, ExposureStatus
 from hackbot.exposure_store import ExposureStore
 from hackbot.orchestrator import PlanOrchestrator
+from hackbot.notification_store import NotificationStore
 from hackbot.planner import CrossSpecialistPlanner
 from hackbot.planner_context import PlannerContextBuilder
 from hackbot.planner_models import (CandidateStatus, PlannerLimits, PlannerMode,
@@ -35,6 +40,9 @@ from hackbot.policy_store import PolicyStore
 from hackbot.postmessage_static import PostMessageStaticAnalyzer
 from hackbot.postmessage_store import PostMessageStore
 from hackbot.research import ResearchStore
+from hackbot.reports import ReportProvenance, ReportReadiness, ReportStore
+from hackbot.store import ArtifactStore
+from hackbot.service import BugHunterRuntime
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
 from hackbot.target_policy import PolicyDecision
 from hackbot.validator import DeterministicValidatorEngine
@@ -249,8 +257,21 @@ class PlannerMultisurfaceTests(unittest.TestCase):
 
         limits = PlannerLimits(requests=20, browser_actions=0, candidates=2,
                                per_specialist=2, cleanup_reserve=2, seconds=1800)
-        run = self.planner_store.create(self.package, PlannerMode.BOUNDED_AUTONOMOUS,
-                                        limits, policy_version(self.package))
+        campaign_store = CampaignStore(self.fx.store)
+        campaign = campaign_store.create(
+            self.package, PlannerMode.BOUNDED_AUTONOMOUS,
+            CampaignLimits(max_cycles=1, seconds=1800, requests=30,
+                           browser_actions=0, research_requests=0),
+            policy_version(self.package), "fixture")
+        campaign = campaign_store.transition(
+            self.target, campaign.id, CampaignStatus.RUNNING, "FIXTURE_READY",
+            package=self.package, policy_hash=policy_version(self.package))
+        campaign_store.begin_cycle(self.package, campaign.id, policy_version(self.package))
+        campaign_work = campaign_store.reserve_work(
+            self.target, campaign.id, CampaignWorkKind.PLANNER, requests=20)
+        run = self.planner_store.create(
+            self.package, PlannerMode.BOUNDED_AUTONOMOUS, limits,
+            policy_version(self.package), campaign_work_id=campaign_work.id)
         self.planner_store.transition(self.target, run.id, PlannerStatus.LOADING_CONTEXT,
                                       "CONTEXT_STARTED")
         self.planner_store.transition(self.target, run.id, PlannerStatus.RANKING,
@@ -287,7 +308,20 @@ class PlannerMultisurfaceTests(unittest.TestCase):
                 raise
 
         with patch.object(runner, "_start_child", side_effect=traced_start):
-            final = runner.run_to_pause(self.package, run.id, max_steps=50)
+            campaign_runtime = SimpleNamespace(
+                store=self.fx.store, planner_store=self.planner_store,
+                planner_runner=runner, _planner_lock=Lock(),
+                _planner_threads={}, _bootstrap_threads={},
+                _behaviour_threads={}, _research_threads={},
+                resources=SimpleNamespace(admit=lambda *_args, **_kwargs: None),
+                record_planner_notification=lambda *_args: None)
+            coordinator = CampaignCoordinator(campaign_runtime)
+            for _ in range(50):
+                campaign_state = coordinator.advance(self.package, campaign.id)
+                if campaign_state.status is not CampaignStatus.RUNNING:
+                    break
+            final = self.planner_store.get(self.target, run.id)
+        self.assertEqual(campaign_state.status, CampaignStatus.COMPLETED)
         self.assertEqual(final.status, PlannerStatus.COMPLETED,
                          (final.status, final.stop_reason, start_errors,
                           [(task.task_type.value, task.status.value, task.reason_code)
@@ -307,6 +341,41 @@ class PlannerMultisurfaceTests(unittest.TestCase):
         self.assertEqual(validation.run_id, child.id)
         self.assertEqual(validation.plan_id, plan["id"])
         self.assertEqual(plan["hypothesis_id"], candidate.hypothesis_id)
+        links = coordinator.finding_links(self.target, campaign.id)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["finding_id"], finding.id)
+        self.assertEqual(links[0]["validation_id"], validation.id)
+        self.assertEqual(links[0]["plan_run_id"], child.id)
+        self.assertEqual(links[0]["planner_run_id"], run.id)
+        self.assertEqual(campaign_store.finding_counts((campaign.id,)), {campaign.id: 1})
+        self.assertTrue(any(item["kind"] == "CONFIRMED" for item in
+                            campaign_store.suppressions(self.target, campaign.id)))
+        draft_store = ReportStore(self.fx.store, ArtifactStore(
+            self.fx.root / "artifacts" / "campaign-reports"))
+        draft = draft_store.save(
+            target_id=self.target, finding_id=finding.id,
+            validation_id=validation.id, snapshot_hash=hashlib.sha256(
+                finding.id.encode()).hexdigest(),
+            markdown="# Synthetic finding\n\nControlled fixture only.\n",
+            readiness=ReportReadiness.READY,
+            provenance=ReportProvenance.DETERMINISTIC)
+        self.assertEqual(coordinator.finding_links(self.target, campaign.id)[0]["report_id"],
+                         draft.id)
+        outbox = NotificationStore(self.fx.store)
+        notification_runtime = SimpleNamespace(
+            planner_store=self.planner_store, validations=self.validations,
+            notification_store=outbox, _notification_wakeup=Event(),
+            logger=SimpleNamespace(error=lambda *_args: None))
+        for _ in range(2):
+            BugHunterRuntime.record_planner_notification(
+                notification_runtime, self.target, run.id,
+                {"run": final.to_dict(), "task": None})
+        with self.fx.store._connection() as db:
+            count = db.execute(
+                "SELECT count(*) FROM notification_events WHERE target_id=? "
+                "AND event_type='PLANNER_COMPLETED_WITH_FINDINGS' AND source_id=?",
+                (self.target, run.id)).fetchone()[0]
+        self.assertEqual(count, 1)
         self.assertTrue(finding.evidence_ids)
         self.assertTrue(any(task.task_type is PlannerTaskType.VALIDATE_RUN
                             and task.result_ref == validation.id for task in

@@ -402,7 +402,8 @@ class TargetBootstrapper:
 
     def create(self, package_id: str, *, limits: BootstrapLimits = BootstrapLimits(),
                identity_policy: BootstrapIdentityPolicy = BootstrapIdentityPolicy.ANONYMOUS_PLUS_PRIMARY,
-               identity_id: str | None = None) -> BootstrapResult:
+               identity_id: str | None = None,
+               campaign_work_id: str | None = None) -> BootstrapResult:
         package = self.targets.get_target_package(package_id)
         if package is None:
             raise LookupError("Target Package not found")
@@ -418,7 +419,8 @@ class TargetBootstrapper:
         return self.ledger.create(package.target.id, package.id,
                                   BootstrapMode.RECON_BACKED if recon_target else BootstrapMode.COLD_START,
                                   identity_policy, limits, identity_id=identity_id,
-                                  recon_domain_id=recon_target.domain_id if recon_target else None)
+                                  recon_domain_id=recon_target.domain_id if recon_target else None,
+                                  campaign_work_id=campaign_work_id)
 
     def capture_browser_signals(self, package: TargetPackage,
                                 run: BootstrapResult) -> tuple[DiscoverySignal, ...]:

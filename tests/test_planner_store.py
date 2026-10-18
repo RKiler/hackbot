@@ -359,7 +359,7 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.assessment.potential_impact, "UNSPECIFIED")
         with sqlite3.connect(self.runtime.store.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
 
     def test_candidate_assessment_is_immutable(self):
         run, (candidate,) = self.portfolio()

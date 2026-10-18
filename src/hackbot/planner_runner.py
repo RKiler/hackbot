@@ -374,6 +374,11 @@ class PlannerRunner:
                                                       requests=4):
                     self._block(run, task, candidate, "BUDGET_TOO_LOW")
                     return
+                from .campaign_store import CampaignStore
+                if not CampaignStore(self.store.store).claim_planner_task(
+                        run.target_id, run.id, task.id, "SETUP"):
+                    self._block(run, task, candidate, "CAMPAIGN_SETUP_LIMIT")
+                    return
                 prior_item, approval_state = self._setup_approval_item(task, run)
                 if prior_item is not None:
                     if prior_item.state not in {ObjectState.PLANNED, ObjectState.CREATED,
@@ -420,6 +425,11 @@ class PlannerRunner:
                 return
             if not self.store.reserve_task_budget(run.target_id, run.id, task.id, requests=4):
                 self._block(run, task, candidate, "BUDGET_TOO_LOW")
+                return
+            from .campaign_store import CampaignStore
+            if not CampaignStore(self.store.store).claim_planner_task(
+                    run.target_id, run.id, task.id, "SETUP"):
+                self._block(run, task, candidate, "CAMPAIGN_SETUP_LIMIT")
                 return
             result = self._continue_setup(item, run.target_id, session)
             if result.outcome == "READY" and result.item and result.item.state is ObjectState.READY:
@@ -539,6 +549,11 @@ class PlannerRunner:
             self._wait(run, task, "STALE_SOURCE")
             return
         if kind is PlannerTaskType.REQUEST_RESEARCH:
+            from .campaign_store import CampaignStore
+            if not CampaignStore(self.store.store).claim_planner_task(
+                    run.target_id, run.id, task.id, "RESEARCH"):
+                self._block(run, task, candidate, "CAMPAIGN_RESEARCH_LIMIT")
+                return
             gap = self._research_gap(candidate)
             submission = self.research.submit(gap, budget=ResearchBudget(max_tokens=500),
                                               external=False, private_target=True)
@@ -816,6 +831,9 @@ class PlannerRunner:
         run = self.store.get(package.target.id, run_id)
         if run is None:
             raise LookupError("Planner run not found")
+        from .campaign_store import CampaignStore
+        if not CampaignStore(self.store.store).planner_may_advance(run.target_id, run.id):
+            return {"run": run.to_dict(), "task": None, "reason": "CAMPAIGN_NOT_RUNNING"}
         try:
             self._current(package, run)
         except ValueError:

@@ -20,6 +20,7 @@ class ResourceError(RuntimeError):
 
 
 class WorkKind(str, Enum):
+    CAMPAIGN = "CAMPAIGN"
     PLANNER = "PLANNER"
     PLAN = "PLAN"
     BROWSER = "BROWSER"
@@ -227,6 +228,7 @@ class ResourceBudgetManager:
         if not isinstance(kind, WorkKind) or type(active) is not int or active < 0:
             raise ValueError("Invalid work admission request")
         caps = {
+            WorkKind.CAMPAIGN: self.settings.max_campaigns,
             WorkKind.PLANNER: self.settings.max_planner_runs,
             WorkKind.PLAN: self.settings.max_plan_runs,
             WorkKind.BROWSER: self.settings.max_browser_sessions,

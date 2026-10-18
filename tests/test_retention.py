@@ -971,7 +971,7 @@ class ArtifactCollectionTests(unittest.TestCase):
             db.execute("PRAGMA user_version=43")
         self.store.initialize(allow_existing_migration=True)
         with self.store._connection() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
             self.assertEqual(db.execute(
                 "SELECT ref_count FROM evidence_json_reference_counts WHERE ref_id=?",
                 (evidence.evidence_id,),

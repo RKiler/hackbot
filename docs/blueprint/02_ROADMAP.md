@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-This is the authoritative Phase 24-33 sequence reconciled after the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 are complete; Phases 24-29 were delivered afterward. Phase 30 is in progress, and Phases 31-33 remain. Completion status may advance, but these phase numbers and assignments do not change. Future sessions must use this sequence rather than older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
+This is the authoritative Phase 24-33 sequence reconciled after the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-31 are complete; Phases 32-33 remain. Completion status may advance, but these phase numbers and assignments do not change. Future sessions must use this sequence rather than older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
 ## Complete at reconciliation (0-23)
 
@@ -35,7 +35,7 @@ Completion of a phase does not imply complete coverage of its bug class. In part
 
 ## Reconciled sequence (24-33)
 
-Phases 24-29 have been delivered. Finish Phase 30 before starting Phases 31-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
+Phases 24-31 have been delivered. Phase 32 is next; Phase 33 follows it. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
 
 | Phase | Authoritative focus | Status |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ Phases 24-29 have been delivered. Finish Phase 30 before starting Phases 31-33 i
 | 28 | Cross-specialist planner | Complete |
 | 29 | Notifications/reports | Complete |
 | 30 | Production hardening | Complete |
-| 31 | Campaign coordination | Planned |
+| 31 | Campaign coordination | Complete |
 | 32 | Continuous delta hunting | Planned |
 | 33 | Evaluation/benchmarking | Planned |
 
@@ -74,11 +74,11 @@ Select minimal evidence context, rank hypotheses, route specialists and skills, 
 
 Add deduplicated notifications for confirmed findings and explicitly labeled high-value manual-review leads. Generate reports from validated evidence and preserve the distinction between leads and confirmed findings.
 
-### Phase 30 - Production hardening (in progress)
+### Phase 30 - Production hardening (complete)
 
 Define retention and backup/recovery, observability, resource controls, operational safeguards, and failure handling before long-running autonomous campaigns.
 
-### Phase 31 - Campaign coordination
+### Phase 31 - Campaign coordination (complete)
 
 Coordinate bounded, resumable multi-hypothesis campaigns across specialists with explicit limits, state, pause/resume, and evidence-aware deduplication. Do not treat a campaign as authority to bypass per-action policy.
 

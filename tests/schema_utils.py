@@ -3,8 +3,18 @@
 import sqlite3
 
 
+def drop_phase31_schema(connection: sqlite3.Connection) -> None:
+    """Remove campaign tables before constructing a historical schema."""
+    for table in (
+        "campaign_objects", "campaign_suppressions", "campaign_events",
+        "campaign_task_claims", "campaign_work", "campaign_cycles", "campaigns",
+    ):
+        connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def drop_dom_retirement_guards(connection: sqlite3.Connection) -> None:
     """Reconstruct schema 45 before a DOM guard upgrade fixture."""
+    drop_phase31_schema(connection)
     for (name,) in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='trigger' "
         "AND name LIKE 'retired_dom_link_%'"

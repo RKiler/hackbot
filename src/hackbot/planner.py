@@ -552,10 +552,13 @@ class CrossSpecialistPlanner:
         return tuple(duplicates.get(item.id) or chosen[item.id] for item in ranked)
 
     def start(self, package: TargetPackage, *, mode: PlannerMode = PlannerMode.ANALYZE_ONLY,
-              limits: PlannerLimits = PlannerLimits()) -> PlannerRun:
+              limits: PlannerLimits = PlannerLimits(),
+              campaign_work_id: str | None = None,
+              suppressed_roots: frozenset[tuple[str, str]] = frozenset()) -> PlannerRun:
         if not isinstance(package, TargetPackage):
             raise ValueError("Authoritative Target Package is required")
-        run = self.store.create(package, mode, limits, policy_version(package))
+        run = self.store.create(package, mode, limits, policy_version(package),
+                                campaign_work_id=campaign_work_id)
         self.store.transition(run.target_id, run.id, PlannerStatus.LOADING_CONTEXT,
                               "CONTEXT_STARTED", expected=(PlannerStatus.CREATED,))
         context = self.context.build(package, limits)
@@ -564,6 +567,11 @@ class CrossSpecialistPlanner:
         run = self.store.get(run.target_id, run.id)
         assert run is not None
         ranked = self._rank(run, context, self._signals(package, limits.portfolio))[:limits.portfolio]
+        if suppressed_roots:
+            ranked = tuple(replace(item, status=CandidateStatus.SKIPPED,
+                                   reason_codes=(*item.reason_codes[:11], "CAMPAIGN_SUPPRESSED"))
+                           if (item.root_cause_key, item.state_hash) in suppressed_roots
+                           else item for item in ranked)
         run = self.store.save_portfolio(run, ranked, context.readiness,
                                         context.snapshot_hash, context)
         if mode is PlannerMode.ANALYZE_ONLY:

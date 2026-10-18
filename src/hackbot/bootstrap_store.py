@@ -161,7 +161,8 @@ class BootstrapStore:
     def create(self, target_id: str, package_id: str, mode: BootstrapMode,
                identity_policy: BootstrapIdentityPolicy, limits: BootstrapLimits,
                *, identity_id: str | None = None, session_id: str | None = None,
-               recon_domain_id: int | None = None) -> BootstrapResult:
+               recon_domain_id: int | None = None,
+               campaign_work_id: str | None = None) -> BootstrapResult:
         run_id = "BOOT-" + uuid.uuid4().hex
         counts = {key: 0 for key in _COUNT_KEYS}
         try:
@@ -173,6 +174,12 @@ class BootstrapStore:
                     (run_id, target_id, package_id, mode.value, BootstrapStatus.CREATED.value,
                      identity_policy.value, identity_id, session_id, json.dumps(limits.to_dict()),
                      json.dumps(counts), "[]", recon_domain_id, datetime.now(timezone.utc).isoformat()))
+                if campaign_work_id is not None:
+                    from .campaign_models import CampaignWorkKind
+                    from .campaign_store import link_created_child
+                    link_created_child(connection, campaign_work_id,
+                                       kind=CampaignWorkKind.BOOTSTRAP,
+                                       target_id=target_id, child_id=run_id)
         except sqlite3.IntegrityError as exc:
             with self.evidence._connection() as connection:
                 active = connection.execute("SELECT 1 FROM bootstrap_runs WHERE target_id=? "

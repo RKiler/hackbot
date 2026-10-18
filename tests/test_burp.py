@@ -387,7 +387,7 @@ class BurpTests(unittest.TestCase):
             exchange.response.body_evidence_id, allow_sensitive=True), b'{"ok":true}')
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM burp_capture_index").fetchone()[0], 1)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
+        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 47)
 
     def test_retired_burp_capture_rejects_late_retry_without_rehydrating_payload(self) -> None:
         self.traffic.retention_policy = TrafficRetentionPolicy(1, 1, 1)

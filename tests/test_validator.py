@@ -311,7 +311,7 @@ class ValidatorTests(unittest.TestCase):
         self.fx.store.initialize(allow_existing_migration=True)
         self.assertTrue(self.fx.store.get_evidence(held_id).retention.pinned)
         with self.fx.store._connection() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 47)
 
     def test_planner_child_confirmation_retains_full_policy_audit_chain(self):
         child_id = self.auth_run()

@@ -71,7 +71,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 46
+_SCHEMA_VERSION = 47
 
 
 def _now() -> datetime:
@@ -266,6 +266,7 @@ class EvidenceFactStore:
                 (44, "044_evidence_json_reference_index.sql"),
                 (45, "045_research_brief_retirement.sql"),
                 (46, "046_dom_retirement_guards.sql"),
+                (47, "047_campaign_coordination.sql"),
             ):
                 if version >= target_version:
                     continue
@@ -288,6 +289,10 @@ class EvidenceFactStore:
                 if target_version == 46:
                     from .dom_guard_schema import dom_guard_sql
                     migration += "\n" + dom_guard_sql(connection)
+                if target_version == 47:
+                    from .dom_guard_schema import dom_guard_extension_sql
+                    migration += "\n" + dom_guard_extension_sql(
+                        migration, table_prefix="campaign_")
                 try:
                     connection.executescript(
                         "BEGIN IMMEDIATE;\n" + migration
@@ -353,6 +358,9 @@ class EvidenceFactStore:
                              "planner_candidate_research_refs",
                              "planner_event_research_refs"})
             expected.add("dom_retirement_guard_sources")
+            expected.update({"campaigns", "campaign_cycles", "campaign_work",
+                             "campaign_task_claims", "campaign_events",
+                             "campaign_suppressions", "campaign_objects"})
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),

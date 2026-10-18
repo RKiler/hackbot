@@ -101,7 +101,8 @@ class PlannerStore:
                    (run_id, candidate_id, task_id, event, reason, _json(refs), _now()))
 
     def create(self, package: TargetPackage, mode: PlannerMode,
-               limits: PlannerLimits, policy_hash: str) -> PlannerRun:
+               limits: PlannerLimits, policy_hash: str,
+               *, campaign_work_id: str | None = None) -> PlannerRun:
         if package.status.value != "TRACKED" or not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}:[0-9a-f]{64}", policy_hash):
             raise ValueError("Target Package is not ready for planning")
         run_id, at = "PLRUN-" + uuid.uuid4().hex, _now()
@@ -117,6 +118,11 @@ class PlannerStore:
                        (run_id, package.target.id, package.id, package.version, policy_hash,
                         mode.value, PlannerStatus.CREATED.value, _json(limits.to_dict()),
                         _json(PlannerUsage().to_dict()), "{}", PLANNER_VERSION, at, at))
+            if campaign_work_id is not None:
+                from .campaign_models import CampaignWorkKind
+                from .campaign_store import link_created_child
+                link_created_child(db, campaign_work_id, kind=CampaignWorkKind.PLANNER,
+                                   target_id=package.target.id, child_id=run_id)
             self._event(db, run_id, "PLANNER_STARTED", "EXPLICIT_OPERATOR_RUN")
         result = self.get(package.target.id, run_id)
         assert result is not None
