@@ -1,0 +1,1 @@
+-- Exact-source DOM late-link guards are generated from the installed schema.

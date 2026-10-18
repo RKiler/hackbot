@@ -12,6 +12,8 @@ Environment=HACKBOT_BROWSER_DISPLAY_NUMBER=901
 Environment=HACKBOT_BROWSER_VNC_PORT=6901
 Environment=HACKBOT_BROWSER_VNC_RUNTIME_DIR=/root/codex_artifacts/bughunter-agent/browser-vnc
 UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=300
 ExecStart=/root/bughunter-agent/scripts/start_browser_vnc.sh
 Restart=on-failure
 RestartSec=10

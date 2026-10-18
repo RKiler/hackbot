@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-This is the authoritative Phase 24-33 sequence from the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 are complete. Phases 24-29 were delivered afterward; Phases 30-33 remain. Completion status may advance, but the phase numbers below do not change. Future sessions must use this numbering rather than conflicting older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
+This is the authoritative Phase 24-33 sequence reconciled after the Phase 23 roadmap review (decisions D-136 and D-137). Phases 0-23 are complete; Phases 24-29 were delivered afterward. Phase 30 is in progress, and Phases 31-33 remain. Completion status may advance, but these phase numbers and assignments do not change. Future sessions must use this sequence rather than older blueprint labels or phase-specific next-step recommendations. Use the phase implementation docs and `docs/DECISIONS.md` for delivered behavior. Do not infer active-testing authorization from recon membership or from a roadmap phase.
 
 ## Complete at reconciliation (0-23)
 
@@ -35,7 +35,20 @@ Completion of a phase does not imply complete coverage of its bug class. In part
 
 ## Reconciled sequence (24-33)
 
-Phases 24-29 have been delivered. Implement Phases 30-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
+Phases 24-29 have been delivered. Finish Phase 30 before starting Phases 31-33 in the order below. Each phase reuses the existing Target Package authority, Phase 13/14 execution gates, Phase 16 run records, and Phase 17 independent confirmation rather than creating a parallel path.
+
+| Phase | Authoritative focus | Status |
+| --- | --- | --- |
+| 24 | Cold-start bootstrap | Complete |
+| 25 | Target/normal-behaviour learning | Complete |
+| 26 | GraphQL/API specialist expansion | Complete |
+| 27 | ResearchCoordinator | Complete |
+| 28 | Cross-specialist planner | Complete |
+| 29 | Notifications/reports | Complete |
+| 30 | Production hardening | Complete |
+| 31 | Campaign coordination | Planned |
+| 32 | Continuous delta hunting | Planned |
+| 33 | Evaluation/benchmarking | Planned |
 
 ### Phase 24 - Cold-start bootstrap (complete)
 
@@ -61,7 +74,7 @@ Select minimal evidence context, rank hypotheses, route specialists and skills, 
 
 Add deduplicated notifications for confirmed findings and explicitly labeled high-value manual-review leads. Generate reports from validated evidence and preserve the distinction between leads and confirmed findings.
 
-### Phase 30 - Production hardening
+### Phase 30 - Production hardening (in progress)
 
 Define retention and backup/recovery, observability, resource controls, operational safeguards, and failure handling before long-running autonomous campaigns.
 
@@ -79,7 +92,7 @@ Evaluate against local or recorded cases and measure precision, false positives,
 
 ## Superseded blueprint labels
 
-The original roadmap's labels and any phase-specific next-step recommendations that conflict with the sequence above are historical, not instructions to start work under those numbers. In particular:
+The original roadmap's labels and any phase-specific next-step recommendations that conflict with the sequence above are historical. When an older blueprint, prompt, or phase document assigns a different number, use this Phase 24-33 map and decisions D-136/D-137. Do not renumber completed phases or advance based on a superseded label.
 
 | Older label or recommendation | Authoritative disposition |
 | --- | --- |
@@ -88,7 +101,7 @@ The original roadmap's labels and any phase-specific next-step recommendations t
 | Phase 16 ResearchCoordinator | Phase 16 delivered the single-plan Investigation Orchestrator; ResearchCoordinator is Phase 27. |
 | Phase 17 static-analysis layer | Phase 17 delivered the Validator Engine; static analysis is embedded in relevant specialists, not a pending Phase 17. |
 | Phase 20 GraphQL authorization capability | Phase 20 delivered typed authorization mutations; broader GraphQL/API work is Phase 26. |
-| Phase 23 recommendation to make the planner Phase 24 | Phase 24 is cold-start bootstrap; the cross-specialist planner is Phase 28. |
+| `docs/PHASE23_EXPOSURE_SPECIALIST.md` recommendation to make the planner Phase 24 | Historical next-step note only. Phase 24 is cold-start bootstrap; the cross-specialist planner is Phase 28. |
 | Phase 24 planner / orchestrator | Phase 28 cross-specialist planner; Phase 16 single-plan orchestration is already complete. |
 | Phase 25 notifications and reporting | Phase 29 notifications/reports. |
 | Phase 26 delta hunter / campaign mode | Split into Phase 31 campaign coordination and Phase 32 continuous delta hunting. |

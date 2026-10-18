@@ -11,6 +11,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import re
+import sqlite3
 import socketserver
 import threading
 from typing import Any
@@ -180,11 +181,28 @@ class BurpCaptureProvider:
                 (self.package.target.id, provider_hash)).fetchone()
         return self.traffic.get_exchange(row["exchange_id"]) if row else None
 
+    def _capture_is_retired(self, capture_id: str) -> bool:
+        provider_hash = hashlib.sha256(capture_id.encode()).hexdigest()
+        with self.traffic.evidence._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM traffic_exchanges e "
+                "JOIN traffic_payload_retirements r ON r.exchange_id=e.exchange_id "
+                "WHERE e.target_id=? AND e.source='BURP' "
+                "AND e.provider_reference_hash=? LIMIT 1",
+                (self.package.target.id, provider_hash),
+            ).fetchone() is not None
+
     def ingest_bytes(self, payload: bytes) -> IngestResult:
         observation = BurpObservation.parse(payload, self.proxy.settings.max_event_bytes)
         return self.ingest(observation)
 
     def ingest(self, observation: BurpObservation) -> IngestResult:
+        try:
+            return self._ingest(observation)
+        except sqlite3.Error:
+            raise BurpError("Bridge persistence unavailable") from None
+
+    def _ingest(self, observation: BurpObservation) -> IngestResult:
         if not isinstance(observation, BurpObservation):
             raise BurpError("Invalid bridge observation")
         binding = self.proxy.resolve_listener(self.package.target.id, observation.listener)
@@ -208,6 +226,8 @@ class BurpCaptureProvider:
         target_id = self.package.target.id
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
+            if self._capture_is_retired(observation.capture_id):
+                raise BurpError("Retired bridge capture cannot be replayed")
             with self.traffic.evidence._connection() as connection:
                 connection.execute("""INSERT OR IGNORE INTO burp_capture_index
                     (target_id,capture_id,request_digest,listener_key,created_at,updated_at)
@@ -223,6 +243,8 @@ class BurpCaptureProvider:
             exchange = self.traffic.get_exchange(row["exchange_id"]) if row["exchange_id"] else None
             if exchange is None:
                 exchange = self._existing_exchange(observation.capture_id)
+            if exchange is not None and self._capture_is_retired(observation.capture_id):
+                raise BurpError("Retired bridge capture cannot be replayed")
             duplicate = exchange is not None
             if exchange is None:
                 try:
@@ -299,12 +321,15 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
     def _reply(self, status: int, data: dict[str, object]) -> None:
         payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def do_GET(self) -> None:
         if not self._authorized():
@@ -351,7 +376,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             else:
                 result = self.server.provider.ingest_bytes(payload)
                 self._reply(200 if result.duplicate else 201, result.to_dict())
-        except (BurpError, TrafficError, ValueError, TypeError, UnicodeError,
+        except (BurpError, TrafficError, ValueError, TypeError, UnicodeError, sqlite3.Error,
                 json.JSONDecodeError, OSError):
             self._reply(400, {"error": "invalid_event"})
 

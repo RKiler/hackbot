@@ -7,6 +7,7 @@ import json
 import sqlite3
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from hackbot.auth import AuthContextManager
 from hackbot.browser import IdentityObservation, IdentityVerificationRule
 from hackbot.config import SecretBindingConfig, SecretSettings
 from hackbot.domain import ObservationState, Principal, Role, Tenant
-from hackbot.evidence import EvidenceProvenance, Sensitivity
+from hackbot.evidence import EvidenceProvenance, Retention, Sensitivity
 from hackbot.finding_workflow import FindingWorkflow
 from hackbot.hypotheses import HypothesisStore
 from hackbot.planner import CrossSpecialistPlanner, _Signal, _candidate_state
@@ -25,6 +26,7 @@ from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLi
 from hackbot.planner_runner import PlannerRunner
 from hackbot.planner_store import PlannerStore
 from hackbot.notification_store import NotificationStore
+from hackbot.permit_store import PolicyPermitStore
 from hackbot.policy import policy_version
 from hackbot.identity import IdentityStatus, MembershipStatus
 from hackbot.response_compare import ResponseComparator
@@ -35,10 +37,18 @@ from hackbot.validation_store import ValidationStatus, ValidationStore
 from hackbot.validator import DeterministicValidatorEngine
 from hackbot.service import create_app
 from tests import test_orchestrator as orchestrator_fixture
+from tests.schema_utils import drop_phase30_schema
 
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+class _ComposedFixturePermitStore(PolicyPermitStore):
+    def issue(self, action, decision, request_fingerprint, *,
+              now: datetime | None = None, ttl_seconds: int = 120):
+        return super().issue(action, decision, request_fingerprint,
+                             now=now, ttl_seconds=ttl_seconds)
 
 
 class ValidatorTests(unittest.TestCase):
@@ -48,6 +58,15 @@ class ValidatorTests(unittest.TestCase):
         self.work.setUp()
         self.addCleanup(self.work.doCleanups)
         self.fx = self.work.fixture
+        self.fx.permits = _ComposedFixturePermitStore(self.fx.store)
+        self.fx.executor.permits = self.fx.permits
+        # Composed local requests need headroom under shared VPS contention.
+        self.fx.executor.settings = replace(
+            self.fx.executor.settings,
+            connect_timeout_seconds=15.0,
+            read_timeout_seconds=15.0,
+            overall_timeout_seconds=120.0,
+        )
         self.target = self.fx.package.target.id
         hypothesis = HypothesisStore(self.fx.store).add_manual(
             self.target, "AUTHORIZATION", "Controlled fixture authorization boundary",
@@ -144,7 +163,15 @@ class ValidatorTests(unittest.TestCase):
             if result["run"]["status"] == "COMPLETED":
                 return run_id
             if result["run"]["status"] in {"BLOCKED", "REJECTED", "FAILED", "BUDGET_EXHAUSTED"}:
-                self.fail(f"fixture run failed: {result['run']['status']}")
+                reason = result["timeline"][-1]["reason_code"] if result["timeline"] else "UNKNOWN"
+                step = result["steps"][len(result["steps"]) - 1]
+                for item in reversed(result["steps"]):
+                    if item["status"] == "FAILED":
+                        step = item
+                        break
+                error_class = step["result"]["error_class"] if step["result"] else None
+                self.fail(f"fixture run failed: {result['run']['status']} ({reason}; "
+                          f"{step['safe_reason']}; {error_class})")
         self.fail("fixture run did not complete")
 
     def auth_run(self, *, skill="cross-tenant-object-authorization", boundary_alias="tenant_b_admin",
@@ -193,6 +220,23 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(same.id, finding.id)
         self.assertEqual(len(self.fx.server.received), sent_before)
         self.assertTrue(finding.evidence_ids)
+        for evidence_id in finding.evidence_ids:
+            policy = self.fx.store.get_evidence(evidence_id).retention
+            self.assertTrue(policy.retain)
+            self.assertTrue(policy.pinned)
+            self.assertTrue(policy.finding_related)
+            self.assertIsNone(policy.expires_at)
+            with self.assertRaises(ValueError):
+                self.fx.store.set_retention(
+                    evidence_id, Retention(retain=False), actor="FIXTURE",
+                    reason="must_not_release_confirmed_evidence")
+            with self.fx.store._connection() as db:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute(
+                        "INSERT INTO evidence_policy_events "
+                        "(evidence_id,retain,expires_at,pinned,finding_related,changed_at,actor,reason) "
+                        "VALUES (?,0,NULL,0,0,datetime('now'),'FIXTURE','direct_release')",
+                        (evidence_id,))
         with self.fx.store._connection() as db:
             chain = db.execute(
                 "SELECT f.finding_id,v.validation_id,r.run_id,p.plan_id,h.hypothesis_id,"
@@ -214,6 +258,8 @@ class ValidatorTests(unittest.TestCase):
         duplicate, original = self.validator.validate_run(second_run, self.target)
         self.assertEqual(duplicate.status, ValidationStatus.DUPLICATE_CANDIDATE)
         self.assertEqual(original.id, finding.id)
+        for evidence_id in duplicate.supporting_evidence_ids:
+            self.assertTrue(self.fx.store.get_evidence(evidence_id).retention.pinned)
         self.assertEqual(self.results.stats(self.target)["findings"], 1)
         ledger = PlannerStore(self.fx.store)
         run = ledger.create(self.fx.package, PlannerMode.BOUNDED_AUTONOMOUS,
@@ -249,6 +295,23 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(ledger.get(self.target, run.id).findings, 0)
         self.assertEqual(ledger.branch_memory(self.target, candidate.root_cause_key,
                                               run.context_hash)[0]["outcome"], "DUPLICATE")
+
+        held_id = finding.evidence_ids[0]
+        with self.fx.store._connection() as db:
+            drop_phase30_schema(db)
+            db.execute(
+                "INSERT INTO evidence_policy_events "
+                "(evidence_id,retain,expires_at,pinned,finding_related,changed_at,actor,reason) "
+                "VALUES (?,0,NULL,0,0,datetime('now'),'FIXTURE','legacy_unpinned')",
+                (held_id,))
+            db.execute("PRAGMA user_version=37")
+            self.assertEqual(db.execute(
+                "SELECT pinned FROM evidence_policy_events WHERE evidence_id=? "
+                "ORDER BY event_id DESC LIMIT 1", (held_id,)).fetchone()[0], 0)
+        self.fx.store.initialize(allow_existing_migration=True)
+        self.assertTrue(self.fx.store.get_evidence(held_id).retention.pinned)
+        with self.fx.store._connection() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 46)
 
     def test_planner_child_confirmation_retains_full_policy_audit_chain(self):
         child_id = self.auth_run()

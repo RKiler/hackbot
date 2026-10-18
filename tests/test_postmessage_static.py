@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import sqlite3
+from subprocess import TimeoutExpired
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from hackbot.artifacts import ArtifactStore
 from hackbot.config import StoreSettings
@@ -207,6 +208,14 @@ class PostMessageStaticTests(unittest.TestCase):
         self.assertEqual(self.analyze(b"const value = 1;").status, "NO_MESSAGE_SIGNAL")
         self.assertEqual(self.analyze(b"postMessage" + b"x" * 1_048_576).status,
                          "ANALYSIS_LIMIT_REACHED")
+
+    def test_parser_timeout_is_visible_and_never_promotes_a_candidate(self) -> None:
+        with patch("hackbot.postmessage_static.subprocess.run",
+                   side_effect=TimeoutExpired(cmd="node", timeout=20)):
+            result = self.analyze(TWO_STAGE)
+        self.assertEqual(result.status, "PARSE_FAILED")
+        self.assertEqual(result.reason, "PARSER_TIMEOUT")
+        self.assertEqual(result.candidates, ())
 
     def test_parent_assumption_without_source_check_is_recorded(self) -> None:
         candidate = self.analyze(PARENT_ASSUMED).candidates[0]

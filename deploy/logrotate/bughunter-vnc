@@ -1,0 +1,13 @@
+/root/codex_artifacts/bughunter-agent/browser-vnc/xvfb.log
+/root/codex_artifacts/bughunter-agent/browser-vnc/fluxbox.log
+/root/codex_artifacts/bughunter-agent/browser-vnc/x11vnc.log
+/root/codex_artifacts/bughunter-agent/browser-vnc/websockify.log {
+    weekly
+    maxsize 10M
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

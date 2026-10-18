@@ -574,10 +574,12 @@ class APISpecialist:
         return "other"
 
     def _ingest_traffic(self, package: TargetPackage, limit: int,
-                        cursor: str | None = None
+                        cursor: str | None = None,
+                        authorization_surface: AuthorizationSurface | None = None,
                         ) -> tuple[int, tuple[str, ...], str | None]:
         target = package.target.id
-        authorization_surface = self.authorization.profile(package) if self.authorization else None
+        if authorization_surface is None and self.authorization:
+            authorization_surface = self.authorization.profile(package)
         known_auth_exchanges = ({item.exchange_id for item in authorization_surface.operations}
                                 if authorization_surface else set())
         owner_by_exchange = ({item.exchange_id: item for item in authorization_surface.operations
@@ -954,12 +956,19 @@ class APISpecialist:
                     return count, ()
         return count, ()
 
-    def profile(self, package: TargetPackage, *, limits: APIAnalysisLimits = APIAnalysisLimits()) -> dict[str, object]:
+    def profile(self, package: TargetPackage, *, limits: APIAnalysisLimits = APIAnalysisLimits(),
+                _authorization_surface: AuthorizationSurface | None = None) -> dict[str, object]:
         if package.status is not PackageStatus.TRACKED:
             raise ValueError("API specialist requires a tracked package")
+        if _authorization_surface is not None and (
+                not isinstance(_authorization_surface, AuthorizationSurface) or
+                _authorization_surface.target_id != package.target.id or
+                _authorization_surface.package_id != package.id):
+            raise ValueError("Authorization snapshot does not match target package")
         progress = self.registry.progress(package.target.id, package.id)
         traffic_count, traffic_gaps, traffic_cursor = self._ingest_traffic(
-            package, limits.traffic, progress.traffic_cursor)
+            package, limits.traffic, progress.traffic_cursor,
+            authorization_surface=_authorization_surface)
         js_count, js_gaps, js_cursor = self._ingest_js(
             package, limits.js_assets, progress.js_cursor)
         self.registry.expire_missing_js_operations(package.target.id)
@@ -982,10 +991,13 @@ class APISpecialist:
                  operation_id: str | None = None) -> tuple[APICandidate, ...]:
         if mode not in {"PLAN_ONLY", "BOUNDED_AUTONOMOUS"}:
             raise ValueError("Invalid API specialist mode")
-        summary = self.profile(package, limits=limits)
+        if package.status is not PackageStatus.TRACKED:
+            raise ValueError("API specialist requires a tracked package")
+        authorization = self.authorization.profile(package) if self.authorization else None
+        summary = self.profile(package, limits=limits,
+                               _authorization_surface=authorization)
         target = package.target.id
         learned = self.behaviour.profile(target) if self.behaviour else None
-        authorization = self.authorization.profile(package) if self.authorization else None
         owner_by_exchange = ({item.exchange_id: item for item in authorization.operations
                              if item.semantic_owner_success} if authorization else {})
         object_by_id = ({item.id: item for item in authorization.objects} if authorization else {})

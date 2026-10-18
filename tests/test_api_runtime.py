@@ -1089,6 +1089,12 @@ class APIDisposableDeleteTests(unittest.TestCase):
             "test_disposable_delete_vulnerable_boundary_confirms")
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.case.fx.executor.settings = replace(
+            fixture.case.fx.executor.settings,
+            connect_timeout_seconds=3.0,
+            read_timeout_seconds=10.0,
+            overall_timeout_seconds=30.0,
+        )
         previous, source, _, runs, mutations = fixture._run_delete(secure=secure)
         self.assertEqual(previous["run"]["status"], "COMPLETED")
         case, fx = fixture.case, fixture.case.fx
@@ -1109,7 +1115,9 @@ class APIDisposableDeleteTests(unittest.TestCase):
                 cleanup_strategy=recipe.cleanup_strategy)
             item = fx.factory.create(draft.id, case.target,
                                      session_id=owner_session.id).item
-            self.assertEqual(item.state, ObjectState.READY)
+            self.assertEqual(item.state, ObjectState.READY,
+                             tuple(event["reason_code"] for event in
+                                   fx.objects.events(item.id, case.target, limit=5)))
             case.protect(item, case.tenants["tenant-a"], policy="TENANT_ONLY")
             current.append(item)
         case.specialist.orchestrator = PlanOrchestrator(

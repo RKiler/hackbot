@@ -1,0 +1,2 @@
+-- The schema-derived index, backfill, and maintenance triggers are appended by
+-- traffic_json_index_sql during this reviewed migration.

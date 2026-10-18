@@ -20,6 +20,7 @@ from hackbot.config import TargetSettings, load_config
 from hackbot.domain import TrafficSource
 from hackbot.recon import Page, Provenance, ReconEndpoint, ReconHost, ReconTarget
 from hackbot.recon_postgres import ReconQueryError
+from hackbot.resources import ResourceBudgetManager
 from hackbot.service import BugHunterRuntime, create_app
 from hackbot.target_policy import RatePolicy
 from hackbot.target_scope import HostRule
@@ -161,6 +162,15 @@ class Phase24Tests(unittest.TestCase):
         config = replace(load_config(environ={"HOME": str(root), "XDG_CONFIG_HOME": str(root),
                                               "XDG_STATE_HOME": str(root)}), targets=TargetSettings(targets))
         self.runtime = BugHunterRuntime(config, vnc_ready=lambda: False)
+        healthy_disk = SimpleNamespace(total=100 * 1024**3, used=10 * 1024**3,
+                                       free=90 * 1024**3)
+        self.runtime.resources = ResourceBudgetManager(
+            config.paths.root, self.runtime.resources.settings,
+            disk_usage=lambda _path: healthy_disk,
+            memory_available=lambda: 8 * 1024**3,
+            load_per_cpu=lambda: 0.0,
+            system_disk_path=Path("/"),
+        )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
         self.server.visits = []
         self.server.login_required = False

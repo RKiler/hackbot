@@ -1,5 +1,7 @@
 import shutil
+from subprocess import TimeoutExpired
 import unittest
+from unittest.mock import patch
 
 from hackbot.domxss_static import (
     DOMCandidateStatus, DOMStaticAnalyzer, MAX_ASSET_BYTES,
@@ -44,6 +46,7 @@ class DOMStaticAnalyzerTests(unittest.TestCase):
             }
           }
         """)
+        self.assertEqual(result.status, "ANALYZED", result.reason)
         self.assertEqual(len(result.candidates), 1)
         self.assertEqual(len(result.candidates[0].transforms), 2)
 
@@ -108,6 +111,7 @@ class DOMStaticAnalyzerTests(unittest.TestCase):
             }
           }
         """)
+        self.assertEqual(result.status, "ANALYZED", result.reason)
         self.assertEqual(len(result.candidates), 1)
         self.assertFalse(result.candidates[0].attacker_controlled)
         self.assertEqual(result.candidates[0].status, DOMCandidateStatus.TRACING)
@@ -121,6 +125,14 @@ class DOMStaticAnalyzerTests(unittest.TestCase):
     def test_malformed_js_is_not_promoted(self) -> None:
         result = self.analyze("function broken( { location.search; iframe.src = ;")
         self.assertEqual(result.status, DOMCandidateStatus.PARSE_FAILED.value)
+        self.assertEqual(result.candidates, ())
+
+    def test_parser_timeout_is_visible_and_never_promotes_a_candidate(self) -> None:
+        with patch("hackbot.domxss_static.subprocess.run",
+                   side_effect=TimeoutExpired(cmd="node", timeout=20)):
+            result = self.analyze("function f(){iframe.src=location.hash}")
+        self.assertEqual(result.status, DOMCandidateStatus.PARSE_FAILED.value)
+        self.assertEqual(result.reason, "PARSER_TIMEOUT")
         self.assertEqual(result.candidates, ())
 
 

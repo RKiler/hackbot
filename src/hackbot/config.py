@@ -57,6 +57,9 @@ class AppConfig:
     objects: ObjectSettings | None = None
     research: ResearchSettings | None = None
     notifications: NotificationSettings | None = None
+    backup: BackupSettings | None = None
+    resources: ResourceSettings | None = None
+    retention: RetentionSettings | None = None
 
 
 _SECRET_REF = r"(?:ref:)?[a-z][a-z0-9_-]{0,63}(?:/[a-z][a-z0-9_-]{0,63})?"
@@ -113,6 +116,130 @@ class NotificationSettings:
                 valid = False
             if not valid:
                 raise ConfigError("Invalid notification dashboard URL")
+
+
+@dataclass(frozen=True)
+class BackupSettings:
+    root: Path
+    artifact_mode: str = "ALL"
+    keep_generations: int = 14
+    encryption_secret_ref: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path) or not self.root.is_absolute() or ".." in self.root.parts:
+            raise ConfigError("Backup root must be absolute")
+        if self.artifact_mode not in {"ALL", "FINDING_LINKED"}:
+            raise ConfigError("Invalid backup artifact policy")
+        if type(self.keep_generations) is not int or not 1 <= self.keep_generations <= 365:
+            raise ConfigError("Invalid backup generation limit")
+        if self.encryption_secret_ref is not None and (
+                not isinstance(self.encryption_secret_ref, str) or
+                not re.fullmatch(_SECRET_REF, self.encryption_secret_ref)):
+            raise ConfigError("Invalid backup encryption secret reference")
+
+
+@dataclass(frozen=True)
+class ResourceSettings:
+    max_planner_runs: int = 1
+    max_plan_runs: int = 4
+    max_browser_sessions: int = 4
+    max_bootstrap_runs: int = 1
+    max_learning_runs: int = 1
+    max_research_requests: int = 2
+    max_artifact_bytes: int = 134_217_728
+    warning_disk_percent: int = 80
+    high_disk_percent: int = 90
+    critical_disk_percent: int = 95
+    min_free_disk_bytes: int = 2_147_483_648
+    min_free_system_disk_bytes: int = 1_073_741_824
+    min_available_memory_bytes: int = 536_870_912
+    required_mount: str | None = None
+    high_load_per_cpu: float | None = None
+    critical_load_per_cpu: float | None = None
+
+    def __post_init__(self) -> None:
+        caps = (self.max_planner_runs, self.max_plan_runs, self.max_browser_sessions,
+                self.max_bootstrap_runs, self.max_learning_runs, self.max_research_requests)
+        if any(type(value) is not int or not 1 <= value <= 64 for value in caps):
+            raise ConfigError("Invalid runtime concurrency limit")
+        if type(self.max_artifact_bytes) is not int or not 1_048_576 <= self.max_artifact_bytes <= 1_073_741_824:
+            raise ConfigError("Invalid artifact size limit")
+        if (any(type(value) is not int for value in
+                (self.warning_disk_percent, self.high_disk_percent, self.critical_disk_percent))
+                or not 1 <= self.warning_disk_percent < self.high_disk_percent
+                < self.critical_disk_percent <= 99):
+            raise ConfigError("Invalid disk thresholds")
+        if (type(self.min_free_disk_bytes) is not int or self.min_free_disk_bytes < 0
+                or type(self.min_free_system_disk_bytes) is not int
+                or self.min_free_system_disk_bytes < 0
+                or type(self.min_available_memory_bytes) is not int
+                or self.min_available_memory_bytes < 0):
+            raise ConfigError("Invalid resource reserve")
+        if self.required_mount is not None and (
+                not isinstance(self.required_mount, str) or
+                not Path(self.required_mount).is_absolute() or
+                ".." in Path(self.required_mount).parts):
+            raise ConfigError("Invalid required storage mount")
+        if (self.high_load_per_cpu is None) != (self.critical_load_per_cpu is None):
+            raise ConfigError("Both CPU load thresholds are required")
+        if self.high_load_per_cpu is not None:
+            if (type(self.high_load_per_cpu) not in (int, float) or
+                    type(self.critical_load_per_cpu) not in (int, float) or
+                    not 0.5 <= self.high_load_per_cpu < self.critical_load_per_cpu <= 100):
+                raise ConfigError("Invalid CPU load thresholds")
+
+
+@dataclass(frozen=True)
+class RetentionSettings:
+    orphan_grace_hours: int = 24
+    max_scan_entries: int = 10_000
+    max_delete_files: int = 100
+    orphan_scan_timeout_seconds: float = 30.0
+    research_brief_grace_days: int = 30
+    js_artifact_hours: int = 2160
+    source_map_hours: int = 2160
+    traffic_anonymous_hours: int = 720
+    traffic_authenticated_hours: int = 2160
+    traffic_execution_hours: int = 4320
+    traffic_target_hours: dict[str, int] = field(default_factory=dict)
+    anonymous_profile_grace_hours: int = 48
+    disabled_identity_profile_grace_hours: int = 168
+    active_identity_profile_grace_hours: int = 720
+    max_profile_scan: int = 1000
+    max_profile_delete: int = 20
+
+    def __post_init__(self) -> None:
+        if (type(self.orphan_grace_hours) is not int or
+                not 1 <= self.orphan_grace_hours <= 8760 or
+                type(self.max_scan_entries) is not int or
+                not 1 <= self.max_scan_entries <= 1_000_000 or
+                type(self.max_delete_files) is not int or
+                not 1 <= self.max_delete_files <= 10_000 or
+                type(self.orphan_scan_timeout_seconds) not in (int, float) or
+                not 0.1 <= self.orphan_scan_timeout_seconds <= 300 or
+                type(self.research_brief_grace_days) is not int or
+                not 1 <= self.research_brief_grace_days <= 3650 or
+                any(type(value) is not int or not 1 <= value <= 87_600 for value in
+                    (self.js_artifact_hours, self.source_map_hours,
+                     self.traffic_anonymous_hours, self.traffic_authenticated_hours,
+                     self.traffic_execution_hours)) or
+                not isinstance(self.traffic_target_hours, dict) or
+                len(self.traffic_target_hours) > 1000 or
+                any(not isinstance(key, str) or
+                    not re.fullmatch(r"TARGET-[0-9a-f]{32}", key) or
+                    type(value) is not int or not 1 <= value <= 87_600
+                    for key, value in self.traffic_target_hours.items()) or
+                type(self.anonymous_profile_grace_hours) is not int or
+                not 1 <= self.anonymous_profile_grace_hours <= 8760 or
+                type(self.disabled_identity_profile_grace_hours) is not int or
+                not 1 <= self.disabled_identity_profile_grace_hours <= 8760 or
+                type(self.active_identity_profile_grace_hours) is not int or
+                not 1 <= self.active_identity_profile_grace_hours <= 8760 or
+                type(self.max_profile_scan) is not int or
+                not 1 <= self.max_profile_scan <= 10_000 or
+                type(self.max_profile_delete) is not int or
+                not 1 <= self.max_profile_delete <= self.max_profile_scan):
+            raise ConfigError("Invalid retention limits")
 
 
 @dataclass(frozen=True)
@@ -294,11 +421,13 @@ class BurpSettings:
     max_event_bytes: int = 1_048_576
     max_inflight: int = 8
     third_party_capture: str = "DROP"
+    runtime_root: Path | None = None
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("Invalid Burp enabled flag")
-        for path in (self.project_root, self.installation_jar, self.ca_certificate):
+        for path in (self.project_root, self.installation_jar, self.ca_certificate,
+                     self.runtime_root):
             if path is not None and (not isinstance(path, Path) or not path.is_absolute()
                                      or ".." in path.parts):
                 raise ConfigError("Burp paths must be absolute")
@@ -396,7 +525,7 @@ def load_config(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError("Cannot read or parse configuration file") from exc
 
-    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects", "research", "notifications"}), "top-level")
+    top = _table(data, frozenset({"paths", "logging", "recon", "store", "targets", "secrets", "browser", "burp", "executor", "skills", "objects", "research", "notifications", "backup", "resources", "retention"}), "top-level")
     skills_table = _table(top.get("skills", {}), frozenset({"root"}), "skills")
     objects_table = _table(top.get("objects", {}), frozenset({"recipe_root", "name_prefix",
         "max_creation_depth", "max_objects_per_plan", "max_objects_per_target_hour",
@@ -421,6 +550,13 @@ def load_config(
         "smtp_username", "smtp_password_ref", "console_enabled", "manual_review_enabled",
         "triage_enabled", "hourly_cap", "target_daily_cap", "dashboard_base_url",
     }), "notifications")
+    backup_table = _table(top.get("backup", {}), frozenset({
+        "root", "artifact_mode", "keep_generations", "encryption_secret_ref",
+    }), "backup")
+    resources_table = _table(top.get("resources", {}), frozenset(ResourceSettings.__dataclass_fields__),
+                             "resources")
+    retention_table = _table(top.get("retention", {}), frozenset(RetentionSettings.__dataclass_fields__),
+                             "retention")
     browser_table = _table(top.get("browser", {}),
                            frozenset({"profile_root", "display", "vnc_url", "chromium_executable",
                                       "max_sessions", "max_page_size"}),
@@ -428,7 +564,8 @@ def load_config(
     burp_table = _table(top.get("burp", {}),
                         frozenset({"enabled", "project_root", "installation_jar", "ca_certificate",
                                    "listener_start", "listener_end", "bridge_port", "bridge_secret_ref",
-                                   "max_event_bytes", "max_inflight", "third_party_capture"}), "burp")
+                                   "max_event_bytes", "max_inflight", "third_party_capture",
+                                   "runtime_root"}), "burp")
     executor_table = _table(top.get("executor", {}),
                             frozenset({"allow_direct", "capture_required", "connect_timeout_seconds",
                                        "read_timeout_seconds", "overall_timeout_seconds", "max_redirects",
@@ -561,6 +698,7 @@ def load_config(
         max_event_bytes=burp_table.get("max_event_bytes", 1_048_576),
         max_inflight=burp_table.get("max_inflight", 8),
         third_party_capture=burp_table.get("third_party_capture", "DROP"),
+        runtime_root=burp_path("runtime_root", root / "burp-runtime"),
     )
 
     return AppConfig(
@@ -591,4 +729,13 @@ def load_config(
             allowed_source_hosts=tuple(research_table.get("allowed_source_hosts", ())),
         ),
         notifications=NotificationSettings(**notifications_table),
+        backup=BackupSettings(
+            root=_path(backup_table["root"], base=file_path.parent)
+                 if "root" in backup_table else root / "backups",
+            artifact_mode=backup_table.get("artifact_mode", "ALL"),
+            keep_generations=backup_table.get("keep_generations", 14),
+            encryption_secret_ref=backup_table.get("encryption_secret_ref"),
+        ),
+        resources=ResourceSettings(**resources_table),
+        retention=RetentionSettings(**retention_table),
     )

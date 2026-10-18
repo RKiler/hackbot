@@ -265,7 +265,7 @@ class PlannerRunner:
 
     def _research_brief_reason(self, target_id: str, brief_id: str) -> str:
         brief = self.research.store.brief(target_id, brief_id)
-        if brief is None:
+        if brief is None or brief.get("freshness") == "RETIRED":
             return "RESEARCH_BRIEF_MISSING"
         proposal = brief.get("ephemeral_skill_proposal")
         if proposal is None:

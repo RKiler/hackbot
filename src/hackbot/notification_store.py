@@ -345,22 +345,37 @@ class NotificationStore:
                                  (delivery_id,)).fetchone()
         return self._delivery(updated)
 
-    def reconcile_inflight(self) -> int:
-        with self.store._connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            rows = db.execute(
-                "SELECT * FROM notification_deliveries WHERE status='SENDING'"
-            ).fetchall()
-            for row in rows:
-                db.execute("UPDATE notification_deliveries SET status='NEEDS_REVIEW',"
-                           "last_error_code='IN_FLIGHT_AFTER_RESTART' WHERE delivery_id=?",
-                           (row["delivery_id"],))
-                db.execute(
-                    "INSERT OR IGNORE INTO notification_attempts(delivery_id,attempt_number,"
-                    "status,error_code,occurred_at) VALUES (?,?,?,?,?)",
-                    (row["delivery_id"], row["attempt_count"], "NEEDS_REVIEW",
-                     "IN_FLIGHT_AFTER_RESTART", _now()))
-        return len(rows)
+    def reconcile_inflight(self, *, batch_size: int = 256) -> int:
+        if type(batch_size) is not int or not 1 <= batch_size <= 1000:
+            raise ValueError("invalid notification recovery batch")
+        reconciled = 0
+        last_delivery_id = ""
+        while True:
+            with self.store._connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute(
+                    "SELECT delivery_id,attempt_count FROM notification_deliveries "
+                    "WHERE status='SENDING' AND delivery_id>? "
+                    "ORDER BY delivery_id LIMIT ?",
+                    (last_delivery_id, batch_size),
+                ).fetchall()
+                for row in rows:
+                    db.execute(
+                        "UPDATE notification_deliveries SET status='NEEDS_REVIEW',"
+                        "last_error_code='IN_FLIGHT_AFTER_RESTART' WHERE delivery_id=?",
+                        (row["delivery_id"],),
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO notification_attempts(delivery_id,attempt_number,"
+                        "status,error_code,occurred_at) VALUES (?,?,?,?,?)",
+                        (row["delivery_id"], row["attempt_count"], "NEEDS_REVIEW",
+                         "IN_FLIGHT_AFTER_RESTART", _now()),
+                    )
+                reconciled += len(rows)
+                if rows:
+                    last_delivery_id = rows[-1]["delivery_id"]
+            if len(rows) < batch_size:
+                return reconciled
 
     def stats(self, target_id: str | None = None) -> dict[str, int]:
         with self.store._connection() as db:
@@ -384,4 +399,5 @@ class NotificationStore:
         return {"events": event_count, "sent": counts.get("SENT", 0),
                 "deduped": duplicate_findings + suppressed,
                 "failed": counts.get("FAILED", 0), "pending": counts.get("PENDING", 0) +
-                counts.get("RETRY", 0), "needs_review": counts.get("NEEDS_REVIEW", 0)}
+                counts.get("RETRY", 0), "sending": counts.get("SENDING", 0),
+                "needs_review": counts.get("NEEDS_REVIEW", 0)}

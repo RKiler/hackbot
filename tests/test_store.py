@@ -5,11 +5,15 @@ from io import StringIO
 from importlib.resources import files
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import stat
 from tempfile import TemporaryDirectory
+from threading import Thread
 import unittest
+from unittest.mock import patch
 
-from hackbot.artifacts import ArtifactIntegrityError, ArtifactStore
+from hackbot.artifacts import ArtifactIntegrityError, ArtifactLimitError, ArtifactStore
 from hackbot.config import StoreSettings, load_config
 from hackbot.evidence import (
     ContentKind, EvidenceProvenance, EvidenceType, FactStatus, Retention, Sensitivity,
@@ -17,7 +21,7 @@ from hackbot.evidence import (
 from hackbot.logging import create_logger
 from hackbot.recon import Provenance
 from hackbot.store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
-from tests.schema_utils import drop_phase28_schema
+from tests.schema_utils import drop_phase28_schema, drop_phase30_schema
 
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
@@ -60,7 +64,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 37)
+        self.assertEqual(version, 46)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -71,12 +75,163 @@ class StoreTests(unittest.TestCase):
             ).fetchall())
         self.assertEqual(reopened.list_evidence().items, ())
 
+    def test_idle_connection_is_reused_but_nested_and_other_threads_are_isolated(self):
+        self.store.initialize()
+        with self.store._connection() as first:
+            with self.store._connection() as nested:
+                self.assertIsNot(first, nested)
+                self.assertEqual(nested.execute("PRAGMA user_version").fetchone()[0], 46)
+        self.assertFalse(first.in_transaction)
+        with self.store._connection() as reused:
+            self.assertIs(first, reused)
+        other: list[sqlite3.Connection] = []
+
+        def inspect_other_thread() -> None:
+            with self.store._connection() as connection:
+                other.append(connection)
+
+        thread = Thread(target=inspect_other_thread)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(other), 1)
+        self.assertIsNot(first, other[0])
+        self.store.close_idle_connection()
+        with self.store._connection() as reopened:
+            self.assertIsNot(first, reopened)
+
+    def test_cached_connection_releases_unfinished_read_cursor(self):
+        self.store.initialize()
+        self._evidence()
+        self._evidence(content=b"second")
+        with self.store._connection() as connection:
+            cursor = connection.execute("SELECT evidence_id FROM evidence ORDER BY evidence_id")
+            self.assertIsNotNone(cursor.fetchone())
+            self.assertIsNotNone(cursor)
+        with sqlite3.connect(self.db_path, timeout=1) as writer:
+            writer.execute("CREATE TABLE external_writer_probe (value INTEGER)")
+        with self.store._connection() as reused:
+            self.assertIs(connection, reused)
+            self.assertEqual(reused.execute("SELECT count(*) FROM external_writer_probe").fetchone()[0], 0)
+
+    def test_finished_temporary_cursor_does_not_block_same_context_ddl(self):
+        self.store.initialize()
+        with self.store._connection() as connection:
+            connection.execute("CREATE TABLE cursor_probe (value INTEGER)")
+            connection.execute("INSERT INTO cursor_probe VALUES (1)")
+            self.assertEqual(connection.execute("SELECT value FROM cursor_probe").fetchone()[0], 1)
+            connection.execute("DROP TABLE cursor_probe")
+
+    def test_failed_context_discards_cache_and_schema_mismatch_fails_closed(self):
+        self.store.initialize()
+        with self.assertRaisesRegex(ValueError, "fixture failure"):
+            with self.store._connection() as failed:
+                raise ValueError("fixture failure")
+        with self.store._connection() as fresh:
+            self.assertIsNot(failed, fresh)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("PRAGMA user_version=999")
+        with self.assertRaises(StoreSchemaError):
+            with self.store._connection():
+                pass
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("PRAGMA user_version=46")
+        with self.store._connection() as restored:
+            self.assertIsNot(fresh, restored)
+
+    def test_replaced_database_file_invalidates_cached_connection(self):
+        self.store.initialize()
+        with self.store._connection() as original:
+            self.assertEqual(original.execute("PRAGMA user_version").fetchone()[0], 46)
+        replacement = self.db_path.with_name("replacement.sqlite3")
+        shutil.copy2(self.db_path, replacement)
+        os.replace(replacement, self.db_path)
+        with self.store._connection() as reopened:
+            self.assertIsNot(original, reopened)
+            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 46)
+
     def test_future_schema_is_rejected_without_mutation(self):
         self.store.initialize()
         with sqlite3.connect(self.db_path) as connection:
             connection.execute("PRAGMA user_version=999")
         with self.assertRaises(StoreSchemaError):
             self.store.initialize()
+
+    def test_default_initializes_fresh_store_but_never_upgrades_existing_one(self):
+        self.store.initialize()
+        record = self._evidence(content=b"preserved-before-service-restart")
+        with sqlite3.connect(self.db_path) as connection:
+            drop_phase28_schema(connection)
+            connection.execute("PRAGMA user_version=34")
+            before_count = connection.execute("SELECT count(*) FROM evidence").fetchone()[0]
+        before_hash = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(StoreSchemaError, "reviewed schema migration"):
+            self.store.initialize()
+        self.assertEqual(hashlib.sha256(self.db_path.read_bytes()).hexdigest(), before_hash)
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+            self.assertEqual(connection.execute("SELECT count(*) FROM evidence").fetchone()[0],
+                             before_count)
+        self.assertIsNotNone(record.evidence_id)
+
+    def test_service_schema_status_is_read_only(self):
+        self.assertEqual(self.store.service_schema_status()["state"], "FRESH")
+        self.assertFalse(self.db_path.exists())
+        self.store.initialize()
+        self.assertEqual(self.store.service_schema_status()["state"], "READY")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("PRAGMA user_version=34")
+        before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        status = self.store.service_schema_status()
+        self.assertEqual(status["state"], "MIGRATION_REQUIRED")
+        self.assertEqual(status["actual_schema"], 34)
+        self.assertEqual(hashlib.sha256(self.db_path.read_bytes()).hexdigest(), before)
+
+    def test_validation_linked_evidence_cannot_be_unpinned_through_store(self):
+        self.store.initialize()
+        record = self._evidence(content=b"validation-only-proof")
+        with self.store._connection() as connection:
+            connection.execute(
+                "INSERT INTO finding_validation_evidence_holds(evidence_id) VALUES (?)",
+                (record.evidence_id,),
+            )
+        self.assertTrue(self.store.get_evidence(record.evidence_id).retention.pinned)
+        with self.assertRaisesRegex(ValueError, "Finding evidence must remain pinned"):
+            self.store.set_retention(
+                record.evidence_id, Retention(retain=False),
+                actor="FIXTURE", reason="attempted_release",
+            )
+
+    def test_schema38_upgrade_indexes_all_artifact_digest_owners(self):
+        self.store.initialize()
+        original = self._evidence(content=b"preserved-artifact-index-evidence")
+        owners = (
+            ("evidence", "artifact_hash", "evidence_artifact_hash_lookup"),
+            ("traffic_requests", "artifact_hash", "traffic_requests_artifact_hash_lookup"),
+            ("traffic_responses", "artifact_hash", "traffic_responses_artifact_hash_lookup"),
+            ("plan_step_results", "artifact_hash", "plan_step_results_artifact_hash_lookup"),
+            ("dom_js_artifacts", "artifact_sha256", "dom_js_artifacts_hash_lookup"),
+            ("dom_source_maps", "map_sha256", "dom_source_maps_hash_lookup"),
+            ("exposure_candidate_sources", "artifact_sha256",
+             "exposure_candidate_sources_hash_lookup"),
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            drop_phase30_schema(connection)
+            for _, _, index in owners:
+                connection.execute(f"DROP INDEX {index}")
+            connection.execute("PRAGMA user_version=38")
+        self.store.initialize(allow_existing_migration=True)
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM evidence WHERE evidence_id=?",
+                (original.evidence_id,)).fetchone()[0], 1)
+            for table, column, index in owners:
+                plan = connection.execute(
+                    f"EXPLAIN QUERY PLAN SELECT 1 FROM {table} "
+                    f"WHERE {column}=? LIMIT 1", ("0" * 64,)).fetchall()
+                self.assertTrue(any("SEARCH" in step[3] and index in step[3]
+                                    for step in plan), (table, plan))
 
     def test_phase27_research_schema_upgrades_existing_version_33_store(self):
         self.store.initialize()
@@ -88,9 +243,9 @@ class StoreTests(unittest.TestCase):
                           "research_requests"):
                 connection.execute(f"DROP TABLE {table}")
             connection.execute("PRAGMA user_version=33")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE "
                 "type='table' AND name='research_briefs'").fetchone())
             self.assertEqual(connection.execute("SELECT count(*) FROM evidence WHERE evidence_id=?",
@@ -104,9 +259,9 @@ class StoreTests(unittest.TestCase):
             connection.execute("DROP TABLE api_inventory_progress")
             connection.execute("DROP INDEX api_js_artifacts_target_hash_state")
             connection.execute("PRAGMA user_version=29")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' "
                 "AND name='api_js_artifacts_target_hash_state'").fetchone())
@@ -122,9 +277,9 @@ class StoreTests(unittest.TestCase):
             connection.execute("DROP TABLE api_inventory_progress")
             connection.execute("DROP INDEX dom_js_artifacts_target_current_page")
             connection.execute("PRAGMA user_version=30")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='api_inventory_progress'").fetchone())
@@ -163,9 +318,9 @@ class StoreTests(unittest.TestCase):
                 connection.execute(f"DROP TABLE {table}")
             connection.execute("ALTER TABLE plan_object_requirements DROP COLUMN test_object_id")
             connection.execute("PRAGMA user_version=14")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)
@@ -182,9 +337,9 @@ class StoreTests(unittest.TestCase):
             connection.execute("DROP TABLE authorization_mutation_results")
             connection.executescript(legacy)
             connection.execute("PRAGMA user_version=31")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             schema = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='authorization_mutation_results'").fetchone()[0]
@@ -198,9 +353,9 @@ class StoreTests(unittest.TestCase):
             connection.execute("DROP INDEX authorization_mutations_delete_exchange")
             connection.execute("DROP INDEX test_object_operations_cleanup_exchange")
             connection.execute("PRAGMA user_version=32")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             names = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'")}
             self.assertIn("authorization_mutations_delete_exchange", names)
@@ -262,6 +417,43 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ArtifactIntegrityError):
             artifacts.get_bytes(digest)
         self.assertEqual(outside.read_bytes(), b"sensitive")
+
+    def test_artifact_write_limit_rejects_oversize_before_disk_write(self):
+        artifacts = ArtifactStore(self.blobs, max_blob_bytes=4)
+        self.assertEqual(artifacts.put_bytes(b"four").size_bytes, 4)
+        with self.assertRaises(ArtifactLimitError):
+            artifacts.put_bytes(b"larger")
+        self.assertFalse(artifacts.path_for(hashlib.sha256(b"larger").hexdigest()).exists())
+
+    def test_new_artifact_syncs_directory_after_publishing_digest(self):
+        artifacts = ArtifactStore(self.blobs)
+        digest = hashlib.sha256(b"durable-artifact").hexdigest()
+        path = artifacts.path_for(digest)
+        original_fsync = os.fsync
+        published_directory_synced = False
+
+        def track_fsync(fd):
+            nonlocal published_directory_synced
+            details = os.fstat(fd)
+            if (stat.S_ISDIR(details.st_mode) and path.exists() and
+                    details.st_ino == path.parent.stat().st_ino):
+                published_directory_synced = True
+            return original_fsync(fd)
+
+        with patch("hackbot.artifacts.os.fsync", side_effect=track_fsync):
+            artifacts.put_bytes(b"durable-artifact")
+        self.assertTrue(published_directory_synced)
+
+    def test_artifact_directory_sync_failure_is_not_reported_as_success(self):
+        artifacts = ArtifactStore(self.blobs)
+        artifacts.prepare()
+        digest = hashlib.sha256(b"directory-sync-failure").hexdigest()
+        artifacts.path_for(digest).parent.mkdir(mode=0o700)
+        with patch.object(artifacts, "_fsync_directory",
+                          side_effect=ArtifactIntegrityError("sync failed")):
+            with self.assertRaisesRegex(ArtifactIntegrityError, "sync failed"):
+                artifacts.put_bytes(b"directory-sync-failure")
+        self.assertTrue(artifacts.path_for(digest).is_file())
 
     def test_corrupt_artifact_is_not_returned(self):
         self.store.initialize()

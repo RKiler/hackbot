@@ -83,6 +83,95 @@ class ConfigTests(unittest.TestCase):
                     load_config(path, environ={"HOME": directory})
                 self.assertNotIn("private-value", str(captured.exception))
 
+    def test_named_profile_grace_is_typed_and_bounded(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            self.assertEqual(load_config(environ={"HOME": directory}).retention
+                             .active_identity_profile_grace_hours, 720)
+            path.write_text("[retention]\nactive_identity_profile_grace_hours = 960\n")
+            self.assertEqual(load_config(path, environ={"HOME": directory}).retention
+                             .active_identity_profile_grace_hours, 960)
+            for value in ("0", "8761", '"720"', "true"):
+                path.write_text("[retention]\nactive_identity_profile_grace_hours = " + value + "\n")
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    load_config(path, environ={"HOME": directory})
+
+    def test_orphan_scan_timeout_is_typed_and_bounded(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text("[retention]\norphan_scan_timeout_seconds = 45\n")
+            self.assertEqual(load_config(path, environ={"HOME": directory}).retention
+                             .orphan_scan_timeout_seconds, 45)
+            for value in ("0", "301", '"30"', "true"):
+                path.write_text("[retention]\norphan_scan_timeout_seconds = " + value + "\n")
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    load_config(path, environ={"HOME": directory})
+
+    def test_traffic_retention_hours_and_target_override_are_validated(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            target_id = "TARGET-" + "a" * 32
+            path.write_text(
+                "[retention]\ntraffic_anonymous_hours = 48\n"
+                "traffic_authenticated_hours = 240\ntraffic_execution_hours = 720\n"
+                f"[retention.traffic_target_hours]\n\"{target_id}\" = 96\n"
+            )
+            configured = load_config(path, environ={"HOME": directory}).retention
+            self.assertEqual(configured.traffic_anonymous_hours, 48)
+            self.assertEqual(configured.traffic_target_hours[target_id], 96)
+            for body in (
+                "[retention]\ntraffic_anonymous_hours = 0\n",
+                "[retention]\ntraffic_execution_hours = true\n",
+                "[retention.traffic_target_hours]\n\"bad-target\" = 24\n",
+                f"[retention.traffic_target_hours]\n\"{target_id}\" = 0\n",
+            ):
+                path.write_text(body)
+                with self.subTest(body=body), self.assertRaises(ConfigError):
+                    load_config(path, environ={"HOME": directory})
+
+    def test_research_brief_retention_grace_is_typed_and_bounded(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            self.assertEqual(load_config(environ={"HOME": directory}).retention
+                             .research_brief_grace_days, 30)
+            path.write_text("[retention]\nresearch_brief_grace_days = 60\n")
+            self.assertEqual(load_config(path, environ={"HOME": directory}).retention
+                             .research_brief_grace_days, 60)
+            for value in ("0", "3651", '"30"', "true"):
+                path.write_text("[retention]\nresearch_brief_grace_days = " + value + "\n")
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    load_config(path, environ={"HOME": directory})
+
+    def test_dom_asset_retention_periods_are_typed_and_bounded(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            defaults = load_config(environ={"HOME": directory}).retention
+            self.assertEqual((defaults.js_artifact_hours, defaults.source_map_hours),
+                             (2160, 2160))
+            path.write_text("[retention]\njs_artifact_hours = 720\nsource_map_hours = 1440\n")
+            configured = load_config(path, environ={"HOME": directory}).retention
+            self.assertEqual((configured.js_artifact_hours, configured.source_map_hours),
+                             (720, 1440))
+            for field in ("js_artifact_hours", "source_map_hours"):
+                for value in ("0", "87601", '"720"', "true"):
+                    path.write_text(f"[retention]\n{field} = {value}\n")
+                    with self.subTest(field=field, value=value), self.assertRaises(ConfigError):
+                        load_config(path, environ={"HOME": directory})
+
+    def test_cpu_load_gate_is_explicitly_configured(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            self.assertIsNone(load_config(environ={"HOME": directory}).resources
+                              .high_load_per_cpu)
+            path.write_text("[resources]\nhigh_load_per_cpu = 4.0\n"
+                            "critical_load_per_cpu = 8.0\n")
+            configured = load_config(path, environ={"HOME": directory})
+            self.assertEqual(configured.resources.high_load_per_cpu, 4.0)
+            self.assertEqual(configured.resources.critical_load_per_cpu, 8.0)
+            path.write_text("[resources]\nhigh_load_per_cpu = 4.0\n")
+            with self.assertRaises(ConfigError):
+                load_config(path, environ={"HOME": directory})
+
     def test_explicit_missing_file_is_invalid(self) -> None:
         with TemporaryDirectory() as directory:
             with self.assertRaises(ConfigError):

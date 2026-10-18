@@ -427,8 +427,10 @@ class ResearchStore:
 
     def cached(self, cache_key: str) -> dict[str, object] | None:
         with self.evidence._connection() as db:
-            row = db.execute("SELECT * FROM research_briefs WHERE cache_key=? "
-                             "ORDER BY version DESC LIMIT 1", (cache_key,)).fetchone()
+            row = db.execute("SELECT b.*,r.retired_at FROM research_briefs b "
+                             "LEFT JOIN research_brief_payload_retirements r "
+                             "ON r.brief_id=b.brief_id WHERE b.cache_key=? "
+                             "ORDER BY b.version DESC LIMIT 1", (cache_key,)).fetchone()
             return dict(row) if row else None
 
     def active_for_cache(self, cache_key: str, target_id: str) -> dict[str, object] | None:
@@ -479,20 +481,34 @@ class ResearchStore:
                        "error_code=?,updated_at=? WHERE request_id=? AND cancel_requested=0",
                        (status.value, brief_id, error_code, _now().isoformat(), request_id))
 
-    def link_cached(self, gap: KnowledgeGap, cached: dict[str, object]) -> None:
-        if not gap.hypothesis_id:
-            return
-        brief = json.loads(cached["payload_json"])
-        guidance = json.dumps({"skills": brief["recommended_skills"],
-                               "false_positives": brief["false_positives"],
-                               "advisory_only": True})
+    def use_cached(self, gap: KnowledgeGap, request_id: str, brief_id: str) -> bool:
         with self.evidence._connection() as db:
-            db.execute("INSERT OR IGNORE INTO research_hypothesis_links "
-                       "(hypothesis_id,brief_id,guidance_json,created_at) "
-                       "SELECT hypothesis_id,?,?,? FROM hypotheses "
-                       "WHERE hypothesis_id=? AND target_id=?",
-                       (cached["brief_id"], guidance, _now().isoformat(),
-                        gap.hypothesis_id, gap.target_id))
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT b.payload_json,b.expires_at FROM research_briefs b "
+                             "LEFT JOIN research_brief_payload_retirements r "
+                             "ON r.brief_id=b.brief_id WHERE b.brief_id=? AND r.brief_id IS NULL "
+                             "AND (b.target_id=? OR b.target_id IS NULL)",
+                             (brief_id, gap.target_id)).fetchone()
+            if row is None or datetime.fromisoformat(row["expires_at"]) <= _now():
+                return False
+            brief = json.loads(row["payload_json"])
+            at = _now().isoformat()
+            updated = db.execute("UPDATE research_requests SET status='CACHE_HIT',brief_id=?,"
+                                 "error_code=NULL,updated_at=? WHERE request_id=? AND target_id=? "
+                                 "AND status='PENDING' AND cancel_requested=0",
+                                 (brief_id, at, request_id, gap.target_id))
+            if updated.rowcount != 1:
+                return False
+            if gap.hypothesis_id:
+                guidance = json.dumps({"skills": brief["recommended_skills"],
+                                       "false_positives": brief["false_positives"],
+                                       "advisory_only": True})
+                db.execute("INSERT OR IGNORE INTO research_hypothesis_links "
+                           "(hypothesis_id,brief_id,guidance_json,created_at) "
+                           "SELECT hypothesis_id,?,?,? FROM hypotheses "
+                           "WHERE hypothesis_id=? AND target_id=?",
+                           (brief_id, guidance, at, gap.hypothesis_id, gap.target_id))
+            return True
 
     def cancel(self, target_id: str, request_id: str) -> bool:
         with self.evidence._connection() as db:
@@ -516,7 +532,8 @@ class ResearchStore:
             return not row or bool(row[0])
 
     def save_brief(self, brief: ResearchBrief, sources: tuple[SourceReference, ...],
-                   proposal: EphemeralSkillProposal | None, status: ResearchStatus) -> None:
+                   proposal: EphemeralSkillProposal | None, status: ResearchStatus,
+                   *, error_code: str | None = None) -> None:
         payload = json.dumps(brief.to_dict(), sort_keys=True, separators=(",", ":"))
         with self.evidence._connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -547,8 +564,10 @@ class ResearchStore:
                             json.dumps({"skills": brief.recommended_skills,
                                         "false_positives": brief.false_positives,
                                         "advisory_only": True}), brief.retrieved_at))
-            db.execute("UPDATE research_requests SET status=?,brief_id=?,updated_at=? WHERE request_id=?",
-                       (status.value, brief.brief_id, brief.retrieved_at, brief.request_id))
+            db.execute("UPDATE research_requests SET status=?,brief_id=?,error_code=?,updated_at=? "
+                       "WHERE request_id=?",
+                       (status.value, brief.brief_id, error_code,
+                        brief.retrieved_at, brief.request_id))
         for source in sources:
             reference = {"brief_id": brief.brief_id, "source_id": source.source_id,
                          "source_type": source.source_type.value, "url": source.url,
@@ -580,10 +599,25 @@ class ResearchStore:
 
     def brief(self, target_id: str, brief_id: str) -> dict[str, object] | None:
         with self.evidence._connection() as db:
-            row = db.execute("SELECT * FROM research_briefs WHERE brief_id=? AND "
-                             "(target_id=? OR target_id IS NULL)", (brief_id, target_id)).fetchone()
+            row = db.execute("SELECT b.*,r.retired_at FROM research_briefs b "
+                             "LEFT JOIN research_brief_payload_retirements r "
+                             "ON r.brief_id=b.brief_id WHERE b.brief_id=? AND "
+                             "(b.target_id=? OR b.target_id IS NULL)", (brief_id, target_id)).fetchone()
             if not row:
                 return None
+            if row["retired_at"] is not None:
+                sources = db.execute("SELECT s.source_id,s.canonical_url,s.source_type,s.title,s.publisher,"
+                                     "s.published_at,bs.retrieved_at,s.quality FROM research_sources s "
+                                     "JOIN research_brief_sources bs ON bs.source_id=s.source_id "
+                                     "WHERE bs.brief_id=? ORDER BY s.quality DESC", (brief_id,)).fetchall()
+                return {"brief_id": row["brief_id"], "request_id": row["created_from_request"],
+                        "target_id": row["target_id"], "topic": row["topic"],
+                        "version": row["version"], "summary": row["summary"],
+                        "content_hash": row["content_hash"], "retrieved_at": row["retrieved_at"],
+                        "expires_at": row["expires_at"], "retired_at": row["retired_at"],
+                        "freshness": "RETIRED", "content_available": False,
+                        "sources": [dict(source) for source in sources],
+                        "ephemeral_skill_proposal": None}
             item = json.loads(row["payload_json"])
             sources = db.execute("SELECT s.source_id,s.canonical_url,s.source_type,s.title,s.publisher,"
                                  "s.published_at,bs.retrieved_at,s.quality FROM research_sources s "
@@ -611,17 +645,22 @@ class ResearchStore:
             raise ValueError("invalid page size")
         with self.evidence._connection() as db:
             rows = db.execute("SELECT r.request_id,r.gap_ref,r.gap_type,r.topic,r.status,r.brief_id,"
-                              "r.created_at,b.expires_at,b.quality,b.payload_json "
-                              "FROM research_requests r LEFT JOIN research_briefs b ON b.brief_id=r.brief_id "
+                              "r.created_at,b.retrieved_at,b.expires_at,b.quality,b.payload_json,"
+                              "ret.retired_at FROM research_requests r "
+                              "LEFT JOIN research_briefs b ON b.brief_id=r.brief_id "
+                              "LEFT JOIN research_brief_payload_retirements ret "
+                              "ON ret.brief_id=r.brief_id "
                               "WHERE r.target_id=? ORDER BY r.created_at DESC,r.request_id DESC LIMIT ?",
                               (target_id, limit)).fetchall()
         items = []
         for row in rows:
             item = {key: row[key] for key in ("request_id", "gap_ref", "gap_type", "topic",
                                             "status", "brief_id", "created_at", "quality")}
-            item["freshness"] = self.freshness(json.loads(row["payload_json"])["retrieved_at"],
-                                               row["expires_at"]) if row["brief_id"] else None
-            item["recommended_skills"] = json.loads(row["payload_json"]).get("recommended_skills", []) if row["payload_json"] else []
+            item["freshness"] = ("RETIRED" if row["retired_at"] is not None else
+                                 self.freshness(row["retrieved_at"], row["expires_at"])
+                                 if row["brief_id"] else None)
+            item["recommended_skills"] = (json.loads(row["payload_json"]).get("recommended_skills", [])
+                                          if row["payload_json"] and row["retired_at"] is None else [])
             items.append(item)
         return {"items": items, "limit": limit}
 
@@ -681,9 +720,7 @@ class ResearchCoordinator:
             if active:
                 return active
             raise
-        if cached and not refresh and datetime.fromisoformat(cached["expires_at"]) > _now():
-            self.store.transition(request_id, ResearchStatus.CACHE_HIT, brief_id=cached["brief_id"])
-            self.store.link_cached(gap, cached)
+        if cached and not refresh and self.store.use_cached(gap, request_id, cached["brief_id"]):
             return {"request_id": request_id, "status": "CACHE_HIT", "brief_id": cached["brief_id"]}
         return {"request_id": request_id, "status": "PENDING", "brief_id": None}
 
@@ -701,6 +738,8 @@ class ResearchCoordinator:
         materials: list[SourceMaterial] = []
         fetched_bytes = 0
         failed = False
+        local_failed = False
+        external_failed = False
         searches = 0
         snippet_only = False
         # Private target statements may contain confidential product or object names.
@@ -711,8 +750,9 @@ class ResearchCoordinator:
         query = _public_term(query + " " + (category or "security") + " documentation") if query else None
         reserve_external = int(bool(request.external_allowed and self.web_provider and query
                                     and budget.max_sources > 1))
-        def collect(provider: ResearchProvider, *, reserve: int = 0) -> None:
-            nonlocal fetched_bytes, failed
+        def collect(provider: ResearchProvider, *, reserve: int = 0,
+                    external: bool = False) -> None:
+            nonlocal fetched_bytes, failed, local_failed, external_failed
             if self.store.cancelled(request_id):
                 return
             remaining = budget.max_sources - reserve - len(materials)
@@ -724,6 +764,10 @@ class ResearchCoordinator:
                                          deadline=deadline)
             except Exception:
                 failed = True
+                if external:
+                    external_failed = True
+                else:
+                    local_failed = True
                 return
             for value in values:
                 if self.store.cancelled(request_id):
@@ -748,7 +792,10 @@ class ResearchCoordinator:
                                for item in materials)
         if request.external_allowed and self.web_provider and query and not locally_answered:
             searches = 1
-            collect(self.web_provider)
+            collect(self.web_provider, external=True)
+        failure_code = ("MULTIPLE_PROVIDERS_UNAVAILABLE" if local_failed and external_failed else
+                        "EXTERNAL_PROVIDER_UNAVAILABLE" if external_failed else
+                        "LOCAL_PROVIDER_UNAVAILABLE" if local_failed else None)
         snippet_only = bool(materials) and all(item.content_level == "SNIPPET" for item in materials)
         if self.store.cancelled(request_id):
             return {"request_id": request_id, "status": "CANCELLED", "brief_id": None}
@@ -756,7 +803,9 @@ class ResearchCoordinator:
             status = ResearchStatus.PARTIAL if failed else ResearchStatus.BLOCKED
             self.store.record_usage(request_id, searches=searches, sources=0,
                                     source_bytes=fetched_bytes, input_tokens=0, output_tokens=0)
-            self.store.transition(request_id, status, error_code="PROVIDER_UNAVAILABLE" if failed else "NO_RELEVANT_SOURCES")
+            self.store.transition(
+                request_id, status,
+                error_code=failure_code or "NO_RELEVANT_SOURCES")
             return {"request_id": request_id, "status": status.value, "brief_id": None}
         sources: list[SourceReference] = []
         patterns: list[str] = []
@@ -855,7 +904,9 @@ class ResearchCoordinator:
                 ("Independent runtime verification",), brief.source_ids)
         status = ResearchStatus.PARTIAL if failed or not patterns or snippet_only else ResearchStatus.COMPLETED
         try:
-            self.store.save_brief(brief, tuple(sources), proposal, status)
+            self.store.save_brief(
+                brief, tuple(sources), proposal, status,
+                error_code=failure_code)
         except RuntimeError:
             if self.store.cancelled(request_id):
                 return {"request_id": request_id, "status": "CANCELLED", "brief_id": None}

@@ -1035,13 +1035,13 @@ frame.addEventListener('load',()=>{{
             db.execute("ALTER TABLE message_analysis_runs DROP COLUMN sender_count")
             db.execute("ALTER TABLE message_analysis_runs DROP COLUMN channel_count")
             db.execute("PRAGMA user_version=18")
-        self.evidence.initialize()
+        self.evidence.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.evidence.db_path) as db:
             after = db.execute("SELECT run_id,step_id,variant,accounted_at "
                                "FROM plan_message_dispatches ORDER BY variant").fetchall()
             version = db.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(after, before)
-        self.assertEqual(version, 37)
+        self.assertEqual(version, 46)
         validation, finding = self._validate(run_id)
         self.assertEqual(validation.status, ValidationStatus.CONFIRMED)
         self.assertIsNotNone(finding)

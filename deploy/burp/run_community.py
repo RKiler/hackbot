@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -16,6 +18,8 @@ import time
 
 WIZARD_TITLE = r"^Burp Suite Community Edition v[0-9.]+$"
 PROJECT_TITLE = r"^Burp Suite Community Edition v.* - Temporary Project$"
+WIZARD_WAIT_SECONDS = 180
+PROJECT_WAIT_SECONDS = 240
 
 
 def windows(title: str) -> list[str]:
@@ -46,6 +50,23 @@ def start_temporary_project(window_id: str) -> None:
     subprocess.run(["xdotool", "key", "space"], check=True, timeout=5)
 
 
+def wait_for_wizard(java: subprocess.Popen[bytes], port: int, *, seconds: int) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and java.poll() is None:
+        wizard = windows(WIZARD_TITLE)
+        if wizard:
+            start_temporary_project(wizard[0])
+            return
+        if windows(PROJECT_TITLE) and listener_ready(port):
+            return
+        time.sleep(1)
+    if java.poll() is not None:
+        raise RuntimeError("Burp Community exited before its startup wizard")
+    if windows(r"^Burp Suite"):
+        raise RuntimeError("Burp Community startup window changed or was not ready")
+    raise RuntimeError("Burp Community startup wizard was not available")
+
+
 def wait_for_project(java: subprocess.Popen[bytes], port: int, *, seconds: int) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -68,6 +89,25 @@ def terminate(child: subprocess.Popen[bytes] | None) -> None:
         child.wait(timeout=5)
 
 
+def acquire_runtime_lock(runtime: Path) -> int:
+    tmp = runtime / "tmp"
+    path = tmp / ".community-maintenance.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                info.st_uid != tmp.stat().st_uid or info.st_mode & 0o077):
+            raise RuntimeError("Unsafe Burp runtime maintenance lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Burp runtime maintenance is active") from None
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jar", type=Path, required=True)
@@ -87,6 +127,10 @@ def main() -> int:
     runtime = args.runtime_root.resolve(strict=True)
     if not runtime.is_dir() or not (runtime / "tmp").is_dir():
         raise SystemExit("Burp runtime directory is unavailable")
+    try:
+        lock_fd = acquire_runtime_lock(runtime)
+    except (OSError, RuntimeError):
+        raise SystemExit("Burp runtime maintenance lock is unavailable") from None
 
     def stop(_signal: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -109,18 +153,8 @@ def main() -> int:
                 f"--user-config-file={args.user_config}",
                 "--disable-auto-update",
             ], stdin=subprocess.DEVNULL)
-            deadline = time.monotonic() + 90
-            while time.monotonic() < deadline and java.poll() is None:
-                wizard = windows(WIZARD_TITLE)
-                if wizard:
-                    start_temporary_project(wizard[0])
-                    break
-                if windows(PROJECT_TITLE) and listener_ready(args.listener_port):
-                    break
-                time.sleep(1)
-            else:
-                raise RuntimeError("Burp Community startup wizard was not available")
-            if not wait_for_project(java, args.listener_port, seconds=240):
+            wait_for_wizard(java, args.listener_port, seconds=WIZARD_WAIT_SECONDS)
+            if not wait_for_project(java, args.listener_port, seconds=PROJECT_WAIT_SECONDS):
                 raise RuntimeError("Burp Community project or loopback listener did not start")
             print("Burp Community temporary project and loopback listener ready", flush=True)
             while java.poll() is None:
@@ -134,6 +168,7 @@ def main() -> int:
     finally:
         terminate(java)
         terminate(fluxbox)
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import base64
 import binascii
 import hashlib
@@ -17,7 +17,8 @@ from .domxss_static import (
     FlowStep, MAX_ASSET_BYTES, SourceLocation,
 )
 from .domxss_maps import MAX_SOURCE_MAP_BYTES, map_locations
-from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
+from .evidence import EvidenceProvenance, EvidenceType, Retention, Sensitivity
+from .evidence_refs import has_evidence_reference
 from .store import EvidenceFactStore
 
 
@@ -78,8 +79,31 @@ def _candidate_from_row(row: object) -> DOMFlowCandidate:
 class DOMXSSStore:
     """No network access; active artifact bytes must arrive from a trusted executor."""
 
-    def __init__(self, evidence: EvidenceFactStore) -> None:
+    def __init__(self, evidence: EvidenceFactStore, *, js_retention_hours: int = 2160,
+                 source_map_retention_hours: int = 2160) -> None:
+        if (type(js_retention_hours) is not int or not 1 <= js_retention_hours <= 87_600 or
+                type(source_map_retention_hours) is not int or
+                not 1 <= source_map_retention_hours <= 87_600):
+            raise ValueError("Invalid DOM artifact retention period")
         self.evidence = evidence
+        self.js_retention_hours = js_retention_hours
+        self.source_map_retention_hours = source_map_retention_hours
+
+    @staticmethod
+    def _retired(db, evidence_id: str) -> bool:
+        return db.execute(
+            "SELECT 1 FROM evidence_payload_retirements WHERE evidence_id=? LIMIT 1",
+            (evidence_id,),
+        ).fetchone() is not None
+
+    def _check_retired_owner(self, evidence_id: str, *, artifact_id: str | None = None,
+                             map_id: str | None = None) -> None:
+        with self.evidence._connection() as db:
+            if has_evidence_reference(
+                db, evidence_id, allowed_dom_artifact_id=artifact_id,
+                allowed_dom_map_id=map_id,
+            ):
+                raise ValueError("Retired DOM Evidence still has protected references")
 
     def _verify_exchange(self, target_id: str, exchange_id: str, digest: str,
                          size: int) -> None:
@@ -113,8 +137,10 @@ class DOMXSSStore:
         url_hash = hashlib.sha256(asset_url.encode()).hexdigest()
         with self.evidence._connection() as connection:
             row = connection.execute("""
-                SELECT * FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
+                SELECT * FROM dom_js_artifacts AS asset WHERE target_id=? AND asset_url_sha256=?
                   AND artifact_sha256=? AND state='CURRENT'
+                  AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
+                                  WHERE retired.evidence_id=asset.evidence_id)
                 ORDER BY retrieved_at DESC LIMIT 1
             """, (target_id, url_hash, recon_sha256)).fetchone()
         if row is None:
@@ -128,8 +154,10 @@ class DOMXSSStore:
         url_hash = hashlib.sha256(asset_url.encode()).hexdigest()
         with self.evidence._connection() as connection:
             row = connection.execute("""
-                SELECT * FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
+                SELECT * FROM dom_js_artifacts AS asset WHERE target_id=? AND asset_url_sha256=?
                   AND source='CONTROLLED_HTTP' AND state='CURRENT'
+                  AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
+                                  WHERE retired.evidence_id=asset.evidence_id)
                 ORDER BY retrieved_at DESC LIMIT 1
             """, (target_id, url_hash)).fetchone()
         if row is None:
@@ -171,9 +199,12 @@ class DOMXSSStore:
                 SELECT * FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
                   AND artifact_sha256=? LIMIT 1
             """, (target_id, url_hash, digest)).fetchone()
-        if row is not None and row["state"] == "CURRENT" and source != "CONTROLLED_HTTP":
+            retired = row is not None and self._retired(connection, row["evidence_id"])
+        if row is not None and row["state"] == "CURRENT" and source != "CONTROLLED_HTTP" and not retired:
             self.evidence.artifacts.get_bytes(digest, max_bytes=MAX_ASSET_BYTES)
             return self._asset(row)
+        if retired:
+            self._check_retired_owner(row["evidence_id"], artifact_id=row["artifact_id"])
         if capture_evidence_id:
             observation = self.evidence.get_evidence(capture_evidence_id)
             if (observation is None or observation.target_ref != target_id
@@ -182,7 +213,7 @@ class DOMXSSStore:
                     or observation.sensitivity is not Sensitivity.SENSITIVE
                     or observation.provenance.record_id != retrieval_exchange_id):
                 raise ValueError("Protected capture evidence does not match artifact")
-        elif row is not None:
+        elif row is not None and not retired:
             observation = self.evidence.get_evidence(row["evidence_id"])
             if observation is None or observation.content_hash != digest:
                 raise ValueError("Cached artifact evidence is unavailable")
@@ -192,7 +223,10 @@ class DOMXSSStore:
                 provenance=EvidenceProvenance(system="HACKBOT", entity="JS_ARTIFACT",
                                                record_id=str(recon_asset_id or "local")),
                 target_ref=target_id, sensitivity=Sensitivity.SENSITIVE,
-                metadata={"asset_url_sha256": url_hash, "recon_asset_id": recon_asset_id},
+                metadata={"asset_url_sha256": url_hash, "recon_asset_id": recon_asset_id,
+                          "retention_class": "REGENERABLE"},
+                retention=Retention(retain=True, expires_at=(
+                    datetime.now(timezone.utc) + timedelta(hours=self.js_retention_hours))),
             )
         state = ("CURRENT" if recon_sha256 is None and source == "CONTROLLED_HTTP" else
                  "UNVERIFIED_CURRENT" if recon_sha256 is None else
@@ -221,19 +255,26 @@ class DOMXSSStore:
                       digest, observation.evidence_id, retrieval_exchange_id, state, source, now.isoformat()))
             else:
                 artifact_id = row["artifact_id"]
-                connection.execute("""
+                updated = connection.execute("""
                     UPDATE dom_js_artifacts SET state=?,recon_sha256=?,evidence_id=?,
-                      retrieval_exchange_id=?,source=?,retrieved_at=? WHERE artifact_id=?
+                      retrieval_exchange_id=?,source=?,retrieved_at=?
+                    WHERE artifact_id=? AND evidence_id=?
                 """, (state, recon_sha256, observation.evidence_id,
-                      retrieval_exchange_id, source, now.isoformat(), artifact_id))
+                      retrieval_exchange_id, source, now.isoformat(), artifact_id,
+                      row["evidence_id"]))
+                if updated.rowcount != 1:
+                    raise ValueError("JavaScript artifact changed during rehydration")
         result = self.get_asset(target_id, artifact_id)
         assert result is not None
         return result
 
     def get_asset(self, target_id: str, artifact_id: str) -> DOMAssetRecord | None:
         with self.evidence._connection() as connection:
-            row = connection.execute("SELECT * FROM dom_js_artifacts WHERE target_id=? AND artifact_id=? LIMIT 1",
-                                     (target_id, artifact_id)).fetchone()
+            row = connection.execute("""
+                SELECT * FROM dom_js_artifacts AS asset WHERE target_id=? AND artifact_id=?
+                  AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
+                                  WHERE retired.evidence_id=asset.evidence_id) LIMIT 1
+            """, (target_id, artifact_id)).fetchone()
         return self._asset(row) if row else None
 
     def list_current_assets(self, target_id: str, *, limit: int = 50) -> tuple[DOMAssetRecord, ...]:
@@ -275,9 +316,11 @@ class DOMXSSStore:
         params = ((target_id, marker[0], marker[0], marker[1], limit + 1)
                   if marker else (target_id, limit + 1))
         with self.evidence._connection() as connection:
-            rows = connection.execute("""SELECT * FROM dom_js_artifacts
+            rows = connection.execute("""SELECT * FROM dom_js_artifacts AS asset
                 WHERE target_id=? AND state='CURRENT' AND (recon_sha256=artifact_sha256
-                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))""" +
+                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))
+                    AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
+                                    WHERE retired.evidence_id=asset.evidence_id)""" +
                 condition + " ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?",
                 params).fetchall()
         items = tuple(self._asset(row) for row in rows[:limit])
@@ -289,7 +332,9 @@ class DOMXSSStore:
     def get_source_map(self, target_id: str, js_artifact_id: str) -> DOMSourceMapRecord | None:
         with self.evidence._connection() as connection:
             row = connection.execute("""
-                SELECT * FROM dom_source_maps WHERE target_id=? AND js_artifact_id=?
+                SELECT * FROM dom_source_maps AS source_map WHERE target_id=? AND js_artifact_id=?
+                  AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
+                                  WHERE retired.evidence_id=source_map.evidence_id)
                 ORDER BY retrieved_at DESC LIMIT 1
             """, (target_id, js_artifact_id)).fetchone()
         if row is None:
@@ -303,7 +348,9 @@ class DOMXSSStore:
     def get_source_map_by_id(self, target_id: str, map_id: str) -> DOMSourceMapRecord | None:
         with self.evidence._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM dom_source_maps WHERE target_id=? AND map_id=? LIMIT 1",
+                "SELECT * FROM dom_source_maps AS source_map WHERE target_id=? AND map_id=? "
+                "AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired "
+                "WHERE retired.evidence_id=source_map.evidence_id) LIMIT 1",
                 (target_id, map_id)).fetchone()
         if row is None:
             return None
@@ -342,12 +389,15 @@ class DOMXSSStore:
                 SELECT * FROM dom_source_maps WHERE target_id=? AND js_artifact_id=?
                   AND map_url_sha256=? AND map_sha256=? LIMIT 1
             """, (target_id, js_artifact_id, url_hash, digest)).fetchone()
-        if existing:
+            retired = existing is not None and self._retired(connection, existing["evidence_id"])
+        if existing and not retired:
             return DOMSourceMapRecord(
                 existing["map_id"], target_id, js_artifact_id, url_hash, digest,
                 existing["evidence_id"], existing["retrieval_exchange_id"],
                 datetime.fromisoformat(existing["retrieved_at"]),
             )
+        if retired:
+            self._check_retired_owner(existing["evidence_id"], map_id=existing["map_id"])
         if retrieval_exchange_id:
             self._verify_exchange(target_id, retrieval_exchange_id, digest, len(body))
             observation = self.evidence.get_evidence(capture_evidence_id)
@@ -363,17 +413,29 @@ class DOMXSSStore:
                 provenance=EvidenceProvenance(system="HACKBOT", entity="SOURCE_MAP",
                                                record_id=js_artifact_id),
                 target_ref=target_id, sensitivity=Sensitivity.SENSITIVE,
-                metadata={"js_artifact_id": js_artifact_id, "map_url_sha256": url_hash},
+                metadata={"js_artifact_id": js_artifact_id, "map_url_sha256": url_hash,
+                          "retention_class": "REGENERABLE"},
+                retention=Retention(retain=True, expires_at=(
+                    datetime.now(timezone.utc) + timedelta(hours=self.source_map_retention_hours))),
             )
-        map_id = "DOMMAP-" + uuid.uuid4().hex
+        map_id = existing["map_id"] if existing else "DOMMAP-" + uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         with self.evidence._connection() as connection:
-            connection.execute("""
-                INSERT INTO dom_source_maps (map_id,target_id,js_artifact_id,map_url_sha256,
-                  map_sha256,evidence_id,retrieval_exchange_id,retrieved_at)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (map_id, target_id, js_artifact_id, url_hash, digest, observation.evidence_id,
-                  retrieval_exchange_id, now))
+            if existing:
+                updated = connection.execute("""
+                    UPDATE dom_source_maps SET evidence_id=?,retrieval_exchange_id=?,retrieved_at=?
+                    WHERE map_id=? AND evidence_id=?
+                """, (observation.evidence_id, retrieval_exchange_id, now,
+                      map_id, existing["evidence_id"]))
+                if updated.rowcount != 1:
+                    raise ValueError("Source map changed during rehydration")
+            else:
+                connection.execute("""
+                    INSERT INTO dom_source_maps (map_id,target_id,js_artifact_id,map_url_sha256,
+                      map_sha256,evidence_id,retrieval_exchange_id,retrieved_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (map_id, target_id, js_artifact_id, url_hash, digest, observation.evidence_id,
+                      retrieval_exchange_id, now))
         result = self.get_source_map(target_id, js_artifact_id)
         assert result is not None
         return result
@@ -412,9 +474,10 @@ class DOMXSSStore:
             raise ValueError("Unknown target JS artifact")
         with self.evidence._connection() as connection:
             previous = connection.execute("""
-                SELECT analysis_id FROM dom_analysis_runs WHERE artifact_id=? AND analyzer_version=? LIMIT 1
+                SELECT analysis_id,status,candidate_count FROM dom_analysis_runs
+                WHERE artifact_id=? AND analyzer_version=? LIMIT 1
             """, (artifact_id, ANALYZER_VERSION)).fetchone()
-        if previous is not None:
+        if previous is not None and previous["status"] != DOMCandidateStatus.PARSE_FAILED.value:
             return previous["analysis_id"], self._read_analysis(target_id, previous["analysis_id"])
         body = self.evidence.read_content(asset.evidence_id, allow_sensitive=True,
                                           max_bytes=MAX_ASSET_BYTES)
@@ -422,14 +485,25 @@ class DOMXSSStore:
                                     recon_asset_id=asset.recon_asset_id)
         if analysis.asset_sha256 != asset.artifact_sha256:
             raise ValueError("Artifact changed during analysis")
-        analysis_id = "DOMAN-" + uuid.uuid4().hex
+        analysis_id = previous["analysis_id"] if previous else "DOMAN-" + uuid.uuid4().hex
         with self.evidence._connection() as connection:
-            connection.execute("""
-                INSERT INTO dom_analysis_runs (analysis_id,target_id,artifact_id,analyzer_version,
-                  status,parse_errors,candidate_count,analyzed_at) VALUES (?,?,?,?,?,?,?,?)
-            """, (analysis_id, target_id, artifact_id, analysis.analyzer_version,
-                  analysis.status, analysis.parse_errors, len(analysis.candidates),
-                  analysis.analyzed_at.isoformat()))
+            if previous is not None:
+                if previous["candidate_count"] != 0:
+                    raise ValueError("Failed analysis unexpectedly has candidates")
+                changed = connection.execute("""
+                    UPDATE dom_analysis_runs SET status=?,parse_errors=?,candidate_count=?,analyzed_at=?
+                    WHERE analysis_id=? AND target_id=? AND status='PARSE_FAILED' AND candidate_count=0
+                """, (analysis.status, analysis.parse_errors, len(analysis.candidates),
+                      analysis.analyzed_at.isoformat(), analysis_id, target_id))
+                if changed.rowcount != 1:
+                    raise RuntimeError("Analysis state changed during retry")
+            else:
+                connection.execute("""
+                    INSERT INTO dom_analysis_runs (analysis_id,target_id,artifact_id,analyzer_version,
+                      status,parse_errors,candidate_count,analyzed_at) VALUES (?,?,?,?,?,?,?,?)
+                """, (analysis_id, target_id, artifact_id, analysis.analyzer_version,
+                      analysis.status, analysis.parse_errors, len(analysis.candidates),
+                      analysis.analyzed_at.isoformat()))
             for candidate in analysis.candidates:
                 candidate = replace(candidate, evidence_ids=(asset.evidence_id,))
                 connection.execute("""

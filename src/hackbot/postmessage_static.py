@@ -11,7 +11,7 @@ import json
 import re
 import subprocess
 
-from .domxss_static import MAX_ASSET_BYTES, SourceLocation
+from .domxss_static import ANALYSIS_TIMEOUT_SECONDS, MAX_ASSET_BYTES, SourceLocation
 
 
 ANALYZER_VERSION = "1.9.1"
@@ -221,12 +221,14 @@ class PostMessageStaticAnalyzer:
                 process = subprocess.run(
                     [self.node_binary, "--max-old-space-size=128", str(helper_path)],
                     input=body, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    timeout=5, check=False,
+                    timeout=ANALYSIS_TIMEOUT_SECONDS, check=False,
                 )
             if process.returncode != 0 or len(process.stdout) > 262_144:
                 return empty("PARSE_FAILED", "PARSER_UNAVAILABLE_OR_LIMIT")
             parsed = json.loads(process.stdout)
-        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        except subprocess.TimeoutExpired:
+            return empty("PARSE_FAILED", "PARSER_TIMEOUT")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return empty("PARSE_FAILED", "PARSER_UNAVAILABLE_OR_LIMIT")
         if not isinstance(parsed, dict) or parsed.get("parse_error"):
             return empty("PARSE_FAILED", "MALFORMED_JAVASCRIPT")

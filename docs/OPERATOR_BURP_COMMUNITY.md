@@ -34,6 +34,11 @@ proxy/extension setup in true headless mode, and Community's project-file
 option is not available. The launcher uses a private Xvfb display and
 window-title/keyboard navigation of the Community startup wizard, not screen
 coordinates. It starts a fresh temporary project after each service restart.
+Under host contention the wizard can appear after 90 seconds; the launcher now
+waits up to 180 seconds for that window and up to another 240 seconds for the
+project/listener. If startup still fails, the sanitized service reason
+distinguishes early Java exit, an unexpected Burp window, and no visible
+wizard. The three-start systemd burst limit prevents endless retries.
 If the wizard changes in a later release, the service fails rather than
 claiming that capture is ready.
 
@@ -128,6 +133,38 @@ starting capture for another tracked package. Already captured TrafficStore
 exchanges remain available. The idle status is then `BURP_RUNNING`, not
 `BRIDGE_CONNECTED`; a new target session establishes the latter after its
 first authenticated extension heartbeat.
+
+## Temporary Runtime Retention
+
+Community uses an in-memory project; TrafficStore, not Burp history, is the
+recoverable capture record. A crash can leave a launcher-created
+`burp-runtime/tmp/community-*` directory behind. Review it with:
+
+```bash
+hackbot burp temp-plan
+```
+
+The dry run checks only exact launcher directory names, a 24-hour age grace,
+bounded tree size, and estimated bytes. It can run while Burp is active. For
+cleanup, first stop `bughunter-burp.service` during a planned capture outage,
+confirm no BugHunter capture session depends on it, and run:
+
+```bash
+hackbot burp temp-run <review-id> --confirmed
+```
+
+Cleanup requires the recent review, a stopped service, no matching runtime
+process, and unchanged directory contents. The launcher and collector share a
+runtime lock, so a new launcher cannot enter during cleanup after this version
+is deployed. The cleanup is audited and does not restart Burp. Never run it
+against the active `community-*` directory. Burp `data/`, Java-created
+`burp*.tmp`, browser profiles, saved reports, and TrafficStore are deliberately
+excluded; do not manually delete them as a substitute for evidence retention.
+The lock-aware launcher was activated by a controlled Burp-only restart on
+2026-10-16. The four proxy listeners returned on loopback and a nonblocking
+exclusive lock attempt failed while the service was running. Recheck those
+conditions after any future launcher replacement; a file match alone does not
+prove that the running process has acquired the lock.
 
 ## Security And Community Limits
 

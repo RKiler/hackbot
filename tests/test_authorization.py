@@ -55,6 +55,12 @@ class AuthorizationSpecialistTests(unittest.TestCase):
             methodName="test_create_verify_facts_cleanup_and_no_repeat")
         self.fx.setUp()
         self.addCleanup(self.fx.doCleanups)
+        self.fx.executor.settings = replace(
+            self.fx.executor.settings,
+            connect_timeout_seconds=10,
+            read_timeout_seconds=30,
+            overall_timeout_seconds=120,
+        )
         aliases = ("tenant_a_admin", "tenant_a_member", "tenant_b_admin")
         bindings = tuple(SecretBindingConfig(
             "ref:fixture_cookie_" + alias,
@@ -170,7 +176,18 @@ class AuthorizationSpecialistTests(unittest.TestCase):
         result = self.fx.factory.resolve(
             package_id=self.fx.package.id, recipe_id="project_a", identity_id=owner.id,
             tenant_id=tenant.id, session_id=session.id, purpose="Authorization fixture")
-        self.assertEqual(result.outcome, "READY")
+        diagnostics = None
+        if result.outcome != "READY" and result.item is not None:
+            with self.fx.store._connection() as db:
+                row = db.execute(
+                    "SELECT o.reason_code,x.state,x.failure_reason FROM test_object_operations o "
+                    "LEFT JOIN traffic_exchanges x ON x.exchange_id=o.exchange_id "
+                    "WHERE o.test_object_id=? ORDER BY o.created_at DESC LIMIT 1",
+                    (result.item.id,),
+                ).fetchone()
+                diagnostics = tuple(row) if row is not None else None
+        self.assertEqual(result.outcome, "READY",
+                         f"{result.reason}; local operation={diagnostics}")
         return owner, session, tenant, result.item
 
     def test_no_object_or_owner_request_produces_no_candidate_and_no_traffic(self):

@@ -133,7 +133,8 @@ class PostgresReconRepository:
             raise ConfigError("Install the optional recon PostgreSQL driver") from None
 
         def connect() -> Any:
-            connection = psycopg2.connect(dsn, cursor_factory=RealDictCursor)
+            connection = psycopg2.connect(dsn, cursor_factory=RealDictCursor,
+                                          connect_timeout=3)
             connection.autocommit = True
             return connection
 
@@ -172,6 +173,13 @@ class PostgresReconRepository:
         finally:
             if connection is not None:
                 connection.close()
+
+    def probe(self) -> bool:
+        """Check recon connectivity without reading target data or writing state."""
+        rows = self._read(
+            "SELECT current_setting('transaction_read_only') AS read_only LIMIT 1", ()
+        )
+        return len(rows) == 1 and rows[0].get("read_only") == "on"
 
     def _limit(self, limit: int) -> int:
         if type(limit) is not int or limit <= 0:

@@ -127,8 +127,8 @@ class ConsoleNotifier:
 
     def send(self, message: NotificationMessage) -> None:
         self._logger.info("notification sent", extra={"context": {
-            "event_id": message.event_id, "title": safe_text(message.title, limit=120),
-            "body": safe_text(message.body, limit=800)}})
+            "event_id": message.event_id if re.fullmatch(r"NOTIF-[0-9a-f]{32}",
+                                                        message.event_id) else "[invalid]"}})
 
 
 _DEFAULT_EVENTS = (

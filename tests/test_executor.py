@@ -4,12 +4,14 @@ from dataclasses import replace
 from datetime import timedelta, datetime, timezone
 import base64
 import binascii
+from functools import cache
 import gzip
 import hashlib
 import http.client
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 import threading
 import time
@@ -18,8 +20,8 @@ import unittest
 from hackbot.artifacts import ArtifactStore
 from hackbot.auth import AuthContextManager, AuthMechanism, AuthStatus
 from hackbot.browser import BrowserSessionManager, IdentityObservation, IdentityVerificationRule
-from hackbot.config import (BrowserSettings, ExecutorSettings, SecretBindingConfig,
-                            SecretSettings, StoreSettings)
+from hackbot.config import (BrowserSettings, ExecutorSettings, RetentionSettings,
+                            SecretBindingConfig, SecretSettings, StoreSettings)
 from hackbot.domxss import DOMAcquisitionStatus, DOMXSSSpecialist
 from hackbot.domxss_store import DOMXSSStore
 from hackbot.executor import (ExecutionError, ProxyRoute, RequestTemplate, TrafficExecutor)
@@ -42,6 +44,16 @@ from hackbot.traffic import AuthState, ExchangeState, TrafficStore
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
 SECRET = "fixture-cookie=very-private-test-value"
+
+
+@cache
+def _empty_executor_schema() -> TemporaryDirectory:
+    directory = TemporaryDirectory()
+    root = Path(directory.name)
+    blobs = root / "blobs"
+    EvidenceFactStore(root / "state/bughunter.sqlite3", ArtifactStore(blobs),
+                      StoreSettings(blobs)).initialize()
+    return directory
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -520,7 +532,7 @@ class FakeTargets:
         return self.package if self.package.id == package_id else None
 
 
-class ExecutorTests(unittest.TestCase):
+class ExecutorFixture(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -563,6 +575,9 @@ class ExecutorTests(unittest.TestCase):
         )
         self.targets = FakeTargets(self.package)
         blobs = self.root / "blobs"
+        database = self.root / "state/bughunter.sqlite3"
+        database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(Path(_empty_executor_schema().name) / "state/bughunter.sqlite3", database)
         self.store = EvidenceFactStore(self.root / "state/bughunter.sqlite3",
                                        ArtifactStore(blobs), StoreSettings(blobs))
         self.store.initialize()
@@ -589,8 +604,8 @@ class ExecutorTests(unittest.TestCase):
             targets=self.targets, policy=self.policy, permits=self.permits,
             rate=self.rate, traffic=self.traffic, auth=self.auth, secrets=self.provider,
             settings=ExecutorSettings(allow_direct=True, max_response_bytes=1024,
-                                      connect_timeout_seconds=0.2, read_timeout_seconds=0.2,
-                                      overall_timeout_seconds=2),
+                                      connect_timeout_seconds=5, read_timeout_seconds=10,
+                                      overall_timeout_seconds=60),
             browser=self.browser,
         )
 
@@ -622,6 +637,18 @@ class ExecutorTests(unittest.TestCase):
         self.browser.verify(session.id, rule)
         return identity, session
 
+class ExecutorTests(ExecutorFixture):
+    def test_empty_schema_seed_keeps_fixture_databases_isolated(self):
+        other = ExecutorFixture(methodName="runTest")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        self.assertNotEqual(self.store.db_path, other.store.db_path)
+        with self.store._connection() as db:
+            db.execute("CREATE TABLE fixture_isolation (marker TEXT)")
+        with other.store._connection() as db:
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE name='fixture_isolation'").fetchone())
+
     def test_plain_request_fingerprint_remains_backward_compatible(self):
         url = self.base + "/fixture"
         expected = hashlib.sha256(json.dumps(
@@ -642,6 +669,13 @@ class ExecutorTests(unittest.TestCase):
                               (action.id,)).fetchall()
         self.assertEqual([row[0] for row in rows], ["EXECUTION_REQUESTED", "EXECUTION_FAILED"])
         permit = self.executor.authorize(action, template)
+        with self.store._connection() as db:
+            issued, expires = db.execute(
+                "SELECT issued_at,expires_at FROM executor_permits WHERE permit_id=?",
+                (permit.id,),
+            ).fetchone()
+        self.assertEqual(datetime.fromisoformat(expires) - datetime.fromisoformat(issued),
+                         timedelta(seconds=30))
         wrong = replace(permit, target_id="TARGET-" + "9" * 32)
         self.assertEqual(self.executor.execute(action, wrong, template).error, ExecutionError.PERMIT_DENIED)
         wrong_identity = replace(permit, identity_id="IDENTITY-" + "8" * 32)
@@ -658,17 +692,36 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(self.traffic.get_exchange(good.exchange_ids[0]).state, ExchangeState.COMPLETE)
 
     def test_protected_asset_capture_is_typed_and_local_only(self):
+        self.executor.retention = RetentionSettings(js_artifact_hours=24, source_map_hours=48)
         action = self.action("/assets/app.js")
+        started = datetime.now(timezone.utc)
         result = self.run_action(action, artifact_capture_kind="JS")
         self.assertIsNone(result.error)
         self.assertIsNotNone(result.artifact_evidence_id)
         self.assertIn(b"fixture-secret", self.store.read_content(
             result.artifact_evidence_id, allow_sensitive=True))
         self.assertEqual(len(result.exchange_ids), 1)
+        js_evidence = self.store.get_evidence(result.artifact_evidence_id)
+        self.assertEqual(js_evidence.metadata["retention_class"], "REGENERABLE")
+        self.assertTrue(js_evidence.retention.retain)
+        self.assertLessEqual(started + timedelta(hours=24), js_evidence.retention.expires_at)
+        self.assertLessEqual(js_evidence.retention.expires_at,
+                             datetime.now(timezone.utc) + timedelta(hours=24))
 
         map_action = self.action("/assets/app.js.map")
+        map_started = datetime.now(timezone.utc)
         source_map = self.run_action(map_action, artifact_capture_kind="SOURCE_MAP")
         self.assertIsNotNone(source_map.artifact_evidence_id)
+        map_evidence = self.store.get_evidence(source_map.artifact_evidence_id)
+        self.assertEqual(map_evidence.metadata["retention_class"], "REGENERABLE")
+        self.assertLessEqual(map_started + timedelta(hours=48), map_evidence.retention.expires_at)
+        self.assertLessEqual(map_evidence.retention.expires_at,
+                             datetime.now(timezone.utc) + timedelta(hours=48))
+
+        exposure = self.run_action(self.action("/fixture/config.json"), artifact_capture_kind="EXPOSURE")
+        exposure_evidence = self.store.get_evidence(exposure.artifact_evidence_id)
+        self.assertIsNone(exposure_evidence.retention.expires_at)
+        self.assertNotIn("retention_class", exposure_evidence.metadata)
         fallback = self.run_action(self.action("/assets/fallback.js"), artifact_capture_kind="JS")
         self.assertIsNone(fallback.artifact_evidence_id)
         invalid = self.run_action(self.action("/assets/app.js"), artifact_capture_kind="SOURCE_MAP")
@@ -697,6 +750,7 @@ class ExecutorTests(unittest.TestCase):
         first = specialist.acquire(self.package.id, asset)
         self.assertEqual(first.status, DOMAcquisitionStatus.RETRIEVED)
         self.assertEqual(first.artifact.artifact_sha256, digest)
+        self.assertIsNotNone(self.store.get_evidence(first.artifact.evidence_id).retention.expires_at)
         self.assertEqual(len(first.exchange_ids), 1)
         self.assertEqual(len(self.server.received), 1)
         second = specialist.acquire(self.package.id, asset)
@@ -704,10 +758,31 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(len(self.server.received), 1)
         source_map = specialist.acquire_source_map(self.package.id, asset, first.artifact)
         self.assertEqual(source_map.status, DOMAcquisitionStatus.RETRIEVED)
+        self.assertIsNotNone(self.store.get_evidence(source_map.source_map.evidence_id).retention.expires_at)
         self.assertEqual(len(self.server.received), 2)
         reused_map = specialist.acquire_source_map(self.package.id, asset, first.artifact)
         self.assertEqual(reused_map.status, DOMAcquisitionStatus.REUSED)
         self.assertEqual(len(self.server.received), 2)
+
+        with self.store._connection() as db:
+            retired_at = (datetime.now(timezone.utc) + timedelta(days=91)).isoformat()
+            for evidence_id in (first.artifact.evidence_id, source_map.source_map.evidence_id):
+                db.execute(
+                    "INSERT INTO evidence_payload_retirements "
+                    "(evidence_id,retired_at,retention_class,actor,reason) "
+                    "VALUES (?,?,?,?,?)",
+                    (evidence_id, retired_at, "REGENERABLE", "fixture", "expired-asset"),
+                )
+        refreshed = specialist.acquire(self.package.id, asset)
+        self.assertEqual(refreshed.status, DOMAcquisitionStatus.RETRIEVED)
+        self.assertEqual(refreshed.artifact.artifact_id, first.artifact.artifact_id)
+        self.assertNotEqual(refreshed.artifact.evidence_id, first.artifact.evidence_id)
+        self.assertEqual(len(self.server.received), 3)
+        refreshed_map = specialist.acquire_source_map(self.package.id, asset, refreshed.artifact)
+        self.assertEqual(refreshed_map.status, DOMAcquisitionStatus.RETRIEVED)
+        self.assertEqual(refreshed_map.source_map.map_id, source_map.source_map.map_id)
+        self.assertNotEqual(refreshed_map.source_map.evidence_id, source_map.source_map.evidence_id)
+        self.assertEqual(len(self.server.received), 4)
 
     def test_scope_policy_change_and_redirects(self):
         out = self.action("/redirect-out")
@@ -796,6 +871,8 @@ class ExecutorTests(unittest.TestCase):
             self.assertIsNone(exposure.error)
             self.assertTrue(exposure.truncated)
             self.assertIsNone(exposure.artifact_evidence_id)
+        self.executor.settings = replace(self.executor.settings, connect_timeout_seconds=0.2,
+                                         read_timeout_seconds=0.2, overall_timeout_seconds=2)
         timeout = self.run_action(self.action("/sleep"))
         self.assertEqual(timeout.error, ExecutionError.TIMEOUT)
         self.assertEqual(self.traffic.get_exchange(timeout.exchange_ids[0]).state, ExchangeState.TIMEOUT)
@@ -858,30 +935,41 @@ class ExecutorTests(unittest.TestCase):
 
     def test_shared_rate_concurrency_blocks_second_request(self):
         self.targets.package = replace(self.package, rate=replace(self.package.rate, max_concurrency=1))
-        first_action = self.action("/sleep")
+        first_action = self.action()
         first_template = RequestTemplate("GET", first_action.url)
         first_permit = self.executor.authorize(first_action, first_template)
         outcome = []
+        reserved = threading.Event()
+        release = threading.Event()
+
+        def hold_reserved_slot(_exchange_id):
+            reserved.set()
+            return release.wait(timeout=60)
+
         worker = threading.Thread(target=lambda: outcome.append(
-            self.executor.execute(first_action, first_permit, first_template)), daemon=True)
+            self.executor.execute(first_action, first_permit, first_template,
+                                  on_dispatch=hold_reserved_slot)), daemon=True)
         worker.start()
-        for _ in range(100):
-            if self.server.received:
-                break
-            time.sleep(0.005)
-        self.assertEqual(len(self.server.received), 1)
-        second_action = self.action()
-        second_template = RequestTemplate("GET", second_action.url)
-        # The shared Phase 13 limiter denies issuance or execution while first is in flight.
         try:
-            second_permit = self.executor.authorize(second_action, second_template)
-        except PermitError:
-            second_permit = None
-        if second_permit is not None:
-            self.assertIn(self.executor.execute(second_action, second_permit, second_template).error,
-                          {ExecutionError.POLICY_DENIED, ExecutionError.RATE_LIMITED})
+            self.assertTrue(reserved.wait(timeout=60))
+            self.assertEqual(self.server.received, [])
+            second_action = self.action()
+            second_template = RequestTemplate("GET", second_action.url)
+            # The shared Phase 13 limiter denies issuance or execution while first is in flight.
+            try:
+                second_permit = self.executor.authorize(second_action, second_template)
+            except PermitError:
+                second_permit = None
+            if second_permit is not None:
+                self.assertIn(self.executor.execute(second_action, second_permit, second_template).error,
+                              {ExecutionError.POLICY_DENIED, ExecutionError.RATE_LIMITED})
+            self.assertEqual(self.server.received, [])
+        finally:
+            release.set()
+            worker.join(timeout=60)
+        self.assertFalse(worker.is_alive())
         self.assertEqual(len(self.server.received), 1)
-        worker.join(timeout=2)
+        self.assertEqual((outcome[0].error, outcome[0].status_code), (None, 200))
         self.assertFalse(worker.is_alive())
 
     def test_template_header_validation(self):

@@ -16,7 +16,7 @@ from typing import Any
 ANALYZER_VERSION = "1.1.0"
 MAX_ASSET_BYTES = 1_048_576
 MAX_CANDIDATES = 16
-ANALYSIS_TIMEOUT_SECONDS = 5
+ANALYSIS_TIMEOUT_SECONDS = 20
 _SOURCE_HINT = re.compile(
     rb"location|document\.(?:URL|documentURI|referrer)|window\.name|"
     rb"URLSearchParams|(?:router|route)\.(?:query|params)|(?:event|messageEvent)\.data"
@@ -154,7 +154,9 @@ class DOMStaticAnalyzer:
             if process.returncode != 0 or len(process.stdout) > 262_144:
                 return empty(DOMCandidateStatus.PARSE_FAILED.value, "PARSER_UNAVAILABLE_OR_LIMIT")
             parsed = json.loads(process.stdout)
-        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        except subprocess.TimeoutExpired:
+            return empty(DOMCandidateStatus.PARSE_FAILED.value, "PARSER_TIMEOUT")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return empty(DOMCandidateStatus.PARSE_FAILED.value, "PARSER_UNAVAILABLE_OR_LIMIT")
         if not isinstance(parsed, dict) or parsed.get("parse_error"):
             return empty(DOMCandidateStatus.PARSE_FAILED.value, "MALFORMED_JAVASCRIPT")

@@ -438,6 +438,9 @@ class JSAPIPage:
     truncated: bool
 
 
+_API_AST_TIMEOUT_SECONDS = 20
+
+
 def extract_js_api_page(body: bytes, *, offset: int = 0) -> JSAPIPage:
     if (not isinstance(body, bytes) or len(body) > MAX_JS_BYTES or
             type(offset) is not int or not 0 <= offset <= 1024):
@@ -445,7 +448,8 @@ def extract_js_api_page(body: bytes, *, offset: int = 0) -> JSAPIPage:
     with as_file(files("hackbot").joinpath("api_ast.cjs")) as script:
         try:
             process = subprocess.run(["node", str(script), "--page", str(offset)],
-                                     input=body, capture_output=True, timeout=5,
+                                     input=body, capture_output=True,
+                                     timeout=_API_AST_TIMEOUT_SECONDS,
                                      check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError("JavaScript AST extractor unavailable") from exc
@@ -499,7 +503,7 @@ def extract_js_api_artifacts(body: bytes) -> tuple[tuple[tuple[str, int], ...],
     with as_file(files("hackbot").joinpath("api_ast.cjs")) as script:
         try:
             process = subprocess.run(["node", str(script)], input=body, capture_output=True,
-                                     timeout=5, check=False)
+                                     timeout=_API_AST_TIMEOUT_SECONDS, check=False)
             if process.returncode or len(process.stdout) > 500000:
                 return (), ()
             result = json.loads(process.stdout)

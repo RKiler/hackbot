@@ -16,7 +16,7 @@ from hackbot.evidence import EvidenceProvenance, EvidenceType, FactStatus
 from hackbot.identity import AccountSource, IdentityStatus, MembershipStatus
 from hackbot.identity_registry import IdentityRegistry, RegistryConflict
 from hackbot.logging import create_logger
-from hackbot.store import EvidenceFactStore
+from hackbot.store import EvidenceFactStore, StoreSchemaError
 from hackbot.target_loader import TargetPackageError, load_target_package
 from hackbot.target_package import AccountReference
 from hackbot.target_scope import HostRule
@@ -371,9 +371,12 @@ class IdentityRegistryTests(unittest.TestCase):
                      NOW.isoformat(), NOW.isoformat(), None, "INTERNAL"))
             settings = StoreSettings(Path(directory) / "artifacts")
             store = EvidenceFactStore(path, ArtifactStore(settings.artifact_root), settings)
+            with self.assertRaises(StoreSchemaError):
+                IdentityRegistry(store).initialize()
+            store.initialize(allow_existing_migration=True)
             IdentityRegistry(store).initialize()
             with sqlite3.connect(path) as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0], 1)
 
     def test_sqlite_schema_has_no_credential_or_session_columns(self):

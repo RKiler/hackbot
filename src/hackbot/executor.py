@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import hashlib
 import json
@@ -19,9 +19,9 @@ import zlib
 import requests
 
 from .auth import AuthContextManager, AuthMechanism, AuthStatus
-from .config import ExecutorSettings
+from .config import ExecutorSettings, RetentionSettings
 from .domain import TrafficSource, normalize_content_type
-from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
+from .evidence import EvidenceProvenance, EvidenceType, Retention, Sensitivity
 from .logging import SecretRedactor, is_sensitive_key
 from .permit_store import PermitError, PolicyPermitStore
 from .policy import PolicyEngine
@@ -231,7 +231,10 @@ class TrafficExecutor:
                  auth: AuthContextManager, secrets: SecretProvider,
                  settings: ExecutorSettings, proxy: ExecutionProxyProvider | None = None,
                  browser: object | None = None,
-                 token_resolver: TokenResolver | None = None) -> None:
+                 token_resolver: TokenResolver | None = None,
+                 retention: RetentionSettings | None = None) -> None:
+        if retention is not None and not isinstance(retention, RetentionSettings):
+            raise ValueError("Invalid executor retention settings")
         self.targets = targets
         self.policy = policy
         self.permits = permits
@@ -240,6 +243,7 @@ class TrafficExecutor:
         self.auth = auth
         self.secrets = secrets
         self.settings = settings
+        self.retention = retention if retention is not None else RetentionSettings()
         self.proxy = proxy
         self.browser = browser
         self.token_resolver = token_resolver
@@ -507,6 +511,14 @@ class TrafficExecutor:
                             )
                         )
                         if accepted:
+                            asset_retention = Retention()
+                            metadata = {"exchange_id": exchange.id, "asset_kind": artifact_capture_kind}
+                            if artifact_capture_kind in {"JS", "SOURCE_MAP"}:
+                                hours = (self.retention.js_artifact_hours if artifact_capture_kind == "JS"
+                                         else self.retention.source_map_hours)
+                                asset_retention = Retention(
+                                    retain=True, expires_at=datetime.now(timezone.utc) + timedelta(hours=hours))
+                                metadata["retention_class"] = "REGENERABLE"
                             asset_evidence = self.traffic.evidence.create_evidence(
                                 EvidenceType.JS_ASSET if artifact_capture_kind == "JS" else
                                 EvidenceType.SOURCE_MAP if artifact_capture_kind == "SOURCE_MAP" else
@@ -515,7 +527,7 @@ class TrafficExecutor:
                                 provenance=EvidenceProvenance(system="HACKBOT", entity="ASSET_FETCH",
                                                                record_id=exchange.id),
                                 target_ref=current_action.target_id, sensitivity=Sensitivity.SENSITIVE,
-                                metadata={"exchange_id": exchange.id, "asset_kind": artifact_capture_kind},
+                                metadata=metadata, retention=asset_retention,
                             )
                             artifact_evidence_id = asset_evidence.evidence_id
                             evidence_ids.append(asset_evidence.evidence_id)

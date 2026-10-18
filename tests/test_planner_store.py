@@ -354,12 +354,12 @@ class PlannerStoreTests(unittest.TestCase):
             drop_phase29_schema(db)
             db.execute("DROP TABLE planner_candidate_assessments")
             db.execute("PRAGMA user_version=35")
-        self.runtime.store.initialize()
+        self.runtime.store.initialize(allow_existing_migration=True)
         restored = self.store.candidate(run.target_id, run.id, candidate.id)
         self.assertIsNotNone(restored)
         self.assertEqual(restored.assessment.potential_impact, "UNSPECIFIED")
         with sqlite3.connect(self.runtime.store.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 46)
 
     def test_candidate_assessment_is_immutable(self):
         run, (candidate,) = self.portfolio()
@@ -1718,16 +1718,18 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertEqual(self.store.task(run.target_id, run.id, task.id).reason_code,
                          "AMBIGUOUS_RESTART")
 
-    def test_restart_repairs_portfolio_without_tasks_and_relaunches_safe_work(self):
+    def test_restart_repairs_portfolio_without_tasks_but_waits_for_operator(self):
         run, (candidate,) = self.portfolio(mode=PlannerMode.PLAN_ONLY)
         self.assertEqual(self.store.tasks(run.target_id, run.id), ())
         with patch.object(BugHunterRuntime, "launch_planner") as launch:
             restored = BugHunterRuntime(self.runtime.config,
                 driver=SimpleNamespace(name="FAKE"), vnc_ready=lambda: False)
-        launch.assert_called_once_with(self.package.id, run.id)
+        launch.assert_not_called()
         tasks = restored.planner_store.tasks(run.target_id, run.id)
         self.assertEqual([task.task_type for task in tasks], [PlannerTaskType.CREATE_PLAN])
         self.assertEqual(tasks[0].status, PlannerTaskStatus.READY)
+        self.assertEqual(restored.planner_store.get(run.target_id, run.id).status,
+                         PlannerStatus.PAUSED)
 
     def test_restart_does_not_launch_pending_work_after_package_change(self):
         run, (candidate,) = self.portfolio(mode=PlannerMode.PLAN_ONLY)
@@ -1762,13 +1764,15 @@ class PlannerStoreTests(unittest.TestCase):
         with patch.object(BugHunterRuntime, "launch_planner") as launch:
             restored = BugHunterRuntime(self.runtime.config,
                 driver=SimpleNamespace(name="FAKE"), vnc_ready=lambda: False)
-        launch.assert_called_once_with(self.package.id, run.id)
+        launch.assert_not_called()
         tasks = restored.planner_store.tasks(run.target_id, run.id)
         self.assertEqual({task.task_type for task in tasks}, {
             PlannerTaskType.RESOLVE_IDENTITY, PlannerTaskType.CREATE_PLAN,
             PlannerTaskType.RUN_PLAN, PlannerTaskType.VALIDATE_RUN})
         self.assertEqual(restored.planner_store.task(run.target_id, run.id, first.id).status,
                          PlannerTaskStatus.COMPLETED)
+        self.assertEqual(restored.planner_store.get(run.target_id, run.id).status,
+                         PlannerStatus.PAUSED)
 
     def test_restart_advances_independent_branch_without_rebuilding_ambiguous_one(self):
         run = self.store.create(self.package, PlannerMode.BOUNDED_AUTONOMOUS,
@@ -1790,12 +1794,14 @@ class PlannerStoreTests(unittest.TestCase):
         with patch.object(BugHunterRuntime, "launch_planner") as launch:
             restored = BugHunterRuntime(self.runtime.config,
                 driver=SimpleNamespace(name="FAKE"), vnc_ready=lambda: False)
-        launch.assert_called_once_with(self.package.id, run.id)
+        launch.assert_not_called()
         self.assertEqual(restored.planner_store.task(run.target_id, run.id,
                                                     ambiguous.id).reason_code,
                          "AMBIGUOUS_RESTART")
         self.assertEqual(restored.planner_store.task(run.target_id, run.id, safe.id).status,
                          PlannerTaskStatus.READY)
+        self.assertEqual(restored.planner_store.get(run.target_id, run.id).status,
+                         PlannerStatus.PAUSED)
         first_types = {task.task_type for task in restored.planner_store.tasks(
             run.target_id, run.id) if task.candidate_id == first.id}
         self.assertEqual(first_types, {PlannerTaskType.RUN_PLAN})

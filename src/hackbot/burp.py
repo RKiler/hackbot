@@ -268,12 +268,41 @@ class BurpProxyProvider:
 
     def status(self, target_id: str | None = None) -> dict[str, object]:
         available = self.availability()
-        connected = self.bridge_connected(target_id) if target_id is not None else False
-        bindings = self.list_bindings(target_id) if target_id is not None else ()
-        active = tuple(item for item in bindings if item.state == "ACTIVE")
         listener_ports = range(self.settings.listener_start, self.settings.listener_end + 1)
         live_ports = {port for port in listener_ports if self.listener_reachable(port)}
-        reachable = sum(item.proxy_port in live_ports for item in active)
+        if target_id is not None:
+            connected = self.bridge_connected(target_id)
+            bindings = self.list_bindings(target_id)
+            active_ports = tuple(item.proxy_port for item in bindings if item.state == "ACTIVE")
+            dropped_events = last_heartbeat_at = None
+        else:
+            with self.traffic.evidence._connection() as connection:
+                rows = connection.execute(
+                    "SELECT target_id,proxy_port FROM burp_listener_bindings "
+                    "WHERE state='ACTIVE' LIMIT ?", (len(listener_ports) + 1,)).fetchall()
+                active_ports = tuple(row["proxy_port"] for row in rows)
+                targets = tuple(sorted({row["target_id"] for row in rows}))
+                health = connection.execute(
+                    "SELECT target_id,dropped_events,last_seen_at FROM burp_bridge_health "
+                    "WHERE target_id IN (" + ",".join("?" for _ in targets) + ")", targets
+                ).fetchall() if targets else ()
+            dropped_events = sum(row["dropped_events"] for row in health)
+            last_heartbeat_at = max((row["last_seen_at"] for row in health), default=None)
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=90)
+            recent = False
+            for row in health:
+                try:
+                    recent = recent or datetime.fromisoformat(row["last_seen_at"]) >= cutoff
+                except (TypeError, ValueError):
+                    pass
+            connected = False
+            if recent:
+                try:
+                    with socket.create_connection(("127.0.0.1", self.settings.bridge_port), timeout=0.25):
+                        connected = True
+                except OSError:
+                    pass
+        reachable = sum(port in live_ports for port in active_ports)
         installed_version = None
         if self.settings.installation_jar is not None:
             match = re.fullmatch(r"burpsuite_desktop_v([0-9][0-9A-Za-z.-]*)\.jar",
@@ -296,16 +325,13 @@ class BurpProxyProvider:
                     FROM burp_bridge_health WHERE target_id=?""", (target_id,)).fetchone()
                 dropped_events = bridge_row["dropped_events"] if bridge_row else 0
                 last_heartbeat_at = bridge_row["last_seen_at"] if bridge_row else None
-        else:
-            dropped_events = None
-            last_heartbeat_at = None
         state = (CaptureStatus.BURP_UNAVAILABLE if available is BurpAvailability.BURP_NOT_INSTALLED
                  else CaptureStatus.BRIDGE_CONNECTED if connected and reachable
                  else CaptureStatus.BRIDGE_DISCONNECTED if connected or reachable
                  else CaptureStatus.BURP_RUNNING if live_ports
                  else CaptureStatus.BURP_STOPPED)
         return {"availability": available.value, "status": state.value,
-                "bridge_connected": connected, "configured_listeners": len(active),
+                "bridge_connected": connected, "configured_listeners": len(active_ports),
                 "reachable_listeners": reachable, "target_id": target_id,
                 "proxy_listener_capacity": len(listener_ports),
                 "proxy_listeners_reachable": len(live_ports),

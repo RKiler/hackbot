@@ -91,6 +91,9 @@ class PlaywrightBrowserDriver:
     def is_running(self, session_id: str) -> bool:
         return session_id in self._contexts
 
+    def active_session_count(self) -> int:
+        return len(self._contexts)
+
     def apply_imported_session(self, session_id: str, material: SecretValue,
                                allowed_url: Callable[[str], bool]) -> None:
         context = self._contexts.get(session_id)

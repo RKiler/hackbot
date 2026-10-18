@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
 from importlib.resources import files
@@ -14,9 +14,11 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from threading import local
 from typing import Iterator, Mapping
 from urllib.parse import quote
 import uuid
+from weakref import WeakSet
 
 from .artifacts import ArtifactIntegrityError, ArtifactStore
 from .config import AppConfig, StoreSettings
@@ -36,12 +38,40 @@ class StoreSchemaError(RuntimeError):
     pass
 
 
+class _StoreConnection(sqlite3.Connection):
+    """Track cursors so an idle cached connection cannot retain read locks."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._cursors: WeakSet[sqlite3.Cursor] = WeakSet()
+
+    def cursor(self, factory: type[sqlite3.Cursor] | None = None) -> sqlite3.Cursor:
+        cursor = super().cursor(factory) if factory is not None else super().cursor()
+        self._cursors.add(cursor)
+        return cursor
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql: str, seq_of_parameters: object) -> sqlite3.Cursor:
+        return self.cursor().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        return self.cursor().executescript(sql_script)
+
+    def close_cursors(self) -> None:
+        cursors = tuple(self._cursors)
+        self._cursors.clear()
+        for cursor in cursors:
+            cursor.close()
+
+
 _ID_PATTERN = re.compile(r"(?:EV|FA)-[0-9a-f]{32}\Z")
 _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 37
+_SCHEMA_VERSION = 46
 
 
 def _now() -> datetime:
@@ -119,6 +149,18 @@ class EvidenceFactStore:
         self.db_path = db_path.expanduser().resolve(strict=False)
         self.artifacts = artifacts
         self.settings = settings
+        self._connection_state = local()
+
+    def close_idle_connection(self) -> None:
+        """Release this thread's cached SQLite connection before maintenance."""
+        state = self._connection_state
+        if getattr(state, "active", False):
+            raise StoreSchemaError("Cannot close an active store connection")
+        connection = getattr(state, "connection", None)
+        state.connection = None
+        state.identity = None
+        if connection is not None:
+            connection.close()
 
     @classmethod
     def from_config(cls, config: AppConfig) -> EvidenceFactStore:
@@ -126,21 +168,57 @@ class EvidenceFactStore:
             raise ValueError("Store settings are unavailable")
         return cls(
             config.paths.state / "bughunter.sqlite3",
-            ArtifactStore(config.store.artifact_root),
+            ArtifactStore(config.store.artifact_root,
+                          max_blob_bytes=config.resources.max_artifact_bytes
+                          if config.resources else 134_217_728),
             config.store,
         )
 
-    def initialize(self) -> None:
+    def service_schema_status(self) -> dict[str, object]:
+        """Inspect startup compatibility without creating or migrating state."""
+        path = self.db_path
+        result: dict[str, object] = {"expected_schema": _SCHEMA_VERSION,
+                                     "actual_schema": None}
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            return {**result, "state": "UNSAFE_PATH"}
+        if not path.exists():
+            return {**result, "state": "FRESH"}
+        try:
+            uri = "file:" + quote(str(path), safe="/") + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+        except (OSError, sqlite3.Error):
+            return {**result, "state": "UNREADABLE"}
+        result["actual_schema"] = version
+        return {**result, "state": "READY" if version == _SCHEMA_VERSION
+                else "MIGRATION_REQUIRED"}
+
+    def initialize(self, *, allow_existing_migration: bool = False) -> None:
+        self.close_idle_connection()
         self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.db_path.is_symlink() or not self.db_path.parent.is_dir():
             raise StoreSchemaError("Unsafe local database path")
+        fresh = False
+        if not allow_existing_migration:
+            try:
+                fd = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+                             getattr(os, "O_NOFOLLOW", 0), 0o600)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise StoreSchemaError("Cannot prepare local database path") from None
+            else:
+                os.close(fd)
+                fresh = True
         connection = sqlite3.connect(self.db_path)
         try:
-            os.chmod(self.db_path, 0o600)
             connection.execute("PRAGMA foreign_keys=ON")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version > _SCHEMA_VERSION or version < 0:
                 raise StoreSchemaError("Unsupported local store schema version")
+            if not allow_existing_migration and not fresh and version != _SCHEMA_VERSION:
+                raise StoreSchemaError("Existing store requires reviewed schema migration")
+            os.chmod(self.db_path, 0o600)
             for target_version, filename in (
                 (1, "001_evidence_facts.sql"),
                 (2, "002_identity_registry.sql"),
@@ -179,10 +257,37 @@ class EvidenceFactStore:
                 (35, "035_cross_specialist_planner.sql"),
                 (36, "036_planner_candidate_assessment.sql"),
                 (37, "037_notifications_reports.sql"),
+                (38, "038_finding_evidence_hold.sql"),
+                (39, "039_artifact_reference_indexes.sql"),
+                (40, "040_finding_validation_evidence_hold.sql"),
+                (41, "041_evidence_payload_retirement.sql"),
+                (42, "042_traffic_payload_retirement.sql"),
+                (43, "043_traffic_json_reference_index.sql"),
+                (44, "044_evidence_json_reference_index.sql"),
+                (45, "045_research_brief_retirement.sql"),
+                (46, "046_dom_retirement_guards.sql"),
             ):
                 if version >= target_version:
                     continue
                 migration = files("hackbot").joinpath("migrations", filename).read_text()
+                if target_version == 42:
+                    from .traffic_guard_schema import traffic_guard_sql
+                    migration += "\n" + traffic_guard_sql(connection)
+                if target_version == 43:
+                    from .traffic_guard_schema import traffic_json_index_sql
+                    try:
+                        migration += "\n" + traffic_json_index_sql(connection)
+                    except ValueError:
+                        raise StoreSchemaError("Local traffic JSON index cannot be built") from None
+                if target_version == 44:
+                    from .evidence_json_index_schema import evidence_json_index_sql
+                    try:
+                        migration += "\n" + evidence_json_index_sql(connection)
+                    except ValueError:
+                        raise StoreSchemaError("Local Evidence JSON index cannot be built") from None
+                if target_version == 46:
+                    from .dom_guard_schema import dom_guard_sql
+                    migration += "\n" + dom_guard_sql(connection)
                 try:
                     connection.executescript(
                         "BEGIN IMMEDIATE;\n" + migration
@@ -239,12 +344,43 @@ class EvidenceFactStore:
             expected.update({"finding_submission_metadata", "notification_events",
                              "notification_deliveries", "notification_attempts",
                              "report_drafts", "report_attempts"})
+            expected.add("finding_validation_evidence_holds")
+            expected.add("evidence_payload_retirements")
+            expected.add("traffic_payload_retirements")
+            expected.update({"traffic_json_reference_counts", "traffic_json_reference_sources"})
+            expected.update({"evidence_json_reference_counts", "evidence_json_reference_sources"})
+            expected.update({"research_brief_payload_retirements",
+                             "planner_candidate_research_refs",
+                             "planner_event_research_refs"})
+            expected.add("dom_retirement_guard_sources")
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" for _ in expected) + ")",
                 tuple(expected),
             )}
             if tables != expected:
                 raise StoreSchemaError("Local store schema is incomplete")
+            from .traffic_guard_schema import (verify_traffic_retirement_guards,
+                                               verify_traffic_json_index)
+            from .evidence_json_index_schema import verify_evidence_json_index
+            try:
+                verify_traffic_retirement_guards(connection)
+                verify_traffic_json_index(connection)
+            except ValueError:
+                raise StoreSchemaError("Local traffic retirement guards are incomplete") from None
+            try:
+                verify_evidence_json_index(connection)
+            except ValueError:
+                raise StoreSchemaError("Local Evidence JSON reference guards are incomplete") from None
+            from .research_retention import verify_research_retirement_schema
+            try:
+                verify_research_retirement_schema(connection)
+            except ValueError:
+                raise StoreSchemaError("Local research retention guards are incomplete") from None
+            from .dom_guard_schema import verify_dom_retirement_guards
+            try:
+                verify_dom_retirement_guards(connection)
+            except ValueError:
+                raise StoreSchemaError("Local DOM retirement guards are incomplete") from None
         finally:
             connection.close()
 
@@ -252,21 +388,45 @@ class EvidenceFactStore:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         if not self.db_path.is_file() or self.db_path.is_symlink():
             raise StoreNotInitialized("Initialize the local BugHunter store first")
+        state = self._connection_state
+        nested = bool(getattr(state, "active", False))
+        metadata = self.db_path.stat()
+        identity = (os.getpid(), metadata.st_dev, metadata.st_ino)
+        if not nested and getattr(state, "identity", None) != identity:
+            self.close_idle_connection()
         uri = "file:" + quote(str(self.db_path), safe="/") + "?mode=rw"
-        connection = sqlite3.connect(uri, uri=True, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        if connection.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
-            connection.close()
-            raise StoreSchemaError("Unsupported local store schema version")
+        connection = (getattr(state, "connection", None) if not nested else None)
+        if connection is None:
+            connection = sqlite3.connect(uri, uri=True, timeout=5, factory=_StoreConnection)
+            if not nested:
+                state.connection = connection
+                state.identity = identity
+        if not nested:
+            state.active = True
+        reusable = False
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            if connection.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
+                raise StoreSchemaError("Unsupported local store schema version")
             yield connection
+            connection.close_cursors()
             connection.commit()
-        except Exception:
-            connection.rollback()
+            reusable = True
+        except BaseException:
+            try:
+                connection.close_cursors()
+                connection.rollback()
+            except sqlite3.Error:
+                pass
             raise
         finally:
-            connection.close()
+            if nested:
+                connection.close()
+            else:
+                state.active = False
+                if not reusable:
+                    self.close_idle_connection()
 
     def _limit(self, limit: int) -> int:
         if type(limit) is not int or limit <= 0:
@@ -321,33 +481,33 @@ class EvidenceFactStore:
         provenance_json = _json(provenance.to_reference())
         if replaces_evidence_id is not None and self.get_evidence(replaces_evidence_id) is None:
             raise ValueError("Replacement evidence does not exist")
-        if artifact:
-            self.artifacts.put_bytes(content)
-
-        with self._connection() as connection:
-            connection.execute("""
-                INSERT INTO evidence (
-                    evidence_id,evidence_type,target_ref,observed_at,created_at,source,
-                    content_hash,content_kind,content_size,inline_content,artifact_hash,
-                    metadata_json,sensitivity,redaction_status,provenance_json,replaces_evidence_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                evidence_id, name, target_ref, observed.isoformat(), created.isoformat(), source,
-                digest, ContentKind.ARTIFACT.value if artifact else ContentKind.INLINE.value,
-                len(content), None if artifact else content, digest if artifact else None,
-                metadata_json, sensitivity.value, redaction_status.value, provenance_json,
-                replaces_evidence_id,
-            ))
-            connection.execute("""
-                INSERT INTO evidence_policy_events
-                (evidence_id,retain,expires_at,pinned,finding_related,changed_at,actor,reason)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (
-                evidence_id, int(retention.retain),
-                retention.expires_at.isoformat() if retention.expires_at else None,
-                int(retention.pinned), int(retention.finding_related), created.isoformat(),
-                source, "initial",
-            ))
+        with self.artifacts.hold(shared=True) if artifact else nullcontext():
+            if artifact:
+                self.artifacts.put_bytes(content)
+            with self._connection() as connection:
+                connection.execute("""
+                    INSERT INTO evidence (
+                        evidence_id,evidence_type,target_ref,observed_at,created_at,source,
+                        content_hash,content_kind,content_size,inline_content,artifact_hash,
+                        metadata_json,sensitivity,redaction_status,provenance_json,replaces_evidence_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    evidence_id, name, target_ref, observed.isoformat(), created.isoformat(), source,
+                    digest, ContentKind.ARTIFACT.value if artifact else ContentKind.INLINE.value,
+                    len(content), None if artifact else content, digest if artifact else None,
+                    metadata_json, sensitivity.value, redaction_status.value, provenance_json,
+                    replaces_evidence_id,
+                ))
+                connection.execute("""
+                    INSERT INTO evidence_policy_events
+                    (evidence_id,retain,expires_at,pinned,finding_related,changed_at,actor,reason)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    evidence_id, int(retention.retain),
+                    retention.expires_at.isoformat() if retention.expires_at else None,
+                    int(retention.pinned), int(retention.finding_related), created.isoformat(),
+                    source, "initial",
+                ))
         result = self.get_evidence(evidence_id)
         assert result is not None
         return result
@@ -446,17 +606,25 @@ class EvidenceFactStore:
             raise ValueError("Invalid content read limit")
         if record.content_size > max_bytes:
             raise ValueError("Evidence content exceeds explicit read limit")
-        if record.content_kind is ContentKind.ARTIFACT:
-            assert record.artifact_hash is not None
-            content = self.artifacts.get_bytes(record.artifact_hash, max_bytes=max_bytes)
-        else:
+        with self.artifacts.hold(shared=True) if record.content_kind is ContentKind.ARTIFACT else nullcontext():
             with self._connection() as connection:
-                row = connection.execute(
-                    "SELECT inline_content FROM evidence WHERE evidence_id=? LIMIT 1", (evidence_id,)
+                retired = connection.execute(
+                    "SELECT 1 FROM evidence_payload_retirements WHERE evidence_id=? LIMIT 1",
+                    (evidence_id,),
                 ).fetchone()
-            if row is None:
-                raise KeyError("Evidence not found")
-            content = row["inline_content"]
+            if retired is not None:
+                raise FileNotFoundError("Evidence payload was retired by retention policy")
+            if record.content_kind is ContentKind.ARTIFACT:
+                assert record.artifact_hash is not None
+                content = self.artifacts.get_bytes(record.artifact_hash, max_bytes=max_bytes)
+            else:
+                with self._connection() as connection:
+                    row = connection.execute(
+                        "SELECT inline_content FROM evidence WHERE evidence_id=? LIMIT 1", (evidence_id,)
+                    ).fetchone()
+                if row is None:
+                    raise KeyError("Evidence not found")
+                content = row["inline_content"]
         if len(content) != record.content_size or hashlib.sha256(content).hexdigest() != record.content_hash:
             raise ArtifactIntegrityError("Evidence content hash mismatch")
         return content
@@ -472,8 +640,22 @@ class EvidenceFactStore:
         if retention.expires_at is not None:
             _utc(retention.expires_at, "retention expiry")
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             if connection.execute("SELECT 1 FROM evidence WHERE evidence_id=? LIMIT 1", (evidence_id,)).fetchone() is None:
                 raise KeyError("Evidence not found")
+            if connection.execute(
+                "SELECT 1 FROM evidence_payload_retirements WHERE evidence_id=? LIMIT 1",
+                (evidence_id,),
+            ).fetchone() is not None and retention.retain:
+                raise ValueError("Retired Evidence payload cannot be retained")
+            linked = connection.execute(
+                "SELECT 1 FROM finding_evidence WHERE evidence_id=? "
+                "UNION ALL SELECT 1 FROM finding_validation_evidence_holds "
+                "WHERE evidence_id=? LIMIT 1", (evidence_id, evidence_id),
+            ).fetchone() is not None
+            if linked and (not retention.retain or not retention.pinned or
+                           not retention.finding_related or retention.expires_at is not None):
+                raise ValueError("Finding evidence must remain pinned")
             connection.execute("""
                 INSERT INTO evidence_policy_events
                 (evidence_id,retain,expires_at,pinned,finding_related,changed_at,actor,reason)

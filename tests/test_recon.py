@@ -264,6 +264,20 @@ class ReconTests(unittest.TestCase):
         self.assertTrue(self.connection.closed)
         self.assertEqual(self.connection.calls[-1][0], "ROLLBACK")
 
+    def test_probe_requires_read_only_transaction_and_closes_connection(self):
+        self.connection.result = lambda _sql, _params: [{"read_only": "on"}]
+        self.assertTrue(self.repo.probe())
+        self.assertEqual(self.connection.calls[0][0], "BEGIN READ ONLY")
+        self.assertEqual(self.connection.calls[-1][0], "ROLLBACK")
+        self.assertIn("transaction_read_only", self.connection.calls[-2][0])
+        self.assertTrue(self.connection.closed)
+
+    def test_probe_rejects_non_read_only_or_empty_result(self):
+        self.connection.result = lambda _sql, _params: [{"read_only": "off"}]
+        self.assertFalse(self.repo.probe())
+        self.connection.result = lambda _sql, _params: []
+        self.assertFalse(self.repo.probe())
+
     def test_config_reference_and_failure_do_not_expose_dsn(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.toml"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 from io import StringIO
@@ -9,24 +10,35 @@ import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from hackbot.artifacts import ArtifactStore
+from hackbot.backup import BackupError, BackupManager
 from hackbot.auth import AuthContextManager, AuthMechanism
 from hackbot.browser import (BrowserSessionManager, IdentityObservation, IdentityVerificationRule)
 from hackbot.cli import main
-from hackbot.config import BrowserSettings, SecretSettings, StoreSettings
+from hackbot.config import BackupSettings, BrowserSettings, SecretSettings, StoreSettings
 from hackbot.domain import ObservationState, Principal, Role, Tenant, TrafficSource, new_entity_id
 from hackbot.evidence import EvidenceProvenance, EvidenceType, RedactionStatus, Retention, Sensitivity
+from hackbot.evidence_refs import has_evidence_reference
 from hackbot.identity import IdentityStatus, MembershipStatus
 from hackbot.identity_registry import IdentityRegistry
-from hackbot.secrets import RoutedSecretProvider
-from hackbot.store import EvidenceFactStore
+from hackbot.retention import ArtifactGarbageCollector, OrphanPolicy
+from hackbot.secrets import RoutedSecretProvider, SecretValue
+from hackbot.store import EvidenceFactStore, StoreSchemaError
 from hackbot.target_loader import load_target_package
 from hackbot.target_scope import ScopeResult
+from hackbot.traffic_guard_schema import _fields as traffic_reference_fields
 from hackbot.traffic import (AuthState, CapturePacket, CapturedRequest, CapturedResponse,
-                             ExchangeState, TrafficError, TrafficStore)
-from tests.schema_utils import drop_phase28_schema
+                             ExchangeState, TrafficError, TrafficRetentionPolicy, TrafficStore)
+from hackbot.traffic_refs import (TrafficReferenceError,
+                                  has_external_traffic_reference,
+                                  retired_traffic_owner)
+from hackbot.traffic_retention import (TrafficPayloadPolicy,
+                                       TrafficPayloadRetirementManager)
+from tests.schema_utils import (drop_phase28_schema, drop_traffic_json_index_schema,
+                                drop_traffic_retirement_schema)
 
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
@@ -59,6 +71,25 @@ class FakeBrowser:
 
 
 class TrafficTests(unittest.TestCase):
+    def test_direct_traffic_reference_checks_use_indexes(self):
+        checked = 0
+        with self.evidence._connection() as db:
+            for table, columns in traffic_reference_fields(db).items():
+                for column, kind in columns:
+                    if kind == "json":
+                        continue
+                    checked += 1
+                    plan = db.execute(
+                        f'EXPLAIN QUERY PLAN SELECT 1 FROM "{table}" '
+                        f'WHERE "{column}"=? LIMIT 1',
+                        ("EXCHANGE-" + "0" * 32,),
+                    ).fetchall()
+                    self.assertTrue(any("USING COVERING INDEX" in row[3] or
+                                        "USING INDEX" in row[3] for row in plan),
+                                    f"{table}.{column} lacks an indexed lookup: "
+                                    f"{[tuple(row) for row in plan]}")
+        self.assertGreaterEqual(checked, 14)
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -101,6 +132,390 @@ class TrafficTests(unittest.TestCase):
             declared_identity_id=declared,
             anonymous=selected.browser_session_id is None and declared is None,
         )
+
+    def test_configured_retention_stamps_new_exchange_and_evidence(self):
+        policy = TrafficRetentionPolicy(24, 72, 168, {self.target: 48})
+        self.traffic = TrafficStore(self.evidence, self.registry, policy)
+        exchange = self.capture()
+        self.assertEqual(exchange.retention.expires_at, NOW + timedelta(hours=48))
+        for evidence_id in exchange.evidence_ids:
+            self.assertEqual(self.evidence.get_evidence(evidence_id).retention.expires_at,
+                             NOW + timedelta(hours=48))
+        self.assertEqual(policy.for_capture(self.target, AuthState.VERIFIED,
+                                            TrafficSource.BURP, NOW).expires_at,
+                         NOW + timedelta(hours=48))
+        default = TrafficRetentionPolicy(24, 72, 168)
+        self.assertEqual(default.for_capture(self.target, AuthState.ANONYMOUS,
+                                             TrafficSource.BURP, NOW).expires_at,
+                         NOW + timedelta(hours=24))
+        self.assertEqual(default.for_capture(self.target, AuthState.VERIFIED,
+                                             TrafficSource.BURP, NOW).expires_at,
+                         NOW + timedelta(hours=72))
+        self.assertEqual(default.for_capture(self.target, AuthState.ANONYMOUS,
+                                             TrafficSource.HACKBOT, NOW).expires_at,
+                         NOW + timedelta(hours=168))
+
+    def test_explicit_pinned_traffic_retention_overrides_default_policy(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(24, 72, 168))
+        exchange = self.traffic.store_exchange(
+            self.package, self.packet(), source=TrafficSource.FIXTURE,
+            capture_provider="LOCAL_FIXTURE", anonymous=True,
+            retention=Retention(retain=True, pinned=True, finding_related=True),
+        )
+        self.assertTrue(exchange.retention.pinned)
+        self.assertIsNone(exchange.retention.expires_at)
+        for evidence_id in exchange.evidence_ids:
+            self.assertTrue(self.evidence.get_evidence(evidence_id).retention.pinned)
+
+    def test_traffic_owner_reference_exception_keeps_other_links(self):
+        exchange = self.capture()
+        request_id = exchange.request.record.id
+        other_request_id = new_entity_id("REQUEST")
+        with self.evidence._connection() as db:
+            for evidence_id in exchange.evidence_ids:
+                self.assertTrue(has_evidence_reference(db, evidence_id))
+                self.assertFalse(has_evidence_reference(
+                    db, evidence_id, allowed_traffic_request_id=request_id))
+                self.assertTrue(has_evidence_reference(
+                    db, evidence_id, allowed_traffic_request_id=other_request_id))
+            with self.assertRaisesRegex(ValueError, "traffic request ID"):
+                has_evidence_reference(db, exchange.evidence_ids[0],
+                                       allowed_traffic_request_id="REQUEST-invalid")
+
+        response_evidence_id = exchange.response.observation_evidence_id
+        self.evidence.create_evidence(
+            EvidenceType.RECON_RECORD, b"separate durable reference", source="FIXTURE",
+            provenance=EvidenceProvenance("FIXTURE", "test", "linked", NOW, "observed"),
+            replaces_evidence_id=response_evidence_id,
+        )
+        with self.evidence._connection() as db:
+            self.assertTrue(has_evidence_reference(
+                db, response_evidence_id, allowed_traffic_request_id=request_id))
+
+    def test_traffic_exchange_reference_scan_excludes_only_own_rows(self):
+        exchange = self.capture()
+        values = {"exchange_id": exchange.id,
+                  "request_id": exchange.request.record.id,
+                  "response_id": exchange.response.record.id}
+        with self.evidence._connection() as db:
+            self.assertFalse(has_external_traffic_reference(db, **values))
+            with self.assertRaisesRegex(ValueError, "traffic reference ID"):
+                has_external_traffic_reference(db, exchange_id="invalid",
+                                               request_id=values["request_id"])
+            db.execute("CREATE TABLE unrelated_exchange_link "
+                       "(id INTEGER PRIMARY KEY, candidate_exchange_id TEXT)")
+            db.execute("INSERT INTO unrelated_exchange_link(candidate_exchange_id) VALUES (?)",
+                       (exchange.id,))
+            self.assertTrue(has_external_traffic_reference(db, **values))
+            db.execute("DELETE FROM unrelated_exchange_link")
+            db.execute("CREATE TABLE opaque_reference (ids_json TEXT NOT NULL)")
+            db.execute("INSERT INTO opaque_reference(ids_json) VALUES (?)",
+                       (json.dumps({"captured": [exchange.request.record.id]}),))
+            with self.assertRaisesRegex(TrafficReferenceError, "incomplete"):
+                has_external_traffic_reference(db, **values)
+            db.execute("DROP TABLE opaque_reference")
+            role_id = new_entity_id("ROLE")
+            db.execute(
+                "INSERT INTO registry_roles(role_id,target_id,name,observation_state,"
+                "evidence_ids_json,created_at) VALUES (?,?,?,?,?,?)",
+                (role_id, self.target, "traffic-index-fixture", "CONFIGURED",
+                 json.dumps({"captured": [exchange.request.record.id]}), NOW.isoformat()),
+            )
+            self.assertTrue(has_external_traffic_reference(db, **values))
+            escaped = json.dumps({"captured": [exchange.request.record.id]}).replace(
+                "REQUEST-", "\\u0052EQUEST-", 1)
+            db.execute("UPDATE registry_roles SET evidence_ids_json=? WHERE role_id=?",
+                       (escaped, role_id))
+            self.assertTrue(has_external_traffic_reference(db, **values))
+            db.execute("UPDATE registry_roles SET evidence_ids_json='[]' WHERE role_id=?",
+                       (role_id,))
+            self.assertFalse(has_external_traffic_reference(db, **values))
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE registry_roles SET evidence_ids_json='not-json' "
+                           "WHERE role_id=?", (role_id,))
+            db.execute("DELETE FROM registry_roles WHERE role_id=?", (role_id,))
+            self.assertFalse(has_external_traffic_reference(db, **values))
+            db.execute("DROP TRIGGER traffic_json_ref_registry_roles_update")
+            with self.assertRaisesRegex(TrafficReferenceError, "incomplete"):
+                has_external_traffic_reference(db, **values)
+
+    def test_expired_traffic_retirement_is_reviewed_and_keeps_metadata(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture()
+        body_id = exchange.response.body_evidence_id
+        digest = self.evidence.get_evidence(body_id).content_hash
+        manager = TrafficPayloadRetirementManager(
+            self.evidence, TrafficPayloadPolicy(),
+            audit_path=self.root / "logs" / "traffic-retirement.jsonl",
+        )
+        future = time.time() + 48 * 3600
+        plan = manager.plan(now=future)
+        self.assertEqual(plan.exchange_ids, (exchange.id,))
+        self.assertEqual(plan.evidence_count, len(exchange.evidence_ids))
+        self.assertGreater(plan.max_reclaimable_bytes, 0)
+        with self.assertRaisesRegex(ValueError, "explicit confirmation"):
+            manager.run(confirmed=False, now=future)
+        result = manager.run(confirmed=True, now=future)
+        self.assertEqual(result["retired_evidence"], len(exchange.evidence_ids))
+        self.assertEqual(self.traffic.get_exchange(exchange.id).id, exchange.id)
+        for evidence_id in exchange.evidence_ids:
+            with self.assertRaisesRegex(FileNotFoundError, "retired"):
+                self.evidence.read_content(evidence_id, allow_sensitive=True)
+        self.assertTrue(self.evidence.artifacts.path_for(digest).exists())
+        audit = [json.loads(line) for line in
+                 (self.root / "logs" / "traffic-retirement.jsonl").read_text().splitlines()]
+        self.assertEqual([row["stage"] for row in audit], ["STARTED", "COMPLETED"])
+        with self.assertRaisesRegex(ValueError, "recent dry-run review"):
+            manager.run(confirmed=True, now=future)
+
+    def test_traffic_retirement_rechecks_new_evidence_link(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture()
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        future = time.time() + 48 * 3600
+        self.assertEqual(manager.plan(now=future).exchange_ids, (exchange.id,))
+        protected_id = exchange.response.observation_evidence_id
+        self.evidence.create_evidence(
+            EvidenceType.RECON_RECORD, b"linked control", source="FIXTURE",
+            provenance=EvidenceProvenance("FIXTURE", "test", "linked", NOW, "observed"),
+            replaces_evidence_id=protected_id,
+        )
+        self.assertEqual(manager.run(confirmed=True, now=future)["retired_exchanges"], 0)
+        self.assertIsNotNone(self.evidence.read_content(
+            protected_id, allow_sensitive=True))
+
+    def test_traffic_retirement_excludes_pinned_and_external_exchange_links(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture()
+        pinned = self.traffic.store_exchange(
+            self.package, self.packet(response_body=b"pinned"),
+            source=TrafficSource.FIXTURE, capture_provider="LOCAL_FIXTURE",
+            anonymous=True, retention=Retention(retain=True, pinned=True),
+        )
+        with self.evidence._connection() as db:
+            db.execute(
+                "INSERT INTO burp_capture_index "
+                "(target_id,capture_id,request_digest,listener_key,exchange_id,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                (self.target, "held-capture", "a" * 64, "fixture", exchange.id,
+                 NOW.isoformat(), NOW.isoformat()),
+            )
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        plan = manager.plan(now=time.time() + 48 * 3600)
+        self.assertNotIn(exchange.id, plan.exchange_ids)
+        self.assertNotIn(pinned.id, plan.exchange_ids)
+
+    def test_matching_burp_index_preserves_dedupe_without_holding_payload(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        packet = self.packet(response_body=b"burp-retention-fixture")
+        request = self.traffic.store_request(
+            self.package, packet.request, source=TrafficSource.BURP,
+            capture_provider="MONTOYA_V1", provider_reference="retire-capture",
+            anonymous=True,
+        )
+        exchange = self.traffic.store_response(request.id, packet.response)
+        digest = self.evidence.get_evidence(exchange.response.body_evidence_id).content_hash
+        with self.evidence._connection() as db:
+            db.execute(
+                "INSERT INTO burp_capture_index "
+                "(target_id,capture_id,request_digest,response_digest,listener_key,"
+                "exchange_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (self.target, "retire-capture", "a" * 64, "b" * 64,
+                 "127.0.0.1:38080", exchange.id, NOW.isoformat(), NOW.isoformat()),
+            )
+            self.assertFalse(has_external_traffic_reference(
+                db, exchange_id=exchange.id, request_id=exchange.request.record.id,
+                response_id=exchange.response.record.id))
+            self.assertTrue(has_external_traffic_reference(
+                db, exchange_id=exchange.id, request_id=exchange.request.record.id,
+                response_id=new_entity_id("RESPONSE")))
+            db.execute("UPDATE burp_capture_index SET response_digest=NULL WHERE exchange_id=?",
+                       (exchange.id,))
+            self.assertTrue(has_external_traffic_reference(
+                db, exchange_id=exchange.id, request_id=exchange.request.record.id,
+                response_id=exchange.response.record.id))
+            db.execute("UPDATE burp_capture_index SET response_digest=? WHERE exchange_id=?",
+                       ("b" * 64, exchange.id))
+            db.execute(
+                "INSERT INTO burp_capture_index "
+                "(target_id,capture_id,request_digest,response_digest,listener_key,"
+                "exchange_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (self.target, "duplicate-capture", "c" * 64, "d" * 64,
+                 "127.0.0.1:38080", exchange.id, NOW.isoformat(), NOW.isoformat()),
+            )
+            self.assertTrue(has_external_traffic_reference(
+                db, exchange_id=exchange.id, request_id=exchange.request.record.id,
+                response_id=exchange.response.record.id))
+            db.execute("DELETE FROM burp_capture_index WHERE capture_id='duplicate-capture'")
+            db.execute("CREATE TABLE foreign_exchange_ref (exchange_id TEXT)")
+            db.execute("INSERT INTO foreign_exchange_ref(exchange_id) VALUES (?)",
+                       (exchange.id,))
+            self.assertTrue(has_external_traffic_reference(
+                db, exchange_id=exchange.id, request_id=exchange.request.record.id,
+                response_id=exchange.response.record.id))
+            db.execute("DROP TABLE foreign_exchange_ref")
+
+        future = time.time() + 48 * 3600
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        self.assertIn(exchange.id, manager.plan(now=future).exchange_ids)
+        self.assertEqual(manager.run(confirmed=True, now=future)["retired_exchanges"], 1)
+        with self.evidence._connection() as db:
+            self.assertEqual(db.execute(
+                "SELECT exchange_id FROM burp_capture_index WHERE capture_id='retire-capture'"
+            ).fetchone()[0], exchange.id)
+            self.assertIsNotNone(retired_traffic_owner(db, exchange.response.body_evidence_id))
+        gc = ArtifactGarbageCollector(self.evidence, OrphanPolicy(grace_hours=1))
+        self.assertIn(digest, gc.plan(now=future).digests)
+        self.assertGreater(gc.run(confirmed=True, now=future)["removed"], 0)
+        self.assertFalse(self.evidence.artifacts.path_for(digest).exists())
+        with self.evidence._connection() as db:
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM burp_capture_index WHERE exchange_id=?",
+                (exchange.id,),
+            ).fetchone()[0], 1)
+
+    def test_traffic_retention_cli_requires_review_and_confirmation(self):
+        config = self.root / "config.toml"
+        config.write_text(f'[paths]\nroot = "{self.root}"\n'
+                          f'[store]\nartifact_root = "{self.blobs}"\n')
+        out, err = StringIO(), StringIO()
+        code = main(["--config", str(config), "retention", "traffic-plan"],
+                    environ={"HOME": str(self.root)}, stdout=out, stderr=err)
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        self.assertEqual(json.loads(out.getvalue())["class"], "EXPIRED_TRAFFIC_PAYLOAD")
+        out, err = StringIO(), StringIO()
+        code = main(["--config", str(config), "retention", "traffic-run"],
+                    environ={"HOME": str(self.root)}, stdout=out, stderr=err)
+        self.assertEqual(code, 2)
+        self.assertIn("failed or input is invalid", err.getvalue())
+
+    def test_retired_traffic_blob_needs_separate_reviewed_gc(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture(self.packet(response_body=b"traffic-gc-fixture"))
+        digest = self.evidence.get_evidence(exchange.response.body_evidence_id).content_hash
+        path = self.evidence.artifacts.path_for(digest)
+        future = time.time() + 48 * 3600
+        retirement = TrafficPayloadRetirementManager(self.evidence)
+        retirement.plan(now=future)
+        retirement.run(confirmed=True, now=future)
+        self.assertTrue(path.exists())
+        gc = ArtifactGarbageCollector(self.evidence, OrphanPolicy(grace_hours=1))
+        self.assertIn(digest, gc.plan(now=future).digests)
+        gc.run(confirmed=True, now=future)
+        self.assertFalse(path.exists())
+        self.assertIsNotNone(self.traffic.get_exchange(exchange.id))
+        backup = BackupManager(
+            self.evidence, BackupSettings(self.root / "backups", "ALL"),
+            ArtifactStore(self.root / "reports"),
+        )
+        with self.evidence._connection() as db:
+            current, _, _ = backup._artifact_hashes(db, "ALL")
+            legacy, _, _ = backup._artifact_hashes(db, "ALL", selection_version=3)
+        self.assertNotIn(digest, current)
+        self.assertIn(digest, legacy)
+
+        class FixtureKeyProvider:
+            def get(self, _reference):
+                return SecretValue(base64.b64encode(b"k" * 32).decode("ascii"))
+
+        encrypted = BackupManager(
+            self.evidence,
+            BackupSettings(self.root / "encrypted-backups", "ALL",
+                           encryption_secret_ref="fixture_backup_key"),
+            ArtifactStore(self.root / "reports"), FixtureKeyProvider(),
+        )
+        created = encrypted.create()
+        self.assertTrue(encrypted.verify(created.backup_id).verified)
+
+    def test_retired_traffic_shared_and_late_exchange_refs_hold_blob(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        first = self.capture(self.packet(response_body=b"shared-traffic-fixture"))
+        pinned = self.traffic.store_exchange(
+            self.package, self.packet(response_body=b"shared-traffic-fixture"),
+            source=TrafficSource.FIXTURE, capture_provider="LOCAL_FIXTURE",
+            anonymous=True, retention=Retention(retain=True, pinned=True),
+        )
+        self.assertNotEqual(first.id, pinned.id)
+        digest = self.evidence.get_evidence(first.response.body_evidence_id).content_hash
+        future = time.time() + 48 * 3600
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        self.assertIn(first.id, manager.plan(now=future).exchange_ids)
+        manager.run(confirmed=True, now=future)
+        gc = ArtifactGarbageCollector(self.evidence, OrphanPolicy(grace_hours=1))
+        self.assertNotIn(digest, gc.plan(now=future).digests)
+        self.assertTrue(self.evidence.artifacts.path_for(digest).exists())
+
+        other = self.capture(self.packet(response_body=b"late-exchange-link"))
+        late_digest = self.evidence.get_evidence(other.response.body_evidence_id).content_hash
+        other_manager = TrafficPayloadRetirementManager(
+            self.evidence, review_path=self.root / "other-traffic-review.json")
+        self.assertIn(other.id, other_manager.plan(now=future).exchange_ids)
+        self.assertEqual(other_manager.run(confirmed=True, now=future)["retired_exchanges"], 1)
+        with self.evidence._connection() as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "retired TrafficStore"):
+                db.execute(
+                    "INSERT INTO burp_capture_index "
+                    "(target_id,capture_id,request_digest,listener_key,exchange_id,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (self.target, "late-capture", "b" * 64, "fixture", other.id,
+                     NOW.isoformat(), NOW.isoformat()),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "retired TrafficStore"):
+                db.execute(
+                    "UPDATE traffic_exchanges SET declared_tenant_ids_json=? "
+                    "WHERE exchange_id=?",
+                    (json.dumps([other.id]), first.id),
+                )
+            owner = retired_traffic_owner(db, other.response.body_evidence_id)
+            self.assertIsNotNone(owner)
+            self.assertFalse(has_external_traffic_reference(
+                db, exchange_id=owner.exchange_id, request_id=owner.request_id,
+                response_id=owner.response_id))
+            self.assertFalse(has_evidence_reference(
+                db, other.response.body_evidence_id,
+                allowed_traffic_request_id=owner.request_id))
+            self.assertFalse(ArtifactGarbageCollector._referenced(db, late_digest))
+        self.assertTrue(self.evidence.artifacts.path_for(late_digest).exists())
+        backup = BackupManager(
+            self.evidence, BackupSettings(self.root / "backups", "ALL"),
+            ArtifactStore(self.root / "reports"),
+        )
+        with self.evidence._connection() as db:
+            selected, _, _ = backup._artifact_hashes(db, "ALL")
+        self.assertIn(digest, selected)
+        self.assertNotIn(late_digest, selected)
+
+    def test_new_unguarded_traffic_reference_schema_blocks_cleanup(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture()
+        future = time.time() + 48 * 3600
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        manager.plan(now=future)
+        manager.run(confirmed=True, now=future)
+        with self.evidence._connection() as db:
+            db.execute("CREATE TABLE late_exchange_reference "
+                       "(id INTEGER PRIMARY KEY, exchange_id TEXT)")
+            db.execute("INSERT INTO late_exchange_reference(exchange_id) VALUES (?)",
+                       (exchange.id,))
+        with self.assertRaisesRegex(ValueError, "link guards are incomplete"):
+            ArtifactGarbageCollector(self.evidence).plan(now=future)
+        with self.assertRaisesRegex(StoreSchemaError, "traffic retirement guards"):
+            self.evidence.initialize()
+        backup = BackupManager(
+            self.evidence, BackupSettings(self.root / "backups", "ALL"),
+            ArtifactStore(self.root / "reports"),
+        )
+        with self.evidence._connection() as db:
+            with self.assertRaisesRegex(BackupError, "reference schema requires review"):
+                backup._artifact_hashes(db, "ALL")
 
     def session(self, alias, *, user=None, expected=None, tenant="tenant-a"):
         identity = self.registry.register_identity(self.target, alias, status=IdentityStatus.ACTIVE)
@@ -425,7 +840,7 @@ class TrafficTests(unittest.TestCase):
 
     def test_schema_indexes_migration_and_no_production_dependency(self):
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             indexes = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'traffic_%'")}
             for name in ("traffic_exchanges_target_recent_idx", "traffic_exchanges_identity_recent_idx",
@@ -489,11 +904,82 @@ class TrafficTests(unittest.TestCase):
             connection.execute("DROP TABLE traffic_requests")
             connection.execute("ALTER TABLE browser_sessions DROP COLUMN proxy_capture_required")
             connection.execute("PRAGMA user_version=4")
+        self.evidence.initialize(allow_existing_migration=True)
         self.traffic.initialize()
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
             self.assertEqual(connection.execute("SELECT package_id FROM registry_targets WHERE target_id=?",
                                                 (self.target,)).fetchone()[0], self.package.id)
+
+    def test_schema_41_upgrade_preserves_traffic_and_installs_retirement_guards(self):
+        self.traffic = TrafficStore(self.evidence, self.registry,
+                                    TrafficRetentionPolicy(1, 1, 1))
+        exchange = self.capture()
+        values = {"exchange_id": exchange.id,
+                  "request_id": exchange.request.record.id,
+                  "response_id": exchange.response.record.id}
+        with sqlite3.connect(self.db) as connection:
+            drop_traffic_retirement_schema(connection)
+            connection.execute(
+                "INSERT INTO registry_roles(role_id,target_id,name,observation_state,"
+                "evidence_ids_json,created_at) VALUES (?,?,?,?,?,?)",
+                (new_entity_id("ROLE"), self.target, "pre-index-reference", "CONFIGURED",
+                 json.dumps([exchange.id]), NOW.isoformat()),
+            )
+            connection.execute("PRAGMA user_version=41")
+        with self.assertRaisesRegex(StoreSchemaError, "reviewed schema migration"):
+            self.evidence.initialize()
+        self.evidence.initialize(allow_existing_migration=True)
+        self.assertIsNotNone(self.traffic.get_exchange(exchange.id))
+        with self.evidence._connection() as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertTrue(has_external_traffic_reference(connection, **values))
+            self.assertIn("retired_traffic_link_burp_capture_index_insert", {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'")})
+        manager = TrafficPayloadRetirementManager(self.evidence)
+        future = time.time() + 48 * 3600
+        self.assertNotIn(exchange.id, manager.plan(now=future).exchange_ids)
+        with self.evidence._connection() as connection:
+            connection.execute("DELETE FROM registry_roles WHERE target_id=? AND name=?",
+                               (self.target, "pre-index-reference"))
+        self.assertIn(exchange.id, manager.plan(now=future).exchange_ids)
+        self.assertEqual(manager.run(confirmed=True, now=future)["retired_exchanges"], 1)
+
+    def test_schema_42_upgrade_backfills_legacy_json_reference(self):
+        exchange = self.capture()
+        values = {"exchange_id": exchange.id,
+                  "request_id": exchange.request.record.id,
+                  "response_id": exchange.response.record.id}
+        with sqlite3.connect(self.db) as connection:
+            drop_traffic_json_index_schema(connection)
+            connection.execute("PRAGMA user_version=42")
+            connection.execute(
+                "INSERT INTO registry_roles(role_id,target_id,name,observation_state,"
+                "evidence_ids_json,created_at) VALUES (?,?,?,?,?,?)",
+                (new_entity_id("ROLE"), self.target, "legacy-json-reference",
+                 "CONFIGURED", json.dumps([exchange.request.record.id]), NOW.isoformat()),
+            )
+            self.assertTrue(has_external_traffic_reference(connection, **values))
+        self.evidence.initialize(allow_existing_migration=True)
+        with self.evidence._connection() as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
+            self.assertTrue(has_external_traffic_reference(connection, **values))
+
+    def test_schema_42_upgrade_refuses_invalid_json_without_advancing(self):
+        with sqlite3.connect(self.db) as connection:
+            drop_traffic_json_index_schema(connection)
+            connection.execute(
+                "INSERT INTO registry_roles(role_id,target_id,name,observation_state,"
+                "evidence_ids_json,created_at) VALUES (?,?,?,?,?,?)",
+                (new_entity_id("ROLE"), self.target, "invalid-pre-index-json",
+                 "CONFIGURED", "not-json", NOW.isoformat()),
+            )
+            connection.execute("PRAGMA user_version=42")
+        with self.assertRaisesRegex(StoreSchemaError, "JSON index cannot be built"):
+            self.evidence.initialize(allow_existing_migration=True)
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 42)
 
 
 if __name__ == "__main__":

@@ -148,6 +148,70 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(len(brief["sources"]), 2)
         web.search.assert_called_once()
 
+    def test_external_failure_is_persisted_when_local_brief_survives(self):
+        weak = SourceMaterial(SourceType.SKILL, "GraphQL hint", "Local skill",
+                              "Implementation detail: authorization depends on the resolver.")
+        web = Mock()
+        web.search.side_effect = RuntimeError("Authorization: Bearer fixture-secret")
+        runner = ResearchCoordinator(
+            self.store, local_providers=(ManualResearchProvider((weak,)),),
+            web_provider=web)
+        request = runner.submit(self.gap, external=True)
+        result = runner.run(self.gap, request["request_id"])
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertIsNotNone(result["brief_id"])
+        record = self.store.request(self.target_id, request["request_id"])
+        self.assertEqual(record["error_code"], "EXTERNAL_PROVIDER_UNAVAILABLE")
+        self.assertEqual(self.store.typed_request(
+            self.target_id, request["request_id"]).usage["searches"], 1)
+        self.assertNotIn("fixture-secret", json.dumps(record))
+        self.runtime.config = replace(
+            self.runtime.config, research=replace(self.runtime.config.research, enabled=True))
+        self.runtime.research = runner
+        degraded = self.runtime.operations()
+        self.assertEqual(degraded["components"]["research_external"], "DEGRADED")
+        self.assertIn("RESEARCH_PROVIDER_UNAVAILABLE", degraded["warnings"])
+
+        web.search.side_effect = None
+        web.search.return_value = (self.vendor,)
+        recovered_request = runner.submit(self.gap, external=True, refresh=True)
+        recovered_result = runner.run(self.gap, recovered_request["request_id"])
+        self.assertEqual(recovered_result["status"], "COMPLETED")
+        recovered = self.runtime.operations()
+        self.assertEqual(recovered["components"]["research_external"], "OK")
+        self.assertNotIn("RESEARCH_PROVIDER_UNAVAILABLE", recovered["warnings"])
+
+    def test_local_failure_remains_visible_when_external_research_succeeds(self):
+        local = Mock()
+        local.search.side_effect = RuntimeError("Cookie: fixture-secret")
+        web = Mock()
+        web.search.return_value = (self.vendor,)
+        runner = ResearchCoordinator(
+            self.store, local_providers=(local,), web_provider=web)
+        request = runner.submit(self.gap, external=True)
+        result = runner.run(self.gap, request["request_id"])
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertEqual(self.store.request(
+            self.target_id, request["request_id"])["error_code"],
+            "LOCAL_PROVIDER_UNAVAILABLE")
+        self.runtime.config = replace(
+            self.runtime.config, research=replace(self.runtime.config.research, enabled=True))
+        self.runtime.research = runner
+        degraded = self.runtime.operations()
+        self.assertEqual(degraded["components"]["research_local"], "DEGRADED")
+        self.assertEqual(degraded["components"]["research_external"], "OK")
+        self.assertIn("RESEARCH_LOCAL_PROVIDER_UNAVAILABLE", degraded["warnings"])
+        self.assertNotIn("fixture-secret", json.dumps(degraded))
+
+        local.search.side_effect = None
+        local.search.return_value = (self.vendor,)
+        recovered_request = runner.submit(self.gap, external=True, refresh=True)
+        self.assertEqual(runner.run(self.gap, recovered_request["request_id"])["status"],
+                         "COMPLETED")
+        recovered = self.runtime.operations()
+        self.assertEqual(recovered["components"]["research_local"], "OK")
+        self.assertNotIn("RESEARCH_LOCAL_PROVIDER_UNAVAILABLE", recovered["warnings"])
+
     def test_conflicting_sources_are_preserved_with_citations(self):
         first = SourceMaterial(SourceType.OWASP, "Control guidance", "OWASP",
             "Control: requires an object-level authorization check at every resolver.",

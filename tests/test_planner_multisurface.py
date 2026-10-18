@@ -248,7 +248,7 @@ class PlannerMultisurfaceTests(unittest.TestCase):
                       and item.test_object_id == object_a.id)
 
         limits = PlannerLimits(requests=20, browser_actions=0, candidates=2,
-                               per_specialist=2, cleanup_reserve=2)
+                               per_specialist=2, cleanup_reserve=2, seconds=1800)
         run = self.planner_store.create(self.package, PlannerMode.BOUNDED_AUTONOMOUS,
                                         limits, policy_version(self.package))
         self.planner_store.transition(self.target, run.id, PlannerStatus.LOADING_CONTEXT,
@@ -350,7 +350,7 @@ class PlannerMultisurfaceTests(unittest.TestCase):
         run = self.planner.start(
             self.package, mode=PlannerMode.BOUNDED_AUTONOMOUS,
             limits=PlannerLimits(requests=20, browser_actions=0, candidates=1,
-                                 per_specialist=1, cleanup_reserve=2))
+                                 per_specialist=1, cleanup_reserve=2, seconds=1800))
         candidate = next(item for item in self.planner_store.candidates(
             self.target, run.id, limit=20) if item.source_id == source.id)
         self.assertEqual(candidate.status, CandidateStatus.SELECTED)

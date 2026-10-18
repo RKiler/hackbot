@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+from threading import RLock
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
@@ -329,6 +330,7 @@ class BrowserSessionManager:
         self.driver = driver
         self.settings = settings
         self.profiles = ProfileStore(settings.profile_root)
+        self.profile_lifecycle_lock = RLock()
         self.verifier = verifier or ExactSessionVerifier()
         if not isinstance(driver.name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", driver.name):
             raise BrowserError("Invalid browser driver name")
@@ -437,6 +439,13 @@ class BrowserSessionManager:
     def start(self, session_id: str, *, proxy: BrowserProxyConfig = BrowserProxyConfig(),
               package: TargetPackage | None = None,
               proxy_health_check: Callable[[BrowserProxyConfig], bool] | None = None) -> BrowserSession:
+        with self.profile_lifecycle_lock:
+            return self._start_locked(session_id, proxy=proxy, package=package,
+                                      proxy_health_check=proxy_health_check)
+
+    def _start_locked(self, session_id: str, *, proxy: BrowserProxyConfig,
+                      package: TargetPackage | None,
+                      proxy_health_check: Callable[[BrowserProxyConfig], bool] | None) -> BrowserSession:
         session = self._required(session_id)
         if session.driver != self.driver.name:
             raise BrowserError("Browser driver does not match stored session")

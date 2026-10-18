@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import socket
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -20,15 +21,21 @@ from unittest.mock import Mock, patch
 from hackbot.browser import IdentityObservation
 from hackbot.api_registry import APICandidate, APIOperationType
 from hackbot.config import (BrowserSettings, BurpSettings, SecretBindingConfig,
-                            SecretSettings, TargetSettings, load_config)
+                            SecretSettings, TargetSettings, ResourceSettings, load_config)
+from hackbot.burp_storage import BurpStorageStatus
 from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
 from hackbot.postmessage_static import PostMessageStaticAnalyzer
+from hackbot.resources import ResourceError
+from hackbot.research import GapType, KnowledgeGap, ResearchBudget, ResearchStatus
 from hackbot.service import BugHunterRuntime, create_app
+from hackbot.store import EvidenceFactStore, StoreSchemaError
 from hackbot.planner_models import PlannerLimits, PlannerMode, PlannerStatus
+from hackbot.process_health import OwnedProcessStatus
 from hackbot.notification_store import DeliveryStatus, NotificationPriority, NotificationType
 from hackbot.policy import policy_version
 from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
+from tests.schema_utils import drop_phase28_schema
 
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
@@ -58,6 +65,18 @@ class FakeDriver:
 
 
 class ServiceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        temporary = TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        config = load_config(environ={"HOME": str(root), "XDG_CONFIG_HOME": str(root),
+                                      "XDG_STATE_HOME": str(root)})
+        store = EvidenceFactStore.from_config(config)
+        store.initialize()
+        cls._empty_schema = store.db_path
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -68,7 +87,11 @@ class ServiceTests(unittest.TestCase):
                                     "XDG_STATE_HOME": str(root)})
         self.config = replace(base, targets=TargetSettings(targets), browser=BrowserSettings(
             profile_root=root / "profiles", display=":901",
-            vnc_url="http://127.0.0.1:6901/vnc.html"))
+            vnc_url="http://127.0.0.1:6901/vnc.html"),
+            resources=ResourceSettings(min_available_memory_bytes=0))
+        state = self.config.paths.state
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(self._empty_schema, state / "bughunter.sqlite3")
         self.driver = FakeDriver()
         self.runtime = BugHunterRuntime(self.config, driver=self.driver, vnc_ready=lambda: True)
         self.app = create_app(runtime=self.runtime)
@@ -80,6 +103,27 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()
 
+    def test_runtime_rejects_old_existing_schema_without_migration(self):
+        database = self.runtime.store.db_path
+        with sqlite3.connect(database) as connection:
+            drop_phase28_schema(connection)
+            connection.execute("PRAGMA user_version=34")
+        before = hashlib.sha256(database.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(StoreSchemaError, "reviewed schema migration"):
+            BugHunterRuntime(self.config, driver=FakeDriver(), vnc_ready=lambda: True)
+        self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 34)
+
+    def test_runtime_wires_dom_retention_periods(self):
+        configured = replace(self.config, retention=replace(
+            self.config.retention, js_artifact_hours=24, source_map_hours=48))
+        runtime = BugHunterRuntime(configured, driver=FakeDriver(), vnc_ready=lambda: True)
+        self.assertEqual(runtime.domxss_store.js_retention_hours, 24)
+        self.assertEqual(runtime.domxss_store.source_map_retention_hours, 48)
+        self.assertEqual(runtime.executor.retention.js_artifact_hours, 24)
+        self.assertEqual(runtime.executor.retention.source_map_hours, 48)
+
     def test_safe_overview_targets_scope_burp_and_pagination(self):
         self.assertEqual(self.get("/v1/health")["checks"]["traffic_store"], "ok")
         self.assertEqual(self.get("/v1/overview")["targets"], 1)
@@ -90,6 +134,428 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/targets?limit=999").status_code, 400)
         self.assertEqual(self.client.get("/v1/targets/not-here").status_code, 404)
         self.assertEqual(self.client.get("/v1/evidence/EV-invalid?target=example").status_code, 400)
+
+    def test_operations_snapshot_is_local_and_reports_missing_backup(self):
+        data = self.get("/v1/operations")
+        self.assertIn("burp_storage", data)
+        self.assertEqual(data["burp_storage"]["state"], "DISABLED")
+        self.assertEqual(data["components"]["burp_storage"], "DISABLED")
+        self.assertEqual(data["storage"]["schema_actual"], data["storage"]["schema_expected"])
+        self.assertEqual(data["backup"]["state"], "MISSING")
+        self.assertIn("BACKUP_MISSING", data["warnings"])
+        self.assertEqual(data["counts"]["evidence"], 0)
+        self.assertEqual(data["storage"]["artifact_count"], 0)
+        self.assertIn("browser_reauth_required", data["counts"])
+        self.assertIn("processes", data)
+        self.assertEqual(data["recon"], "DISCONNECTED")
+        self.assertEqual(data["components"]["state_database"], "OK")
+        self.assertEqual(data["components"]["artifact_store"], "OK")
+        self.assertEqual(data["components"]["recon"], "DISABLED")
+        self.assertEqual(data["components"]["research_external"], "DISABLED")
+        self.assertEqual(data["retention"]["traffic"]["anonymous_hours"], 720)
+        self.assertEqual(data["retention"]["traffic"]["payload_cleanup"], "CLI_REVIEWED")
+        self.assertEqual(data["retention"]["traffic"]["physical_gc"], "SEPARATE_REVIEW")
+        self.assertIsNotNone(self.runtime.traffic.retention_policy)
+
+    def test_operations_warns_for_owned_display_orphan_and_blocks_profile_cleanup(self):
+        orphan = OwnedProcessStatus(
+            "OK", {"bughunter-agent.service": 1, "bughunter-burp.service": 0,
+                   "bughunter-vnc.service": 1}, (), (), (101,), (201,), (101,))
+        with patch("hackbot.service.inspect_owned_processes", return_value=orphan):
+            self.assertFalse(self.runtime._profile_process_safe())
+            data = self.get("/v1/operations")
+        self.assertIn("SUSPECTED_DISPLAY_ORPHAN", data["warnings"])
+        self.assertEqual(data["processes"]["vnc_display_pids"], [201])
+
+        expected = OwnedProcessStatus(
+            "OK", {"bughunter-agent.service": 1, "bughunter-burp.service": 0,
+                   "bughunter-vnc.service": 1}, (), (), (), (201,), ())
+        with patch("hackbot.service.inspect_owned_processes", return_value=expected):
+            self.assertTrue(self.runtime._profile_process_safe())
+            healthy = self.get("/v1/operations")
+            self.runtime._vnc_ready = lambda: False
+            disconnected = self.get("/v1/operations")
+        self.assertNotIn("SUSPECTED_DISPLAY_ORPHAN", healthy["warnings"])
+        self.assertIn("SUSPECTED_DISPLAY_ORPHAN", disconnected["warnings"])
+
+    def test_operations_degrades_incomplete_burp_storage_inventory(self):
+        self.runtime.config = replace(
+            self.runtime.config,
+            burp=replace(self.runtime.config.burp, enabled=True),
+        )
+        incomplete = BurpStorageStatus("PARTIAL", 3, 1, 1, 1, 17, 17, 0, 0)
+        with patch("hackbot.service.inspect_burp_storage", return_value=incomplete):
+            data = self.get("/v1/operations")
+        self.assertEqual(data["components"]["burp_storage"], "DEGRADED")
+        self.assertIn("BURP_STORAGE_INVENTORY_INCOMPLETE", data["warnings"])
+        self.assertEqual(data["burp_storage"]["data_estimated_bytes"], 17)
+        self.assertNotIn(str(self.runtime.config.burp.runtime_root), json.dumps(data["burp_storage"]))
+
+    def test_operations_exposes_configured_cpu_load_warning(self):
+        self.runtime.resources.settings = replace(
+            self.runtime.resources.settings,
+            high_load_per_cpu=4.0,
+            critical_load_per_cpu=8.0,
+        )
+        self.runtime.resources._load_per_cpu = lambda: 5.0
+        data = self.get("/v1/operations")
+        self.assertEqual(data["resources"]["load_per_cpu"], 5.0)
+        self.assertIn("HIGH_LOAD", data["warnings"])
+        self.assertEqual(data["state"], "DEGRADED")
+
+    def test_optional_status_failures_degrade_operations_without_exposing_errors(self):
+        self.runtime.config = replace(
+            self.runtime.config,
+            burp=replace(self.runtime.config.burp, enabled=True))
+        with (patch.object(self.runtime.burp, "status",
+                           side_effect=RuntimeError("Authorization: Bearer DO_NOT_LOG")),
+              patch.object(self.runtime.notifications, "status",
+                           side_effect=RuntimeError("password=DO_NOT_LOG"))):
+            data = self.get("/v1/operations")
+        self.assertEqual(data["components"]["burp"], "FAILED")
+        self.assertEqual(data["components"]["notifier"], "DEGRADED")
+        self.assertIn("BURP_DOWN", data["warnings"])
+        self.assertIn("NOTIFIER_FAILURE", data["warnings"])
+        self.assertNotIn("DO_NOT_LOG", json.dumps(data))
+
+    def test_inflight_notification_is_visible_as_degraded(self):
+        event = self.runtime.notification_store.enqueue(
+            target_id=self.target, event_type=NotificationType.TEST,
+            source_kind="TEST", source_id="TEST-" + uuid.uuid4().hex,
+            priority=NotificationPriority.LOW,
+        )
+        self.runtime.notification_store.prepare_deliveries(event.id, ("fixture",))
+        claimed = self.runtime.notification_store.claim("fixture")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0].status, DeliveryStatus.SENDING)
+
+        operations = self.get("/v1/operations")
+        self.assertEqual(operations["notifications"]["delivery"]["sending"], 1)
+        self.assertEqual(operations["components"]["notifier"], "DEGRADED")
+        self.assertIn("NOTIFIER_FAILURE", operations["warnings"])
+        self.assertEqual(self.get("/v1/health")["checks"]["notifier"], "degraded")
+
+    def test_research_provider_configuration_is_not_reported_as_verified(self):
+        self.runtime.config = replace(
+            self.runtime.config,
+            research=replace(self.runtime.config.research, enabled=True))
+        self.runtime.research.web_provider = object()
+        data = self.get("/v1/operations")
+        self.assertEqual(data["components"]["research_local"], "UNVERIFIED")
+        self.assertEqual(data["components"]["research_external"], "UNVERIFIED")
+
+    def test_recent_research_provider_failure_warns_without_network_probe(self):
+        self.runtime.config = replace(
+            self.runtime.config,
+            research=replace(self.runtime.config.research, enabled=True))
+        self.runtime.research.web_provider = object()
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        gap = KnowledgeGap("hypothesis:HYP-" + "a" * 32, self.target,
+                           GapType.UNKNOWN_PROTOCOL, "fixture research gap", None,
+                           "authorization", "api", None, 50)
+        request_id = self.runtime.research_store.create_request(
+            gap, ResearchBudget(), external=True, private_target=False,
+            cache_key="fixture:" + "a" * 64)
+        self.runtime.research_store.record_usage(
+            request_id, searches=1, sources=0, source_bytes=0,
+            input_tokens=0, output_tokens=0)
+        self.runtime.research_store.transition(
+            request_id, ResearchStatus.FAILED,
+            error_code="EXTERNAL_PROVIDER_UNAVAILABLE")
+        data = self.get("/v1/operations")
+        self.assertEqual(data["components"]["research"], "DEGRADED")
+        self.assertEqual(data["components"]["research_external"], "DEGRADED")
+        self.assertIn("RESEARCH_PROVIDER_UNAVAILABLE", data["warnings"])
+        with self.runtime.store._connection() as db:
+            db.execute("UPDATE research_requests SET updated_at=? WHERE request_id=?",
+                       ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+                        request_id))
+        stale = self.get("/v1/operations")
+        self.assertEqual(stale["components"]["research_external"], "DEGRADED")
+        self.assertIn("RESEARCH_PROVIDER_UNAVAILABLE", stale["warnings"])
+        recovered_id = self.runtime.research_store.create_request(
+            gap, ResearchBudget(), external=True, private_target=False,
+            cache_key="fixture:" + "b" * 64)
+        self.runtime.research_store.record_usage(
+            recovered_id, searches=1, sources=1, source_bytes=100,
+            input_tokens=20, output_tokens=10)
+        self.runtime.research_store.transition(recovered_id, ResearchStatus.COMPLETED)
+        recovered = self.get("/v1/operations")
+        self.assertEqual(recovered["components"]["research_external"], "OK")
+        self.assertNotIn("RESEARCH_PROVIDER_UNAVAILABLE", recovered["warnings"])
+
+    def test_legacy_provider_failure_does_not_blame_an_unidentified_provider(self):
+        self.runtime.config = replace(
+            self.runtime.config,
+            research=replace(self.runtime.config.research, enabled=True))
+        self.runtime.research.web_provider = object()
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        gap = KnowledgeGap("hypothesis:HYP-" + "c" * 32, self.target,
+                           GapType.UNKNOWN_PROTOCOL, "fixture research gap", None,
+                           "authorization", "api", None, 50)
+        request_id = self.runtime.research_store.create_request(
+            gap, ResearchBudget(), external=True, private_target=False,
+            cache_key="fixture:" + "e" * 64)
+        self.runtime.research_store.record_usage(
+            request_id, searches=1, sources=0, source_bytes=0,
+            input_tokens=0, output_tokens=0)
+        self.runtime.research_store.transition(
+            request_id, ResearchStatus.PARTIAL, error_code="PROVIDER_UNAVAILABLE")
+        state = self.get("/v1/operations")
+        self.assertEqual(state["components"]["research"], "DEGRADED")
+        self.assertEqual(state["components"]["research_local"], "UNVERIFIED")
+        self.assertEqual(state["components"]["research_external"], "UNVERIFIED")
+        self.assertIn("RESEARCH_PROVIDER_UNAVAILABLE", state["warnings"])
+        self.assertNotIn("RESEARCH_LOCAL_PROVIDER_UNAVAILABLE", state["warnings"])
+
+    def test_interrupted_research_is_degraded_until_a_later_completed_request(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        gap = KnowledgeGap("hypothesis:HYP-" + "b" * 32, self.target,
+                           GapType.UNKNOWN_PROTOCOL, "fixture research gap", None,
+                           "authorization", "api", None, 50)
+        failed_id = self.runtime.research_store.create_request(
+            gap, ResearchBudget(), external=False, private_target=False,
+            cache_key="fixture:" + "c" * 64)
+        self.runtime.research_store.transition(
+            failed_id, ResearchStatus.PARTIAL, error_code="INTERRUPTED")
+        degraded = self.get("/v1/operations")
+        self.assertEqual(degraded["components"]["research"], "DEGRADED")
+        self.assertEqual(degraded["components"]["research_local"], "UNVERIFIED")
+        self.assertIn("RESEARCH_EXECUTION_FAILURE", degraded["warnings"])
+
+        recovered_id = self.runtime.research_store.create_request(
+            gap, ResearchBudget(), external=False, private_target=False,
+            cache_key="fixture:" + "d" * 64)
+        self.runtime.research_store.transition(recovered_id, ResearchStatus.COMPLETED)
+        recovered = self.get("/v1/operations")
+        self.assertEqual(recovered["components"]["research"], "OK")
+        self.assertNotIn("RESEARCH_EXECUTION_FAILURE", recovered["warnings"])
+
+    def test_operations_stays_readable_when_storage_budget_is_unavailable(self):
+        with patch.object(self.runtime.resources, "snapshot",
+                          side_effect=ResourceError("REQUIRED_MOUNT_UNAVAILABLE")):
+            data = self.get("/v1/operations")
+            self.assertEqual(data["state"], "BLOCKED")
+            self.assertIn("REQUIRED_MOUNT_UNAVAILABLE", data["warnings"])
+            self.assertEqual(data["resources"]["disk_free_bytes"], 0)
+
+    def test_startup_rejects_missing_required_mount_before_sqlite_creation(self):
+        mount = Path(self.temp.name) / "unmounted"
+        root = mount / "bughunter"
+        root.mkdir(parents=True)
+        config = replace(self.config, paths=replace(self.config.paths, root=root),
+                         resources=ResourceSettings(required_mount=str(mount)))
+        with patch("hackbot.resources.os.path.ismount", return_value=False):
+            with self.assertRaisesRegex(ResourceError, "REQUIRED_MOUNT_UNAVAILABLE"):
+                BugHunterRuntime(config, driver=self.driver, vnc_ready=lambda: True)
+        self.assertFalse((root / "state" / "bughunter.sqlite3").exists())
+
+    def test_startup_rejects_off_mount_artifacts_before_sqlite_creation(self):
+        mount = Path(self.temp.name) / "mounted"
+        root = mount / "bughunter"
+        root.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside-artifacts"
+        config = replace(self.config, paths=replace(self.config.paths, root=root),
+                         store=replace(self.config.store, artifact_root=outside),
+                         resources=ResourceSettings(required_mount=str(mount)))
+        with patch("hackbot.resources.os.path.ismount", return_value=True):
+            with self.assertRaisesRegex(ResourceError, "ARTIFACT_STORAGE_OUTSIDE_REQUIRED_MOUNT"):
+                BugHunterRuntime(config, driver=self.driver, vnc_ready=lambda: True)
+        self.assertFalse((root / "state" / "bughunter.sqlite3").exists())
+
+    def test_startup_accepts_required_mount_with_state_and_artifacts_on_it(self):
+        mount = Path(self.temp.name) / "mounted"
+        root = mount / "bughunter"
+        root.mkdir(parents=True)
+        artifact_root = root / "artifacts" / "evidence"
+        config = replace(self.config, paths=replace(self.config.paths, root=root),
+                         store=replace(self.config.store, artifact_root=artifact_root),
+                         resources=ResourceSettings(required_mount=str(mount)))
+        with patch("hackbot.resources.os.path.ismount", return_value=True):
+            runtime = BugHunterRuntime(config, driver=self.driver, vnc_ready=lambda: True)
+        self.assertTrue(runtime.store.db_path.is_file())
+        self.assertTrue(artifact_root.is_dir())
+
+    def test_startup_rejects_artifact_symlink_escaping_required_mount(self):
+        mount = Path(self.temp.name) / "mounted"
+        root = mount / "bughunter"
+        root.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside-artifacts"
+        outside.mkdir()
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+        config = replace(self.config, paths=replace(self.config.paths, root=root),
+                         store=replace(self.config.store, artifact_root=root / "linked" / "evidence"),
+                         resources=ResourceSettings(required_mount=str(mount)))
+        with patch("hackbot.resources.os.path.ismount", return_value=True):
+            with self.assertRaisesRegex(ResourceError, "ARTIFACT_STORAGE_OUTSIDE_REQUIRED_MOUNT"):
+                BugHunterRuntime(config, driver=self.driver, vnc_ready=lambda: True)
+        self.assertFalse((root / "state" / "bughunter.sqlite3").exists())
+
+    def test_recon_probe_is_cached_and_failure_degrades_without_crashing(self):
+        repo = Mock()
+        repo.probe.return_value = True
+        self.runtime.recon = repo
+        self.assertEqual(self.get("/v1/operations")["recon"], "OK")
+        self.assertEqual(self.get("/v1/health")["checks"]["recon"], "OK")
+        repo.probe.assert_called_once_with()
+
+        repo.probe.side_effect = RuntimeError("password=DO_NOT_LOG")
+        self.runtime._recon_probe_until = 0.0
+        operations = self.get("/v1/operations")
+        self.assertEqual(operations["recon"], "DISCONNECTED")
+        self.assertIn("RECON_DISCONNECTED", operations["warnings"])
+        health = self.get("/v1/health")
+        self.assertEqual(health["status"], "degraded")
+        self.assertEqual(health["checks"]["recon"], "DISCONNECTED")
+        self.assertNotIn("DO_NOT_LOG", json.dumps(operations) + json.dumps(health))
+
+    def test_readiness_distinguishes_essential_and_optional_failures(self):
+        self.assertEqual(self.get("/v1/ready")["state"], "READY")
+        repo = Mock()
+        repo.probe.return_value = False
+        self.runtime.recon = repo
+        degraded = self.get("/v1/ready")
+        self.assertEqual(degraded["state"], "DEGRADED")
+        self.assertEqual(degraded["checks"]["recon"], "FAILED")
+
+        original_root = self.runtime.store.artifacts.root
+        self.runtime.store.artifacts.root = original_root / "missing"
+        try:
+            response = self.client.get("/v1/ready")
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.get_json()["state"], "NOT_READY")
+        finally:
+            self.runtime.store.artifacts.root = original_root
+
+    def test_liveness_stays_responsive_when_local_store_fails(self):
+        with patch.object(self.runtime.store, "_connection", side_effect=OSError("secret")):
+            response = self.client.get("/v1/health")
+            self.assertEqual(response.status_code, 200)
+            result = response.get_json()
+            self.assertEqual(result["status"], "degraded")
+            self.assertEqual(result["checks"]["bughunter_store"], "failed")
+            self.assertNotIn("secret", response.get_data(as_text=True))
+
+    def test_operations_maintenance_is_explicit_and_local_only(self):
+        self.assertEqual(self.get("/v1/operations/maintenance")["status"], "IDLE")
+        missing_confirmation = self.client.post("/v1/operations/maintenance",
+                                                json={"action": "RETENTION_RUN"})
+        self.assertEqual(missing_confirmation.status_code, 400)
+        self.assertEqual(missing_confirmation.get_json()["reason_code"], "CONFIRMATION_REQUIRED")
+        unsafe_id = self.client.post("/v1/operations/maintenance",
+                                     json={"action": "BACKUP_VERIFY", "backup_id": "../state"})
+        self.assertEqual(unsafe_id.status_code, 400)
+        started = self.client.post("/v1/operations/maintenance",
+                                   json={"action": "RETENTION_PLAN"})
+        self.assertEqual(started.status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        finished = self.get("/v1/operations/maintenance")
+        self.assertEqual(finished["status"], "COMPLETED")
+        self.assertEqual(finished["result"]["candidate_count"], 0)
+        denied = self.client.post("/v1/operations/maintenance",
+                                  json={"action": "RETENTION_RUN", "confirmed": True,
+                                        "review_id": finished["id"]})
+        self.assertEqual(denied.status_code, 400)
+        self.assertEqual(denied.get_json()["reason_code"], "REVIEW_REQUIRED")
+
+    def test_operations_profile_retention_uses_terminal_anonymous_fixture_only(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        session = self.runtime.browser.create(self.target)
+        self.runtime.browser.start(session.id)
+        self.runtime.browser.stop(session.id)
+        path = self.runtime.browser.profiles.path(session)
+        (path / "cache.bin").write_bytes(b"ephemeral")
+        old = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        with self.runtime.store._connection() as db:
+            db.execute("UPDATE browser_sessions SET created_at=?,updated_at=? WHERE session_id=?",
+                       (old, old, session.id))
+        self.runtime.maintenance.profiles.process_safe = lambda: True
+        started = self.client.post("/v1/operations/maintenance", json={"action": "PROFILE_PLAN"})
+        self.assertEqual(started.status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        planned = self.get("/v1/operations/maintenance")
+        self.assertEqual(planned["result"]["candidate_count"], 1)
+        self.assertEqual(self.client.post("/v1/operations/maintenance",
+                                          json={"action": "PROFILE_RUN"}).status_code, 400)
+        self.assertTrue(path.exists())
+        started = self.client.post("/v1/operations/maintenance",
+                                   json={"action": "PROFILE_RUN", "confirmed": True,
+                                         "review_id": planned["id"]})
+        self.assertEqual(started.status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        self.assertEqual(self.get("/v1/operations/maintenance")["result"]["removed"], 1)
+        self.assertFalse(path.exists())
+
+    def test_operations_disabled_profile_retention_is_identity_bound(self):
+        from hackbot.auth import AuthMechanism
+        from hackbot.identity import IdentityStatus
+
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        identity = self.runtime.registry.register_identity(
+            self.target, "disabled_profile_fixture", status=IdentityStatus.ACTIVE)
+        self.runtime.auth.prepare(self.target, identity.id,
+                                  mechanism=AuthMechanism.MANUAL_LOGIN)
+        session = self.runtime.browser.create(self.target, identity.id)
+        self.runtime.browser.start(session.id)
+        self.runtime.browser.stop(session.id)
+        path = self.runtime.browser.profiles.path(session)
+        (path / "cache.bin").write_bytes(b"sensitive session fixture")
+        self.runtime.registry.disable_identity(identity.id)
+        old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        with self.runtime.store._connection() as db:
+            db.execute("UPDATE registry_identities SET created_at=?,updated_at=? WHERE identity_id=?",
+                       (old, old, identity.id))
+            db.execute("UPDATE browser_sessions SET created_at=?,updated_at=? WHERE session_id=?",
+                       (old, old, session.id))
+        self.runtime.maintenance.profiles.process_safe = lambda: True
+        action = {"action": "DISABLED_PROFILE_PLAN", "target_id": self.target,
+                  "identity_id": identity.id}
+        self.assertEqual(self.client.post("/v1/operations/maintenance", json=action).status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        reviewed = self.get("/v1/operations/maintenance")
+        self.assertEqual(reviewed["result"]["candidate_count"], 1)
+        action = {"action": "DISABLED_PROFILE_RUN", "target_id": self.target,
+                  "identity_id": identity.id, "review_id": reviewed["id"], "confirmed": True}
+        self.assertEqual(self.client.post("/v1/operations/maintenance", json=action).status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        self.assertEqual(self.get("/v1/operations/maintenance")["result"]["removed"], 1)
+        self.assertFalse(path.exists())
+
+    def test_operations_named_profile_retention_requires_exact_review(self):
+        from hackbot.auth import AuthMechanism
+        from hackbot.identity import IdentityStatus
+
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        identity = self.runtime.registry.register_identity(
+            self.target, "named_profile_fixture", status=IdentityStatus.ACTIVE)
+        self.runtime.auth.prepare(self.target, identity.id,
+                                  mechanism=AuthMechanism.MANUAL_LOGIN)
+        session = self.runtime.browser.create(self.target, identity.id)
+        self.runtime.browser.start(session.id)
+        self.runtime.browser.stop(session.id)
+        path = self.runtime.browser.profiles.path(session)
+        (path / "cache.bin").write_bytes(b"owned session fixture")
+        old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        with self.runtime.store._connection() as db:
+            db.execute("UPDATE browser_sessions SET created_at=?,updated_at=? WHERE session_id=?",
+                       (old, old, session.id))
+        self.runtime.maintenance.profiles.process_safe = lambda: True
+        action = {"action": "NAMED_PROFILE_PLAN", "target_id": self.target,
+                  "identity_id": identity.id, "session_id": session.id}
+        self.assertEqual(self.client.post("/v1/operations/maintenance", json=action).status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        reviewed = self.get("/v1/operations/maintenance")
+        self.assertEqual(reviewed["result"]["candidate_count"], 1)
+        bad = {**action, "action": "NAMED_PROFILE_RUN", "review_id": reviewed["id"],
+               "confirmed": True, "session_id": "BSESSION-" + "0" * 32}
+        self.assertEqual(self.client.post("/v1/operations/maintenance", json=bad).status_code, 400)
+        self.assertTrue(path.exists())
+        action.update({"action": "NAMED_PROFILE_RUN", "review_id": reviewed["id"],
+                       "confirmed": True})
+        self.assertEqual(self.client.post("/v1/operations/maintenance", json=action).status_code, 202)
+        self.runtime.maintenance.wait_for_test()
+        self.assertEqual(self.get("/v1/operations/maintenance")["result"]["removed"], 1)
+        self.assertFalse(path.exists())
 
     def test_phase29_private_report_and_notification_routes(self):
         self.assertEqual(self.get("/v1/reports?target=example")["items"], [])

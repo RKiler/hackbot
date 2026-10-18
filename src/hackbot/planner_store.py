@@ -189,7 +189,9 @@ class PlannerStore:
                         if kind == "RESEARCH":
                             exists = db.execute(
                                 "SELECT 1 FROM research_briefs b JOIN research_requests r "
-                                "ON r.brief_id=b.brief_id WHERE b.brief_id=? AND r.target_id=?",
+                                "ON r.brief_id=b.brief_id WHERE b.brief_id=? AND r.target_id=? "
+                                "AND NOT EXISTS (SELECT 1 FROM research_brief_payload_retirements "
+                                "WHERE brief_id=b.brief_id)",
                                 (ref, run.target_id)).fetchone()
                         else:
                             table, id_column, target_column = {

@@ -29,13 +29,13 @@ from hackbot.validation_store import ValidationStatus, ValidationStore
 from hackbot.validator import DeterministicValidatorEngine
 from hackbot.traffic import CapturedRequest, CapturedResponse
 from hackbot.test_objects import ObjectState
-from tests.test_authorization import AuthorizationSpecialistTests as _AuthorizationFixture
+from tests import test_authorization
 from tests.schema_utils import drop_phase28_schema
 
 
 class AuthorizationMutationFixtureTests(unittest.TestCase):
     def setUp(self):
-        self.case = _AuthorizationFixture(
+        self.case = test_authorization.AuthorizationSpecialistTests(
             methodName="test_cross_tenant_candidate_uses_verified_object_and_owner_traffic")
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)
@@ -270,7 +270,7 @@ class AuthorizationMutationFixtureTests(unittest.TestCase):
                 "INSERT INTO authorization_mutation_results (" + ",".join(columns) +
                 ") VALUES (" + ",".join("?" for _ in columns) + ")", rows)
             connection.execute("PRAGMA user_version=31")
-        self.case.fx.store.initialize()
+        self.case.fx.store.initialize(allow_existing_migration=True)
         restored = mutations.list_for_run(detail["run"]["id"], self.case.target)
         self.assertEqual([(entry.id, entry.status, entry.phase) for entry in restored],
                          [(entry.id, entry.status, entry.phase) for entry in original])
@@ -735,7 +735,7 @@ class AuthorizationMutationFixtureTests(unittest.TestCase):
 
 class AuthorizationNestedFixtureTests(unittest.TestCase):
     def setUp(self):
-        self.case = _AuthorizationFixture(
+        self.case = test_authorization.AuthorizationSpecialistTests(
             methodName="test_cross_tenant_candidate_uses_verified_object_and_owner_traffic")
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)
@@ -828,7 +828,7 @@ class AuthorizationNestedFixtureTests(unittest.TestCase):
 
 class AuthorizationBatchFixtureTests(unittest.TestCase):
     def setUp(self):
-        self.case = _AuthorizationFixture(
+        self.case = test_authorization.AuthorizationSpecialistTests(
             methodName="test_cross_tenant_candidate_uses_verified_object_and_owner_traffic")
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from hackbot.api_graphql import (GraphQLResult, classify_result, encode_observed_global_id,
                                  extract_js_api_artifacts, extract_js_api_page,
@@ -134,6 +136,13 @@ class GraphQLParsingTests(unittest.TestCase):
         self.assertEqual(page.entries[-1].ordinal, 1023)
         self.assertIsNone(page.next_offset)
         self.assertTrue(page.truncated)
+
+    def test_js_api_page_timeout_is_explicit_and_bounded(self):
+        with patch("hackbot.api_graphql.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired("node", 20)) as run:
+            with self.assertRaisesRegex(RuntimeError, "extractor unavailable"):
+                extract_js_api_page(b"fetch('/api/v1/fixture');")
+        self.assertEqual(run.call_args.kwargs["timeout"], 20)
 
     def test_http_200_errors_partial_and_null(self):
         self.assertEqual(classify_result({"data": {"node": None},

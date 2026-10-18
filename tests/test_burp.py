@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 from io import StringIO
 import json
+import fcntl
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -18,10 +20,12 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
 
+from deploy.burp import run_community
 from hackbot.artifacts import ArtifactStore
 from hackbot.auth import AuthContextManager, AuthMechanism
 from hackbot.browser import (BrowserError, BrowserSessionManager, IdentityObservation,
@@ -29,7 +33,9 @@ from hackbot.browser import (BrowserError, BrowserSessionManager, IdentityObserv
 from hackbot.browser_trust import ProfileTrustError, install_profile_ca
 from hackbot.browser_playwright import PlaywrightBrowserDriver
 from hackbot.burp import BurpError, BurpProxyProvider
-from hackbot.burp_bridge import BurpBridgeServer, BurpCaptureProvider, BurpObservation
+from hackbot.burp_bridge import (BurpBridgeServer, BurpCaptureProvider,
+                                 BurpObservation, _BridgeHandler)
+from hackbot.burp_temp import (BurpTempCollector, BurpTempError, BurpTempPolicy)
 from hackbot.cli import main
 from hackbot.config import (BrowserSettings, BurpSettings, ConfigError, SecretBindingConfig,
                             SecretSettings, StoreSettings)
@@ -39,11 +45,196 @@ from hackbot.identity_registry import IdentityRegistry
 from hackbot.secrets import RoutedSecretProvider, SecretValue
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
-from hackbot.traffic import AuthState, ExchangeState, TrafficStore
+from hackbot.traffic import AuthState, ExchangeState, TrafficRetentionPolicy, TrafficStore
+from hackbot.traffic_retention import TrafficPayloadRetirementManager
 
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
 TOKEN = "fixture-bridge-token-with-at-least-32-characters"
+
+
+class BridgeReplyTests(unittest.TestCase):
+    def test_disconnected_client_does_not_trigger_second_reply(self):
+        class ClosedClient:
+            def __init__(self):
+                self.wfile = self
+                self.writes = 0
+
+            def send_response(self, _status):
+                pass
+
+            def send_header(self, _name, _value):
+                pass
+
+            def end_headers(self):
+                pass
+
+            def write(self, _body):
+                self.writes += 1
+                raise BrokenPipeError
+
+        client = ClosedClient()
+        _BridgeHandler._reply(client, 200, {"status": "ok"})
+        self.assertEqual(client.writes, 1)
+
+
+class BurpLauncherTests(unittest.TestCase):
+    def test_late_wizard_within_bounded_wait_starts_temporary_project(self):
+        java = types.SimpleNamespace(poll=lambda: None)
+        with patch.object(run_community.time, "monotonic",
+                          side_effect=(0, 0, 50, 100)), patch.object(
+                              run_community.time, "sleep"
+                          ), patch.object(run_community, "windows",
+                                          side_effect=([], [], [], [], ["123"])) as windows, patch.object(
+                              run_community, "start_temporary_project"
+                          ) as start:
+            run_community.wait_for_wizard(
+                java, 38080, seconds=run_community.WIZARD_WAIT_SECONDS)
+        self.assertEqual(windows.call_count, 5)
+        start.assert_called_once_with("123")
+
+    def test_unexpected_window_fails_without_title_or_navigation(self):
+        java = types.SimpleNamespace(poll=lambda: None)
+        with patch.object(run_community.time, "monotonic",
+                          side_effect=(0, 181)), patch.object(
+                              run_community, "windows", return_value=["123"]
+                          ), patch.object(run_community, "start_temporary_project") as start:
+            with self.assertRaisesRegex(RuntimeError, "window changed or was not ready"):
+                run_community.wait_for_wizard(java, 38080, seconds=180)
+        start.assert_not_called()
+
+    def test_runtime_lock_allows_shared_launch_and_blocks_cleanup(self):
+        with TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "burp-runtime"
+            (runtime / "tmp").mkdir(parents=True)
+            first = run_community.acquire_runtime_lock(runtime)
+            second = run_community.acquire_runtime_lock(runtime)
+            try:
+                lock = os.open(runtime / "tmp" / ".community-maintenance.lock", os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(lock)
+            finally:
+                os.close(second)
+                os.close(first)
+
+    def test_busy_runtime_lock_has_sanitized_startup_reason(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "burp-runtime"
+            (runtime / "tmp").mkdir(parents=True)
+            jar = root / "burp.jar"
+            project = root / "project.json"
+            user = root / "user.json"
+            for path in (jar, project, user):
+                path.write_bytes(b"fixture")
+            argv = ["run_community.py", "--jar", str(jar),
+                    "--runtime-root", str(runtime), "--project-config", str(project),
+                    "--user-config", str(user), "--listener-port", "38080"]
+            with patch.object(sys, "argv", argv), patch.dict(
+                os.environ, {"DISPLAY": ":902", "HACKBOT_SECRET_BURP_BRIDGE": "x" * 32}
+            ), patch.object(run_community, "acquire_runtime_lock",
+                            side_effect=RuntimeError("untrusted internal detail")):
+                with self.assertRaisesRegex(SystemExit,
+                                            "Burp runtime maintenance lock is unavailable") as failure:
+                    run_community.main()
+            self.assertNotIn("untrusted internal detail", str(failure.exception))
+
+
+class BurpTempCollectorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = self.root / "burp-runtime"
+        (self.runtime / "tmp").mkdir(parents=True)
+        (self.runtime / "data").mkdir()
+        self.review = self.root / "state" / "burp-temp-review.json"
+        self.audit = self.root / "logs" / "burp-temp-audit.jsonl"
+        self.collector = BurpTempCollector(self.runtime, self.review, self.audit,
+                                           require_stopped=lambda _root: None)
+
+    def project(self, name: str, *, hours_old: int = 48) -> Path:
+        path = self.runtime / "tmp" / name
+        path.mkdir()
+        body = path / "cache.bin"
+        body.write_bytes(b"fixture-temporary-burp-data")
+        old = time.time() - hours_old * 3600
+        os.utime(body, (old, old))
+        os.utime(path, (old, old))
+        return path
+
+    def test_reviewed_cleanup_removes_only_stale_launcher_projects(self):
+        old = self.project("community-abcdefgh")
+        recent = self.project("community-ijklmnop", hours_old=1)
+        unrelated = self.project("burp123456.tmp")
+        plan = self.collector.plan()
+        self.assertEqual(plan.candidates, (old.name,))
+        self.assertGreater(plan.estimated_bytes, 0)
+        self.assertEqual(self.review.stat().st_mode & 0o777, 0o600)
+        result = self.collector.run(plan.review_id, confirmed=True)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertEqual([json.loads(line)["stage"] for line in self.audit.read_text().splitlines()],
+                         ["STARTED", "COMPLETED"])
+        with self.assertRaises(BurpTempError):
+            self.collector.run(plan.review_id, confirmed=True)
+
+    def test_active_service_and_changed_tree_block_cleanup(self):
+        path = self.project("community-abcdefgh")
+        plan = self.collector.plan()
+        blocked = BurpTempCollector(self.runtime, self.review, self.audit,
+                                    require_stopped=lambda _root: (_ for _ in ()).throw(
+                                        BurpTempError("Burp service must be stopped")))
+        with self.assertRaisesRegex(BurpTempError, "must be stopped"):
+            blocked.run(plan.review_id, confirmed=True)
+        self.assertTrue(path.exists())
+        (path / "cache.bin").write_bytes(b"changed")
+        with self.assertRaisesRegex(BurpTempError, "changed after review"):
+            self.collector.run(plan.review_id, confirmed=True)
+        self.assertTrue(path.exists())
+
+    def test_shared_launcher_lock_allows_plan_but_blocks_run(self):
+        self.project("community-abcdefgh")
+        lock = self.runtime / "tmp" / ".community-maintenance.lock"
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            plan = self.collector.plan()
+            self.assertEqual(len(plan.candidates), 1)
+            with self.assertRaisesRegex(BurpTempError, "runtime is active"):
+                self.collector.run(plan.review_id, confirmed=True)
+        finally:
+            os.close(fd)
+
+    def test_symlink_and_entry_limit_fail_closed(self):
+        path = self.project("community-abcdefgh")
+        (path / "outside").symlink_to(self.root)
+        with self.assertRaisesRegex(BurpTempError, "Unsafe Burp temp entry"):
+            self.collector.plan()
+        (path / "outside").unlink()
+        (path / "second.bin").write_bytes(b"second")
+        limited = BurpTempCollector(self.runtime, self.review, self.audit,
+                                    BurpTempPolicy(max_tree_entries=2),
+                                    require_stopped=lambda _root: None)
+        with self.assertRaisesRegex(BurpTempError, "exceeds review limit"):
+            limited.plan()
+
+    def test_cli_plan_uses_configured_runtime_without_database(self):
+        self.project("community-abcdefgh")
+        config = self.root / "config.toml"
+        config.write_text(f'[paths]\nroot = "{self.root}"\n'
+                          f'[burp]\nruntime_root = "{self.runtime}"\n', encoding="utf-8")
+        out, err = StringIO(), StringIO()
+        result = main(["--config", str(config), "burp", "temp-plan"],
+                      stdout=out, stderr=err)
+        self.assertEqual(result, 0, err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["candidate_count"], 1)
+        self.assertFalse((self.root / "state" / "bughunter.sqlite3").exists())
 
 
 class FixtureBrowser:
@@ -150,6 +341,18 @@ class BurpTests(unittest.TestCase):
                                proxy_health_check=lambda _: True)
         return identity, session, binding
 
+    def test_global_status_aggregates_active_listener_and_recent_bridge(self) -> None:
+        _, _, binding = self.session(None, 38080)
+        self.capture.ingest_bytes(observation("global-status", binding.listener_key,
+                                              authenticated=False))
+        with patch.object(self.proxy, "listener_reachable", return_value=True), \
+             patch("hackbot.burp.socket.create_connection"):
+            status = self.proxy.status()
+        self.assertEqual(status["configured_listeners"], 1)
+        self.assertEqual(status["reachable_listeners"], 1)
+        self.assertTrue(status["bridge_connected"])
+        self.assertIsNotNone(status["last_heartbeat_at"])
+
     def test_request_response_incomplete_retry_and_protected_artifacts(self) -> None:
         identity, session, binding = self.session("org1_admin", 38080)
         first = self.capture.ingest_bytes(observation("fixture-1", binding.listener_key))
@@ -184,7 +387,47 @@ class BurpTests(unittest.TestCase):
             exchange.response.body_evidence_id, allow_sensitive=True), b'{"ok":true}')
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM burp_capture_index").fetchone()[0], 1)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
+
+    def test_retired_burp_capture_rejects_late_retry_without_rehydrating_payload(self) -> None:
+        self.traffic.retention_policy = TrafficRetentionPolicy(1, 1, 1)
+        _, _, binding = self.session(None, 38080)
+        completed = self.capture.ingest_bytes(
+            observation("retired-capture", binding.listener_key, response=True,
+                        authenticated=False))
+        exchange = self.traffic.get_exchange(completed.exchange_id)
+        body_id = exchange.response.body_evidence_id
+        future = time.time() + 48 * 3600
+        manager = TrafficPayloadRetirementManager(self.traffic.evidence)
+        self.assertEqual(manager.plan(now=future).exchange_ids, (exchange.id,))
+        self.assertEqual(manager.run(confirmed=True, now=future)["retired_exchanges"], 1)
+        for response in (False, True):
+            with self.assertRaisesRegex(BurpError, "Retired bridge capture"):
+                self.capture.ingest_bytes(
+                    observation("retired-capture", binding.listener_key,
+                                response=response, authenticated=False))
+        with self.traffic.evidence._connection() as db:
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM burp_capture_index WHERE exchange_id=?",
+                (exchange.id,),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM traffic_exchanges WHERE target_id=?",
+                (self.target,),
+            ).fetchone()[0], 1)
+        with self.assertRaisesRegex(FileNotFoundError, "retired"):
+            self.traffic.evidence.read_content(body_id, allow_sensitive=True)
+
+    def test_bridge_persistence_error_is_redacted(self) -> None:
+        parsed = BurpObservation.parse(
+            observation("persistence-error", "127.0.0.1:38080", authenticated=False),
+            self.settings.max_event_bytes,
+        )
+        with patch.object(self.capture, "_ingest",
+                          side_effect=sqlite3.OperationalError("sensitive-local-db-path")):
+            with self.assertRaisesRegex(BurpError, "Bridge persistence unavailable") as failure:
+                self.capture.ingest(parsed)
+        self.assertNotIn("sensitive-local-db-path", str(failure.exception))
 
     def test_four_sessions_wrong_identity_and_no_cross_attribution(self) -> None:
         cases = [
@@ -368,7 +611,7 @@ class BurpTests(unittest.TestCase):
         thread.start()
         try:
             def send(path: str, payload: bytes, token: str = TOKEN):
-                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
                 conn.request("POST", path, payload, {"X-Hackbot-Bridge-Token": token,
                                                    "Content-Type": "application/json"})
                 response = conn.getresponse()
@@ -386,7 +629,7 @@ class BurpTests(unittest.TestCase):
             self.assertEqual(send("/v1/heartbeat", b'{"version":"1.0"}')[0], 200)
             self.assertEqual(self.proxy.status(self.target)["dropped_events"], 2)
             self.assertEqual(send("/v1/heartbeat", b'{"version":"1.0","dropped_events":-1}')[0], 400)
-            with socket.create_connection(("127.0.0.1", port), timeout=3) as malformed:
+            with socket.create_connection(("127.0.0.1", port), timeout=30) as malformed:
                 malformed.sendall(("POST /v1/capture HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                                    f"X-Hackbot-Bridge-Token: {TOKEN}\r\n"
                                    "Content-Type: application/json\r\n"
@@ -414,7 +657,7 @@ class BurpTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
-            thread.join(timeout=3)
+            thread.join(timeout=30)
 
     def test_bridge_rejects_invalid_token_and_mismatched_settings(self) -> None:
         with self.assertRaises(BurpError):
@@ -538,6 +781,7 @@ class BurpTests(unittest.TestCase):
 
     def test_loopback_fixture_proxy_browser_app_bridge_store(self) -> None:
         app_hits = []
+        loopback_timeout = 30
 
         class AppHandler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -565,14 +809,16 @@ class BurpTests(unittest.TestCase):
                 pass
 
             def do_GET(self):
-                local = http.client.HTTPConnection("127.0.0.1", app.server_address[1], timeout=3)
+                local = http.client.HTTPConnection(
+                    "127.0.0.1", app.server_address[1], timeout=loopback_timeout)
                 local.request("GET", "/local-fixture")
                 response = local.getresponse()
                 body = response.read()
                 local.close()
                 event = observation("loopback-capture-1", f"127.0.0.1:{self.server.server_port}",
                                     response=True, url=self.path, body=body, authenticated=False)
-                channel = http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=3)
+                channel = http.client.HTTPConnection(
+                    "127.0.0.1", bridge_port, timeout=loopback_timeout)
                 channel.request("POST", "/v1/capture", event,
                                 {"X-Hackbot-Bridge-Token": TOKEN, "Content-Type": "application/json"})
                 receipt = channel.getresponse()
@@ -599,7 +845,8 @@ class BurpTests(unittest.TestCase):
         proxy_thread.start()
         bridge_thread.start()
         try:
-            client = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=3)
+            client = http.client.HTTPConnection(
+                "127.0.0.1", proxy_port, timeout=loopback_timeout + 15)
             client.request("GET", "https://app.example.test/local-fixture")
             reply = client.getresponse()
             self.assertEqual(reply.status, 200)

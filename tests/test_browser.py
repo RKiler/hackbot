@@ -376,9 +376,9 @@ class BrowserTests(unittest.TestCase):
             connection.execute("DROP TABLE browser_session_events")
             connection.execute("DROP TABLE browser_sessions")
             connection.execute("PRAGMA user_version=3")
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.store.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 37)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 46)
         self.assertEqual(self.auth.get(self.target, identity.id).id, context.id)
 
     def test_playwright_import_adapter_rejects_foreign_or_malformed_before_cookies(self):

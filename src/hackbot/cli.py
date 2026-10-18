@@ -3,24 +3,40 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
+import http.client
 import json
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import sys
 from typing import Mapping, Sequence, TextIO
 
 from . import __version__
 from .auth import AuthContextManager
+from .backup import BackupError, BackupManager
+from .backup_crypto import BackupCryptoError
 from .browser import BrowserError, BrowserSessionManager
 from .browser_playwright import PlaywrightBrowserDriver
 from .burp import BurpError, BurpProxyProvider
-from .config import AppConfig, ConfigError, load_config
+from .burp_storage import inspect_burp_storage
+from .config import AppConfig, ConfigError, ResourceSettings, load_config
+from .db_maintenance import DatabaseCheckError, check_database
+from .dom_refs import DOMReferenceError
+from .dom_retention import DOMPayloadPolicy, DOMPayloadRetirementManager
+from .evidence_refs import EvidenceReferenceError
 from .identity_registry import IdentityRegistry
 from .logging import SecretRedactor
 from .policy import PolicyEngine
 from .policy_models import ActionCategory, ActorMode, ProposedAction
 from .policy_store import PolicyStore
+from .retention import ArtifactGarbageCollector, OrphanPolicy
+from .evidence_retention import EvidencePayloadPolicy, EvidencePayloadRetirementManager
+from .research_retention import ResearchBriefRetentionManager, ResearchBriefRetentionPolicy
+from .traffic_retention import TrafficPayloadPolicy, TrafficPayloadRetirementManager
+from .traffic_refs import TrafficReferenceError
+from .resources import ResourceBudgetManager, ResourceError, ResourceSnapshot
 from .secrets import RoutedSecretProvider, SecretError
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
 from .target_loader import TargetPackageRepository, load_target_package
@@ -64,7 +80,7 @@ def _status(config: AppConfig) -> dict[str, object]:
     paths = config.paths
     return {
         "version": __version__,
-        "phase": 13,
+        "phase": 30,
         "runtime": "local_cli_metadata_only_private_service_separate",
         "service": "not_checked_use_private_api_status",
         "recon_integration": "adapter_available_not_connected",
@@ -100,6 +116,71 @@ def _status(config: AppConfig) -> dict[str, object]:
     }
 
 
+class _PrivateConnection(http.client.HTTPConnection):
+    def __init__(self, path: str) -> None:
+        super().__init__("localhost", timeout=5)
+        self.socket_path = path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def _operations_status() -> dict[str, object]:
+    return _private_operations_request("GET", "/v1/operations")
+
+
+def _private_operations_request(method: str, path: str,
+                                payload: dict[str, object] | None = None) -> dict[str, object]:
+    connection = _PrivateConnection("/run/bughunter-agent/control.sock")
+    try:
+        body = json.dumps(payload, sort_keys=True) if payload is not None else None
+        headers = {"Host": "localhost"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read(524_289)
+        if (response.status not in {200, 202} or len(response_body) > 524_288
+                or "application/json" not in response.getheader("Content-Type", "")):
+            raise OSError("Private operations status is unavailable")
+        result = json.loads(response_body)
+        if not isinstance(result, dict):
+            raise ValueError("Invalid private operations response")
+        return result
+    finally:
+        connection.close()
+
+
+def _storage_status(config: AppConfig) -> dict[str, object]:
+    from .store import _SCHEMA_VERSION
+
+    try:
+        resource = ResourceBudgetManager(config.paths.root,
+                                         config.resources or ResourceSettings(),
+                                         system_disk_path=Path("/")).snapshot()
+    except ResourceError as exc:
+        resource = ResourceSnapshot(0, 0, 100, None, "BLOCKED", (exc.reason_code,))
+    database = config.paths.state / "bughunter.sqlite3"
+    if database.is_symlink():
+        raise ValueError("Unsafe BugHunter database path")
+    actual_schema = None
+    if database.is_file():
+        from urllib.parse import quote
+        with closing(sqlite3.connect("file:" + quote(str(database), safe="/") + "?mode=ro",
+                                     uri=True, timeout=5)) as db:
+            actual_schema = db.execute("PRAGMA user_version").fetchone()[0]
+    wal = database.parent / (database.name + "-wal")
+    backup = (BackupManager.from_config(config).latest_metadata()
+              if config.backup is not None else {"state": "NOT_CONFIGURED"})
+    return {"resources": resource.to_dict(),
+            "database_bytes": database.stat().st_size if database.is_file() else 0,
+            "wal_bytes": wal.stat().st_size if wal.is_file() and not wal.is_symlink() else 0,
+            "schema_actual": actual_schema, "schema_expected": _SCHEMA_VERSION,
+            "backup": backup}
+
+
 def _traffic_identity_alias(store: TrafficStore, exchange: TrafficExchange) -> str:
     if exchange.attribution.verified_identity_id is None:
         return exchange.attribution.auth_state.value
@@ -122,6 +203,89 @@ def main(
     commands.add_parser("version", help="print installed version")
     commands.add_parser("health", help="check local configuration and prerequisites")
     commands.add_parser("status", help="show local BugHunter state")
+    ops = commands.add_parser("ops", help="inspect the private BugHunter control plane")
+    ops_commands = ops.add_subparsers(dest="ops_command", required=True)
+    ops_commands.add_parser("status", help="read live operations status without target requests")
+    ops_commands.add_parser("maintenance-status", help="read local maintenance task state")
+    disabled_plan = ops_commands.add_parser(
+        "disabled-profile-plan", help="review old profiles for one disabled identity")
+    disabled_plan.add_argument("target_id")
+    disabled_plan.add_argument("identity_id")
+    disabled_run = ops_commands.add_parser(
+        "disabled-profile-run", help="run a reviewed disabled-identity profile cleanup")
+    disabled_run.add_argument("target_id")
+    disabled_run.add_argument("identity_id")
+    disabled_run.add_argument("review_id")
+    disabled_run.add_argument("--confirmed", action="store_true", required=True)
+    named_plan = ops_commands.add_parser(
+        "named-profile-plan", help="review one old terminal active-identity profile")
+    named_plan.add_argument("target_id")
+    named_plan.add_argument("identity_id")
+    named_plan.add_argument("session_id")
+    named_run = ops_commands.add_parser(
+        "named-profile-run", help="remove one reviewed active-identity profile")
+    named_run.add_argument("target_id")
+    named_run.add_argument("identity_id")
+    named_run.add_argument("session_id")
+    named_run.add_argument("review_id")
+    named_run.add_argument("--confirmed", action="store_true", required=True)
+    storage = commands.add_parser("storage", help="inspect local BugHunter storage")
+    storage_commands = storage.add_subparsers(dest="storage_command", required=True)
+    storage_commands.add_parser("status", help="read disk, database, and backup metadata")
+    storage_commands.add_parser("check", help="read-only SQLite integrity and schema check")
+    storage_commands.add_parser("startup-check", help="read-only service schema compatibility gate")
+    backup = commands.add_parser("backup", help="manage BugHunter-owned local backups")
+    backup_commands = backup.add_subparsers(dest="backup_command", required=True)
+    backup_commands.add_parser("create", help="create a consistent local backup")
+    backup_list = backup_commands.add_parser("list", help="list bounded local backup history")
+    backup_list.add_argument("--limit", type=int, default=20)
+    backup_verify = backup_commands.add_parser("verify", help="verify one backup and its hashes")
+    backup_verify.add_argument("backup_id")
+    backup_stage = backup_commands.add_parser("stage", help="stage a verified copy; never replace live state")
+    backup_stage.add_argument("backup_id")
+    backup_rehearse = backup_commands.add_parser(
+        "rehearse", help="verify and migrate an isolated backup copy, then remove the staging files")
+    backup_rehearse.add_argument("backup_id")
+    backup_rehearse.add_argument("--max-values", type=int, default=250_000)
+    backup_rehearse.add_argument("--max-seconds", type=float, default=60.0)
+    backup_audit = backup_commands.add_parser(
+        "audit-json-indexes", help="audit reference indexes on a verified staged backup copy")
+    backup_audit.add_argument("backup_id")
+    backup_audit.add_argument("--max-values", type=int, default=250_000)
+    backup_audit.add_argument("--max-seconds", type=float, default=60.0)
+    backup_commands.add_parser("prune-plan", help="preview old backup generations")
+    backup_prune = backup_commands.add_parser("prune", help="remove generations beyond retention")
+    backup_prune.add_argument("--confirmed", action="store_true")
+    backup_commands.add_parser("incomplete-plan", help="preview stale unfinished backup staging")
+    backup_incomplete = backup_commands.add_parser(
+        "incomplete-cleanup", help="remove stale unfinished backup staging")
+    backup_incomplete.add_argument("--confirmed", action="store_true")
+    backup_commands.add_parser(
+        "restore-staging-plan", help="preview stale decrypted restore stages")
+    backup_restore_cleanup = backup_commands.add_parser(
+        "restore-staging-cleanup", help="remove one reviewed stale decrypted restore stage")
+    backup_restore_cleanup.add_argument("name")
+    backup_restore_cleanup.add_argument("--confirmed", action="store_true")
+    retention = commands.add_parser("retention", help="plan or run bounded local artifact cleanup")
+    retention_commands = retention.add_subparsers(dest="retention_command", required=True)
+    retention_commands.add_parser("plan", help="dry-run aged unreferenced artifact cleanup")
+    retention_run = retention_commands.add_parser("run", help="remove aged unreferenced artifacts")
+    retention_run.add_argument("--confirmed", action="store_true")
+    retention_commands.add_parser("evidence-plan", help="review expired standalone Evidence payloads")
+    evidence_run = retention_commands.add_parser("evidence-run", help="retire reviewed Evidence payloads")
+    evidence_run.add_argument("--confirmed", action="store_true")
+    dom_plan = retention_commands.add_parser("dom-plan", help="review expired DOM asset payloads")
+    dom_plan.add_argument("--kind", choices=("JS", "SOURCE_MAP"), required=True)
+    dom_plan.add_argument("--after")
+    dom_run = retention_commands.add_parser("dom-run", help="retire reviewed DOM Evidence payloads")
+    dom_run.add_argument("--kind", choices=("JS", "SOURCE_MAP"), required=True)
+    dom_run.add_argument("--confirmed", action="store_true")
+    retention_commands.add_parser("traffic-plan", help="review expired TrafficStore payloads")
+    traffic_run = retention_commands.add_parser("traffic-run", help="retire reviewed TrafficStore payloads")
+    traffic_run.add_argument("--confirmed", action="store_true")
+    retention_commands.add_parser("research-plan", help="review expired unlinked ResearchBrief cache payloads")
+    research_run = retention_commands.add_parser("research-run", help="retire reviewed ResearchBrief cache payloads")
+    research_run.add_argument("--confirmed", action="store_true")
     target = commands.add_parser("target", help="inspect local authoritative target packages")
     target_commands = target.add_subparsers(dest="target_command", required=True)
     target_commands.add_parser("validate", help="validate one package directory").add_argument("path", type=Path)
@@ -174,6 +338,12 @@ def main(
     burp = commands.add_parser("burp", help="inspect local Burp capture metadata")
     burp_commands = burp.add_subparsers(dest="burp_command", required=True)
     burp_commands.add_parser("check", help="check configured local Burp availability")
+    burp_commands.add_parser("storage", help="inspect bounded Burp runtime storage usage")
+    burp_commands.add_parser("temp-plan", help="review abandoned Burp launcher temp directories")
+    burp_temp_run = burp_commands.add_parser(
+        "temp-run", help="remove only recently reviewed abandoned Burp launcher temp directories")
+    burp_temp_run.add_argument("review_id")
+    burp_temp_run.add_argument("--confirmed", action="store_true")
     burp_status = burp_commands.add_parser("status", help="show local Burp capture status")
     burp_status.add_argument("target", nargs="?")
     burp_listeners = burp_commands.add_parser("listeners", help="list target listener bindings")
@@ -210,6 +380,159 @@ def main(
         print(f"hackbot: {exc}", file=err)
         return 2
 
+    if args.command == "ops":
+        try:
+            if args.ops_command == "status":
+                result = _operations_status()
+            elif args.ops_command == "maintenance-status":
+                result = _private_operations_request("GET", "/v1/operations/maintenance")
+            else:
+                payload: dict[str, object] = {
+                    "action": {
+                        "disabled-profile-plan": "DISABLED_PROFILE_PLAN",
+                        "disabled-profile-run": "DISABLED_PROFILE_RUN",
+                        "named-profile-plan": "NAMED_PROFILE_PLAN",
+                        "named-profile-run": "NAMED_PROFILE_RUN",
+                    }[args.ops_command],
+                    "target_id": args.target_id,
+                    "identity_id": args.identity_id,
+                }
+                if args.ops_command.startswith("named-profile-"):
+                    payload["session_id"] = args.session_id
+                if args.ops_command in {"disabled-profile-run", "named-profile-run"}:
+                    payload.update({"review_id": args.review_id, "confirmed": args.confirmed})
+                result = _private_operations_request("POST", "/v1/operations/maintenance", payload)
+        except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+            print("hackbot: private operations status unavailable", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
+
+    if args.command == "storage":
+        try:
+            if args.storage_command == "startup-check":
+                result = EvidenceFactStore.from_config(config).service_schema_status()
+            elif args.storage_command == "check":
+                from .store import _SCHEMA_VERSION
+                result = check_database(config.paths.state / "bughunter.sqlite3",
+                                        expected_schema=_SCHEMA_VERSION).to_dict()
+            else:
+                result = _storage_status(config)
+        except (OSError, ValueError, sqlite3.Error, BackupError, ResourceError,
+                DatabaseCheckError):
+            print("hackbot: local storage status unavailable", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        if args.storage_command == "startup-check":
+            return 0 if result["state"] in {"READY", "FRESH"} else 1
+        return 0 if args.storage_command != "check" or result["state"] == "OK" else 2
+
+    if args.command == "backup":
+        try:
+            manager = BackupManager.from_config(config)
+            if args.backup_command == "create":
+                result: object = manager.create().to_dict()
+            elif args.backup_command == "list":
+                result = {"items": [item.to_dict() for item in manager.list(limit=args.limit)]}
+            elif args.backup_command == "verify":
+                result = manager.verify(args.backup_id, record=True).to_dict()
+            elif args.backup_command == "rehearse":
+                result = manager.rehearse_upgrade(
+                    args.backup_id, max_values=args.max_values,
+                    max_seconds=args.max_seconds)
+            elif args.backup_command == "audit-json-indexes":
+                result = manager.audit_json_indexes(
+                    args.backup_id, max_values=args.max_values,
+                    max_seconds=args.max_seconds)
+            elif args.backup_command == "prune-plan":
+                result = manager.prune_plan()
+            elif args.backup_command == "prune":
+                result = manager.prune(confirmed=args.confirmed)
+            elif args.backup_command == "incomplete-plan":
+                result = manager.incomplete_plan()
+            elif args.backup_command == "incomplete-cleanup":
+                result = manager.cleanup_incomplete(confirmed=args.confirmed)
+            elif args.backup_command == "restore-staging-plan":
+                result = manager.stale_restore_plan()
+            elif args.backup_command == "restore-staging-cleanup":
+                result = manager.cleanup_stale_restore(args.name, confirmed=args.confirmed)
+            else:
+                result = {"staged_at": str(manager.stage_restore(args.backup_id)),
+                          "active_state_replaced": False}
+        except (BackupError, BackupCryptoError, DatabaseCheckError, StoreSchemaError,
+                ValueError, OSError, sqlite3.Error):
+            print("hackbot: backup operation failed or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 2 if args.backup_command == "audit-json-indexes" and not result["matches"] else 0
+
+    if args.command == "retention":
+        try:
+            assert config.retention is not None
+            store = EvidenceFactStore.from_config(config)
+            if args.retention_command in {"dom-plan", "dom-run"}:
+                scan = min(config.retention.max_scan_entries, 100)
+                dom_manager = DOMPayloadRetirementManager(
+                    store,
+                    DOMPayloadPolicy(config.retention.orphan_grace_hours, scan,
+                                     min(config.retention.max_delete_files, scan, 25)),
+                    audit_path=config.paths.logs / "dom-retirement-audit.jsonl",
+                )
+                result = (dom_manager.plan(args.kind, after=args.after).to_dict()
+                          if args.retention_command == "dom-plan"
+                          else dom_manager.run(args.kind, confirmed=args.confirmed))
+            elif args.retention_command.startswith("evidence-"):
+                evidence_manager = EvidencePayloadRetirementManager(
+                    store,
+                    EvidencePayloadPolicy(config.retention.orphan_grace_hours,
+                                          min(config.retention.max_scan_entries, 250),
+                                          min(config.retention.max_delete_files, 25)),
+                    config.paths.logs / "evidence-retirement-audit.jsonl",
+                )
+                result = (evidence_manager.plan().to_dict()
+                          if args.retention_command == "evidence-plan"
+                          else evidence_manager.run(confirmed=args.confirmed))
+            elif args.retention_command.startswith("traffic-"):
+                traffic_manager = TrafficPayloadRetirementManager(
+                    store,
+                    TrafficPayloadPolicy(config.retention.orphan_grace_hours,
+                                         min(config.retention.max_scan_entries, 250),
+                                         min(config.retention.max_delete_files, 25)),
+                    config.paths.logs / "traffic-retirement-audit.jsonl",
+                )
+                result = (traffic_manager.plan().to_dict()
+                          if args.retention_command == "traffic-plan"
+                          else traffic_manager.run(confirmed=args.confirmed))
+            elif args.retention_command.startswith("research-"):
+                research_manager = ResearchBriefRetentionManager(
+                    store,
+                    ResearchBriefRetentionPolicy(config.retention.research_brief_grace_days,
+                                                 min(config.retention.max_scan_entries, 250),
+                                                 min(config.retention.max_scan_entries,
+                                                     config.retention.max_delete_files, 25)),
+                    config.paths.logs / "research-retirement-audit.jsonl",
+                )
+                result = (research_manager.plan().to_dict()
+                          if args.retention_command == "research-plan"
+                          else research_manager.run(confirmed=args.confirmed))
+            else:
+                manager = ArtifactGarbageCollector(
+                    store,
+                    OrphanPolicy(config.retention.orphan_grace_hours,
+                                 config.retention.max_scan_entries,
+                                 config.retention.max_delete_files,
+                                 config.retention.orphan_scan_timeout_seconds),
+                    config.paths.logs / "retention-audit.jsonl",
+                )
+                result = (manager.plan().to_dict() if args.retention_command == "plan"
+                          else manager.run(confirmed=args.confirmed))
+        except (ValueError, OSError, sqlite3.Error, StoreNotInitialized, StoreSchemaError,
+                DOMReferenceError, EvidenceReferenceError, TrafficReferenceError):
+            print("hackbot: retention operation failed or input is invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return 0
+
     if args.command in {"policy", "approvals"}:
         try:
             assert config.targets is not None
@@ -244,7 +567,28 @@ def main(
         return 0
 
     if args.command == "burp":
+        if args.burp_command == "storage":
+            root = config.burp.runtime_root if config.burp is not None else None
+            result = (inspect_burp_storage(root).to_dict() if root is not None
+                      else {"state": "UNAVAILABLE"})
+            print(json.dumps(result, sort_keys=True), file=out)
+            return 0 if result["state"] != "UNAVAILABLE" else 2
         assert config.burp is not None
+        if args.burp_command in {"temp-plan", "temp-run"}:
+            from .burp_temp import BurpTempCollector, BurpTempError
+            try:
+                assert config.burp.runtime_root is not None
+                collector = BurpTempCollector(
+                    config.burp.runtime_root,
+                    config.paths.state / "burp-temp-review.json",
+                    config.paths.logs / "burp-temp-audit.jsonl")
+                result = (collector.plan().to_dict() if args.burp_command == "temp-plan"
+                          else collector.run(args.review_id, confirmed=args.confirmed))
+            except (BurpTempError, OSError, ValueError):
+                print("hackbot: Burp temporary cleanup is unavailable or unreviewed", file=err)
+                return 2
+            print(json.dumps(result, sort_keys=True), file=out)
+            return 0
         if args.burp_command == "check":
             provider = BurpProxyProvider(config.burp, TrafficStore.from_config(config))
             print(json.dumps({"enabled": config.burp.enabled,

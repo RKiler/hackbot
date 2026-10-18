@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
+from typing import Iterator
 
 
 class ArtifactIntegrityError(RuntimeError):
     """An existing artifact does not match its digest or is unsafe to read."""
+
+
+class ArtifactLimitError(ValueError):
+    """An artifact exceeds the configured local write budget."""
 
 
 @dataclass(frozen=True)
@@ -21,19 +29,60 @@ class ArtifactRef:
 
 
 class ArtifactStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, max_blob_bytes: int = 134_217_728) -> None:
+        if type(max_blob_bytes) is not int or max_blob_bytes <= 0:
+            raise ValueError("Invalid artifact write limit")
         self.root = root.expanduser().resolve(strict=False)
+        self.max_blob_bytes = max_blob_bytes
+
+    def prepare(self) -> None:
+        """Create and validate the private content-addressed root at startup."""
+        self._prepare_parent(self.root / "sha256")
 
     def path_for(self, digest: str) -> Path:
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("Invalid SHA-256 artifact identifier")
         return self.root / "sha256" / digest[:2] / digest
 
+    @contextmanager
+    def hold(self, *, shared: bool = False) -> Iterator[None]:
+        """Coordinate artifact writers and garbage collection across processes."""
+        self._prepare_parent(self.root / "sha256")
+        lock_path = self.root / ".artifact.lock"
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.fchmod(fd, 0o600)
+        except OSError:
+            raise ArtifactIntegrityError("Cannot open artifact lock") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _prepare_parent(self, parent: Path) -> None:
         for directory in (self.root, self.root / "sha256", parent):
+            existed = directory.exists() or directory.is_symlink()
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
                 raise ArtifactIntegrityError("Unsafe artifact directory")
+            if not existed:
+                self._fsync_directory(directory.parent)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        try:
+            fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                         getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise ArtifactIntegrityError("Unsafe artifact directory")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            raise ArtifactIntegrityError("Cannot sync artifact directory") from None
 
     def _verified_size(self, digest: str) -> int:
         path = self.path_for(digest)
@@ -59,6 +108,8 @@ class ArtifactStore:
     def put_bytes(self, content: bytes) -> ArtifactRef:
         if not isinstance(content, bytes):
             raise TypeError("Artifact content must be bytes")
+        if len(content) > self.max_blob_bytes:
+            raise ArtifactLimitError("Artifact exceeds configured write limit")
         digest = hashlib.sha256(content).hexdigest()
         destination = self.path_for(digest)
         self._prepare_parent(destination.parent)
@@ -78,6 +129,8 @@ class ArtifactStore:
             except FileExistsError:
                 if self._verified_size(digest) != len(content):
                     raise ArtifactIntegrityError("Existing artifact size mismatch")
+            else:
+                self._fsync_directory(destination.parent)
             return ArtifactRef(digest, len(content))
         finally:
             Path(temporary).unlink(missing_ok=True)

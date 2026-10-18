@@ -1,0 +1,2 @@
+-- The schema-derived backfill and triggers are appended by EvidenceFactStore.
+-- Keeping them generated makes new JSON columns a fail-closed migration review.

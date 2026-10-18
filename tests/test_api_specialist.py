@@ -6,9 +6,11 @@ import unittest
 import hashlib
 import json
 from datetime import timedelta
+from unittest.mock import Mock
 
 from hackbot.api_registry import APICandidate, APIOperationRegistry, APIOperationType
 from hackbot.api_specialist import APIAnalysisLimits, APISpecialist
+from hackbot.authorization import AuthorizationSurface
 from hackbot.domxss_store import DOMXSSStore
 from hackbot.domain import TrafficSource
 from hackbot.evidence import EvidenceProvenance
@@ -27,6 +29,22 @@ class APISpecialistInventoryTests(unittest.TestCase):
         self.specialist = APISpecialist(registry=self.registry, traffic=self.fx.traffic,
                                         evidence=self.fx.evidence, js=self.js,
                                         behaviour=self.fx.ledger)
+
+    def test_generate_uses_one_authorization_snapshot(self):
+        surface = AuthorizationSurface(self.fx.target, self.fx.package.id, (), (), (),
+                                       0, 0, (), False)
+        authorization = Mock()
+        authorization.profile.return_value = surface
+        self.specialist.authorization = authorization
+        self.assertEqual(self.specialist.generate(self.fx.package), ())
+        authorization.profile.assert_called_once_with(self.fx.package)
+        authorization.profile.reset_mock()
+        self.specialist.profile(self.fx.package)
+        authorization.profile.assert_called_once_with(self.fx.package)
+        wrong = AuthorizationSurface("TARGET-" + "0" * 32, self.fx.package.id,
+                                     (), (), (), 0, 0, (), False)
+        with self.assertRaisesRegex(ValueError, "Authorization snapshot"):
+            self.specialist.profile(self.fx.package, _authorization_surface=wrong)
 
     def test_observed_graphql_and_saved_js_without_target_requests(self):
         _, session = self.fx.session("admin_a", self.fx.tenant_a, self.fx.admin)

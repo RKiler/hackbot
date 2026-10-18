@@ -45,8 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY" -noreset \
-  >"$runtime_dir/xvfb.log" 2>&1 &
+Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY" -noreset &
 pids+=("$!")
 for _ in {1..50}; do
   [[ -S "/tmp/.X11-unix/X${display_number}" ]] && break
@@ -54,10 +53,10 @@ for _ in {1..50}; do
 done
 [[ -S "/tmp/.X11-unix/X${display_number}" ]] || { printf '%s\n' 'Dedicated display did not start' >&2; exit 1; }
 
-fluxbox -display "$DISPLAY" >"$runtime_dir/fluxbox.log" 2>&1 &
+fluxbox -display "$DISPLAY" &
 pids+=("$!")
 x11vnc -display "$DISPLAY" -no6 -rfbport 0 -rfbportv6 0 -unixsock "$socket" \
-  -forever -shared -nopw -noxdamage -repeat -o "$runtime_dir/x11vnc.log" &
+  -forever -shared -nopw -noxdamage -repeat &
 pids+=("$!")
 for _ in {1..50}; do
   [[ -S "$socket" ]] && break
@@ -65,8 +64,7 @@ for _ in {1..50}; do
 done
 [[ -S "$socket" ]] || { printf '%s\n' 'Dedicated VNC socket did not start' >&2; exit 1; }
 
-websockify --web="$novnc_root" --unix-target="$socket" "127.0.0.1:${vnc_port}" \
-  >"$runtime_dir/websockify.log" 2>&1 &
+websockify --web="$novnc_root" --unix-target="$socket" "127.0.0.1:${vnc_port}" &
 pids+=("$!")
 printf 'BugHunter VNC ready on 127.0.0.1:%s (display %s)\n' "$vnc_port" "$DISPLAY"
 wait -n "${pids[@]}"

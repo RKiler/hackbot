@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import socket
+import time
 import uuid
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -19,6 +20,7 @@ from werkzeug.exceptions import HTTPException
 
 from . import __version__
 from .auth import AuthContextManager, AuthMechanism
+from .backup import BackupError, BackupManager
 from .authorization import AuthorizationSpecialist
 from .authorization_store import AuthorizationMode, AuthorizationStore, HuntStatus
 from .api_registry import APIOperationRegistry
@@ -31,8 +33,10 @@ from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, Bootstra
                               BootstrapStore)
 from .behaviour import BehaviourStore, LearningLimits, LearningStatus, NormalBehaviourLearner
 from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
+from .burp_storage import inspect_burp_storage
 from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
-from .config import AppConfig, ConfigError, ExecutorSettings, NotificationSettings, ObjectSettings, load_config
+from .config import (AppConfig, ConfigError, ExecutorSettings, NotificationSettings,
+                     ObjectSettings, ResourceSettings, load_config)
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
 from .domxss_store import DOMXSSStore
@@ -42,11 +46,14 @@ from .exposure_store import ExposureStore
 from .postmessage import PostMessageSpecialist
 from .postmessage_browser import PostMessageBrowserExperimentExecutor
 from .postmessage_store import PostMessageStore
+from .process_health import inspect_owned_processes
+from .profile_retention import BrowserProfileCollector, ProfileRetentionPolicy
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
 from .identity_registry import IdentityRegistry
 from .finding_workflow import FindingWorkflow
 from .logging import SecretRedactor, create_logger
+from .maintenance import MaintenanceCoordinator, MaintenanceError
 from .notification_store import NotificationPriority, NotificationStore, NotificationType
 from .notifications import ConsoleNotifier, DiscordNotifier, NotificationManager, SMTPNotifier
 from .policy import PolicyEngine, policy_version
@@ -71,18 +78,20 @@ from .profile import AttackSurfaceProfiler
 from .rate_limit import RateLimiter
 from .research import ResearchBudget, ResearchCoordinator, ResearchStatus, ResearchStore
 from .research_sources import BraveWebResearchProvider, FindingKnowledgeProvider, SkillKnowledgeProvider
+from .retention import ArtifactGarbageCollector, OrphanPolicy
 from .reports import ReportGenerator, ReportStore
+from .resources import ResourceBudgetManager, ResourceError, ResourceSnapshot, WorkKind
 from .recon_postgres import PostgresReconRepository
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
 from .skill_plans import (DOMPlanBinding, MessagePlanBinding, PrerequisiteChecker, SkillContextBuilder,
                           SkillPlanStore, SkillPlanner, SkillRouter)
-from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError
+from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError, _SCHEMA_VERSION
 from .artifacts import ArtifactStore
 from .target_loader import TargetPackageRepository
 from .target_package import PackageStatus, TargetPackage
 from .target_policy import RiskLevel
-from .traffic import TrafficStore
+from .traffic import TrafficRetentionPolicy, TrafficStore
 from .validation_store import FindingStatus, ValidationStatus, ValidationStore
 from .validator import DeterministicValidatorEngine, ValidatorRegistry
 
@@ -122,13 +131,57 @@ class BugHunterRuntime:
     def __init__(self, config: AppConfig, *, driver: Any | None = None,
                  vnc_ready: Callable[[], bool] | None = None) -> None:
         self.config = config
+        self.started_monotonic = time.monotonic()
+        self.resources = ResourceBudgetManager(config.paths.root,
+                                               config.resources or ResourceSettings(),
+                                               system_disk_path=Path("/"))
+        if self.resources.settings.required_mount is not None:
+            self.resources.snapshot()
+            artifact_root = (config.store.artifact_root if config.store is not None
+                             else config.paths.evidence)
+            try:
+                mount = Path(self.resources.settings.required_mount).resolve(strict=True)
+                on_mount = artifact_root.resolve().is_relative_to(mount)
+            except OSError:
+                on_mount = False
+            if not on_mount:
+                raise ResourceError("ARTIFACT_STORAGE_OUTSIDE_REQUIRED_MOUNT")
         self.store = EvidenceFactStore.from_config(config)
-        self.store.initialize()
+        self.store.initialize(allow_existing_migration=False)
+        self.store.artifacts.prepare()
         self.registry = IdentityRegistry(self.store)
         self.auth = AuthContextManager(self.registry, RoutedSecretProvider(config.secrets))
         self.driver = driver or PlaywrightBrowserDriver(config.browser.chromium_executable)
         self.browser = BrowserSessionManager(self.registry, self.auth, self.driver, config.browser)
-        self.traffic = TrafficStore(self.store, self.registry)
+        self.maintenance = MaintenanceCoordinator(
+            config.paths.state / "maintenance.json", BackupManager.from_config(config),
+            ArtifactGarbageCollector(
+                self.store,
+                OrphanPolicy(config.retention.orphan_grace_hours,
+                             config.retention.max_scan_entries,
+                             config.retention.max_delete_files,
+                             config.retention.orphan_scan_timeout_seconds),
+                config.paths.logs / "retention-audit.jsonl",
+            ),
+            BrowserProfileCollector(
+                self.browser,
+                ProfileRetentionPolicy(
+                    config.retention.anonymous_profile_grace_hours,
+                    config.retention.max_profile_scan,
+                    config.retention.max_profile_delete,
+                    disabled_identity_grace_hours=
+                        config.retention.disabled_identity_profile_grace_hours,
+                    active_identity_grace_hours=
+                        config.retention.active_identity_profile_grace_hours),
+                self._profile_process_safe,
+                config.paths.logs / "profile-retention-audit.jsonl",
+            ),
+        )
+        self.traffic = TrafficStore(
+            self.store, self.registry,
+            retention_policy=(TrafficRetentionPolicy.from_settings(config.retention)
+                              if config.retention is not None else None),
+        )
         self.burp = BurpProxyProvider(config.burp, self.traffic, self.browser)
         self._burp_bridge_lock = Lock()
         self._burp_bridge: BurpBridgeServer | None = None
@@ -136,7 +189,9 @@ class BugHunterRuntime:
         self._burp_bridge_thread: Thread | None = None
         self.targets = TargetPackageRepository(config.targets.root)
         self.hypotheses = HypothesisStore(self.store)
-        self.domxss_store = DOMXSSStore(self.store)
+        self.domxss_store = DOMXSSStore(
+            self.store, js_retention_hours=config.retention.js_artifact_hours,
+            source_map_retention_hours=config.retention.source_map_hours)
         self.bootstrap_store = BootstrapStore(self.store)
         self.behaviour_store = BehaviourStore(self.store)
         self.exposure_store = ExposureStore(self.store)
@@ -178,8 +233,12 @@ class BugHunterRuntime:
             rate=self.rate, traffic=self.traffic, auth=self.auth,
             secrets=self.auth.secrets, settings=config.executor or ExecutorSettings(),
             proxy=BurpExecutionProxyAdapter(self.burp), browser=self.browser,
+            retention=config.retention,
         )
         self.recon = None
+        self._recon_probe_lock = Lock()
+        self._recon_probe_until = 0.0
+        self._recon_probe_state = "UNKNOWN"
         try:
             self.recon = PostgresReconRepository.from_config(config)
         except ConfigError:
@@ -226,7 +285,11 @@ class BugHunterRuntime:
         self.validations = ValidationStore(self.store)
         self.workflow = FindingWorkflow(self.store, self.validations)
         self.notification_store = NotificationStore(self.store)
-        self.report_store = ReportStore(self.store, ArtifactStore(config.paths.artifacts / "reports"))
+        self.report_store = ReportStore(
+            self.store, ArtifactStore(
+                config.paths.artifacts / "reports",
+                max_blob_bytes=(config.resources.max_artifact_bytes
+                                if config.resources else 134_217_728)))
         self.report_generator = ReportGenerator(
             store=self.store, drafts=self.report_store, validations=self.validations,
             runs=self.run_store, traffic=self.traffic, targets=self.targets,
@@ -330,7 +393,12 @@ class BugHunterRuntime:
                         if candidate.status in {CandidateStatus.SELECTED,
                                                 CandidateStatus.NEEDS_REFRESH} and candidate.id not in ambiguous:
                             self.planner.build_tasks(run, candidate)
-                    self.launch_planner(run.package_id, run.id)
+                    current = self.planner_store.get(run.target_id, run.id)
+                    if current and current.status is PlannerStatus.READY:
+                        self.planner_store.transition(
+                            run.target_id, run.id, PlannerStatus.PAUSED,
+                            "RECOVERY_OPERATOR_RESUME_REQUIRED",
+                            expected=(PlannerStatus.READY,))
                 except (LookupError, ValueError):
                     self.planner_store.transition(run.target_id, run.id,
                                                   PlannerStatus.PAUSED,
@@ -384,6 +452,8 @@ class BugHunterRuntime:
             existing = self._planner_threads.get(run_id)
             if existing and existing.is_alive():
                 return
+            self.resources.admit(WorkKind.PLANNER,
+                                 active=sum(thread.is_alive() for thread in self._planner_threads.values()))
             thread = Thread(target=self._planner_work, args=(package_id, run_id), daemon=True,
                             name="planner-" + run_id[-8:])
             self._planner_threads[run_id] = thread
@@ -394,6 +464,7 @@ class BugHunterRuntime:
             for _ in range(MAX_RUN_TASKS * 8):
                 with self._planner_lock:
                     package = self.package(package_id)
+                    self.resources.admit(WorkKind.PLANNER, active=0)
                     result = self.planner_runner.advance(package, run_id)
                     self.record_planner_notification(package.target.id, run_id, result)
                 if result["run"]["status"] not in {"READY", "RUNNING"} or result["task"] is None:
@@ -427,6 +498,11 @@ class BugHunterRuntime:
                 return True
         except OSError:
             return False
+
+    @staticmethod
+    def _profile_process_safe() -> bool:
+        status = inspect_owned_processes()
+        return status.state == "OK" and not status.browser_pids and not status.agent_display_pids
 
     def reconcile_on_startup(self) -> int:
         """Fail closed after process restart; never reuse an unowned browser handle."""
@@ -539,21 +615,86 @@ class BugHunterRuntime:
         items = [dict(row) for row in rows[:page.limit]]
         return {"items": items, "next_cursor": str(items[-1]["id"]) if len(rows) > page.limit else None}
 
+    def recon_health(self) -> str:
+        if self.recon is None:
+            return "DISCONNECTED"
+        with self._recon_probe_lock:
+            now = time.monotonic()
+            if now >= self._recon_probe_until:
+                try:
+                    self._recon_probe_state = "OK" if self.recon.probe() else "FAILED"
+                except Exception:
+                    self._recon_probe_state = "DISCONNECTED"
+                self._recon_probe_until = time.monotonic() + 30.0
+            return self._recon_probe_state
+
     def health(self) -> dict[str, object]:
-        with self.store._connection() as connection:
-            connection.execute("SELECT 1").fetchone()
+        try:
+            with self.store._connection() as connection:
+                connection.execute("SELECT 1").fetchone()
+            store_state = "ok"
+        except Exception:
+            store_state = "failed"
         browser_installed = importlib.util.find_spec("playwright") is not None
-        notifier = self.notifications.status()
-        degraded = notifier["delivery"]["failed"] > 0 or notifier["delivery"]["needs_review"] > 0
+        try:
+            notifier = self.notifications.status()
+            notifier_state = ("degraded" if notifier["delivery"]["failed"] > 0 or
+                              notifier["delivery"]["needs_review"] > 0 or
+                              notifier["delivery"].get("sending", 0) > 0 else
+                              "configured" if self.notifications.providers else "disabled")
+        except Exception:
+            notifier_state = "failed"
+        try:
+            objects = self.objects.stats()
+        except Exception:
+            objects = {"cleanup_pending": None, "orphaned": None}
+        try:
+            resource = self.resources.snapshot()
+            resource_state = resource.state
+        except ResourceError:
+            resource_state = "FAILED"
+        recon_state = self.recon_health()
+        recon_degraded = self.recon is not None and recon_state != "OK"
+        degraded = (store_state != "ok" or notifier_state in {"degraded", "failed"} or
+                    resource_state != "OK" or recon_degraded or
+                    objects["cleanup_pending"] is None)
         return {"status": "degraded" if degraded else "ok", "version": __version__, "checks": {
-            "bughunter_store": "ok", "browser_manager": "ready" if browser_installed else "dependency_missing",
+            "bughunter_store": store_state,
+            "browser_manager": "ready" if browser_installed else "dependency_missing",
             "vnc": "ready" if self._vnc_ready() else "not_running",
-            "traffic_store": "ok", "orchestrator": "ready", "validator": "ready",
-            "object_factory": "ready", "object_cleanup_pending": self.objects.stats()["cleanup_pending"],
-            "object_orphans": self.objects.stats()["orphaned"],
+            "traffic_store": store_state, "orchestrator": "ready", "validator": "ready",
+            "object_factory": "ready", "object_cleanup_pending": objects["cleanup_pending"],
+            "object_orphans": objects["orphaned"],
             "burp": self.burp.availability().value,
-            "notifier": "degraded" if degraded else ("configured" if self.notifications.providers else "disabled"),
-        }, "recon_integration": "configured_read_only" if self.recon else "not_connected"}
+            "notifier": notifier_state,
+            "resources": resource_state,
+            "recon": recon_state,
+        }, "recon_integration": recon_state}
+
+    def readiness(self) -> dict[str, object]:
+        """Local readiness only; optional providers never make the control plane disappear."""
+        checks: dict[str, object] = {}
+        try:
+            with self.store._connection() as connection:
+                connection.execute("SELECT 1").fetchone()
+                schema = connection.execute("PRAGMA user_version").fetchone()[0]
+            checks["state_database"] = "OK" if schema == _SCHEMA_VERSION else "FAILED"
+        except Exception:
+            checks["state_database"] = "FAILED"
+        checks["artifact_root"] = ("OK" if self.store.artifacts.root.is_dir() else "FAILED")
+        try:
+            resources = self.resources.snapshot()
+            checks["resources"] = resources.state
+        except ResourceError:
+            checks["resources"] = "FAILED"
+        checks["recon"] = self.recon_health() if self.recon is not None else "DISABLED"
+        checks["burp"] = self.burp.availability().value
+        essential_ok = checks["state_database"] == "OK" and checks["artifact_root"] == "OK"
+        degraded = (checks["resources"] != "OK" or
+                    checks["recon"] not in {"OK", "DISABLED"})
+        return {"state": "NOT_READY" if not essential_ok else
+                         "DEGRADED" if degraded else "READY",
+                "checks": checks, "version": __version__}
 
     def overview(self) -> dict[str, object]:
         with self.store._connection() as connection:
@@ -577,6 +718,230 @@ class BugHunterRuntime:
                 "finding_outcomes": self.workflow.metrics(),
                 "objects": self.objects.stats(),
                 "burp": self.burp.availability().value, "activity": self.activity(PageRequest(8, None))["items"]}
+
+    def operations(self) -> dict[str, object]:
+        try:
+            resource = self.resources.snapshot()
+        except ResourceError as exc:
+            resource = ResourceSnapshot(0, 0, 100, None, "BLOCKED", (exc.reason_code,))
+        with self.store._connection() as db:
+            schema = db.execute("PRAGMA user_version").fetchone()[0]
+            counts = {label: db.execute(sql).fetchone()[0] for label, sql in {
+                "evidence": "SELECT count(*) FROM evidence",
+                "traffic": "SELECT count(*) FROM traffic_exchanges",
+                "findings": "SELECT count(*) FROM findings",
+                "report_drafts": "SELECT count(*) FROM report_drafts",
+                "planner_active": "SELECT count(*) FROM planner_runs WHERE status NOT IN "
+                                  "('COMPLETED','BLOCKED','FAILED','CANCELLED','BUDGET_EXHAUSTED')",
+                "plan_active": "SELECT count(*) FROM plan_runs WHERE status NOT IN "
+                               "('COMPLETED','REJECTED','FAILED','BUDGET_EXHAUSTED','CANCELLED')",
+                "browser_active": "SELECT count(*) FROM browser_sessions WHERE status IN "
+                                  "('STARTING','RUNNING','WAITING_LOGIN','VERIFYING_IDENTITY',"
+                                  "'NEEDS_MANUAL_REVIEW','VALID')",
+                "browser_reauth_required": "SELECT count(*) FROM browser_sessions "
+                                           "WHERE status='REAUTH_REQUIRED'",
+                "research_active": "SELECT count(*) FROM research_requests WHERE status IN "
+                                   "('PENDING','RESEARCHING')",
+                "confirmed_findings": "SELECT count(*) FROM findings WHERE status IN "
+                                      "('CONFIRMED','READY_FOR_REPORT','SUBMITTED','TRIAGED','RESOLVED','REWARDED')",
+            }.items()}
+            artifact_stats = db.execute(
+                "SELECT count(*),COALESCE(sum(content_size),0) FROM "
+                "(SELECT artifact_hash,max(content_size) AS content_size FROM evidence "
+                "WHERE artifact_hash IS NOT NULL GROUP BY artifact_hash)"
+            ).fetchone()
+            recent_research = db.execute(
+                "SELECT external_allowed,status,error_code,usage_json,updated_at FROM research_requests "
+                "WHERE status IN ('COMPLETED','PARTIAL','FAILED','BLOCKED') "
+                "ORDER BY rowid DESC LIMIT 64"
+            ).fetchall()
+        database = self.store.db_path
+        try:
+            notifier = self.notifications.status()
+        except Exception:
+            notifier = {"configured_providers": [item.name for item in self.notifications.providers],
+                        "discord_configured": any(item.name == "discord" for item in self.notifications.providers),
+                        "smtp_configured": any(item.name == "smtp" for item in self.notifications.providers),
+                        "manual_review_enabled": self.notifications.settings.manual_review_enabled,
+                        "triage_enabled": self.notifications.settings.triage_enabled,
+                        "delivery": {"events": None, "sent": None, "deduped": None,
+                                     "pending": None, "sending": None,
+                                     "failed": None, "needs_review": None}}
+        try:
+            burp = self.burp.status()
+        except Exception:
+            burp = {"availability": "UNKNOWN", "status": "BURP_UNAVAILABLE",
+                    "bridge_connected": False, "configured_listeners": None,
+                    "reachable_listeners": None, "target_id": None,
+                    "proxy_listener_capacity": None, "proxy_listeners_reachable": None,
+                    "installed_version": None, "captured_exchanges": None,
+                    "last_capture_at": None, "dropped_events": None,
+                    "last_heartbeat_at": None}
+        burp_root = (self.config.burp.runtime_root
+                     if self.config.burp and self.config.burp.enabled else None)
+        burp_storage = (inspect_burp_storage(burp_root).to_dict()
+                        if burp_root is not None else
+                        {"state": "DISABLED" if not self.config.burp or
+                         not self.config.burp.enabled else "UNAVAILABLE"})
+        try:
+            objects = self.objects.stats()
+        except Exception:
+            objects = {"cleanup_pending": None, "orphaned": None}
+        active_count = getattr(self.driver, "active_session_count", None)
+        if callable(active_count):
+            counts["browser_active"] = active_count()
+        processes = inspect_owned_processes(
+            active_browser_sessions=active_count() if callable(active_count) else None).to_dict()
+        try:
+            backup = BackupManager.from_config(self.config).latest_metadata()
+        except (BackupError, OSError):
+            backup = {"state": "UNAVAILABLE", "backup_id": None, "age_hours": None,
+                      "size_bytes": None, "keep_generations": None,
+                      "verification": "NOT_CHECKED"}
+        warnings = list(resource.warnings)
+        if backup["state"] == "MISSING":
+            warnings.append("BACKUP_MISSING")
+        elif backup["state"] == "UNAVAILABLE" or backup["state"] == "INVALID_METADATA":
+            warnings.append("BACKUP_UNAVAILABLE")
+        elif backup["age_hours"] is not None and backup["age_hours"] > 48:
+            warnings.append("STALE_BACKUP")
+        if objects["orphaned"]:
+            warnings.append("ORPHAN_OBJECTS")
+        if objects["cleanup_pending"] is None or objects["orphaned"] is None:
+            warnings.append("OBJECT_STATUS_UNAVAILABLE")
+        if (notifier["delivery"]["failed"] is None or notifier["delivery"]["failed"] or
+                notifier["delivery"]["needs_review"] or notifier["delivery"].get("sending", 0)):
+            warnings.append("NOTIFIER_FAILURE")
+        if self.config.burp and self.config.burp.enabled and burp["status"] in {
+                "BURP_STOPPED", "BURP_UNAVAILABLE"}:
+            warnings.append("BURP_DOWN")
+        if self.config.burp and self.config.burp.enabled and burp_storage["state"] != "COMPLETE":
+            warnings.append("BURP_STORAGE_INVENTORY_INCOMPLETE")
+        if self.recon is None:
+            warnings.append("RECON_DISCONNECTED")
+        recon_state = self.recon_health()
+        if self.recon is not None and recon_state != "OK":
+            warnings.append("RECON_DISCONNECTED")
+        browser_dependency = (getattr(self.driver, "name", None) != "PLAYWRIGHT" or
+                              importlib.util.find_spec("playwright") is not None)
+        try:
+            vnc_available = self._vnc_ready()
+        except Exception:
+            vnc_available = False
+        if not browser_dependency or not vnc_available:
+            warnings.append("BROWSER_UNAVAILABLE")
+        research_enabled = bool(self.config.research and self.config.research.enabled)
+        external_configured = research_enabled and self.research.web_provider is not None
+        external_attempts = []
+        for row in recent_research:
+            if not row["external_allowed"] or row["status"] in {"PENDING", "RESEARCHING"}:
+                continue
+            try:
+                usage = json.loads(row["usage_json"])
+                if isinstance(usage, dict) and type(usage.get("searches")) is int and usage["searches"] > 0:
+                    external_attempts.append(row)
+            except (TypeError, ValueError):
+                continue
+        last_external = max(external_attempts, key=lambda row: row["updated_at"], default=None)
+        last_research = max(
+            (row for row in recent_research if row["status"] in
+             {"COMPLETED", "PARTIAL", "FAILED", "BLOCKED"}),
+            key=lambda row: row["updated_at"], default=None)
+        external_failed = bool(external_configured and last_external and
+                               last_external["error_code"] in {
+                                   "EXTERNAL_PROVIDER_UNAVAILABLE",
+                                   "MULTIPLE_PROVIDERS_UNAVAILABLE"})
+        local_failed = bool(self.research.local_providers and last_research and
+                            last_research["error_code"] in {
+                                "LOCAL_PROVIDER_UNAVAILABLE", "MULTIPLE_PROVIDERS_UNAVAILABLE"})
+        legacy_provider_failed = bool(last_research and
+                                      last_research["error_code"] == "PROVIDER_UNAVAILABLE")
+        research_execution_failed = bool(last_research and last_research["error_code"] in {
+            "RESEARCH_FAILED", "INTERRUPTED"})
+        if external_failed or local_failed or legacy_provider_failed:
+            warnings.append("RESEARCH_PROVIDER_UNAVAILABLE")
+        if local_failed:
+            warnings.append("RESEARCH_LOCAL_PROVIDER_UNAVAILABLE")
+        if research_execution_failed:
+            warnings.append("RESEARCH_EXECUTION_FAILURE")
+        components = {
+            "state_database": "OK" if schema == _SCHEMA_VERSION else "FAILED",
+            "artifact_store": "OK" if self.store.artifacts.root.is_dir() and
+            not any(code in resource.warnings for code in
+                    ("STORAGE_UNAVAILABLE", "REQUIRED_MOUNT_UNAVAILABLE")) else "BLOCKED",
+            "recon": "DISABLED" if self.recon is None else
+                     "OK" if recon_state == "OK" else "DEGRADED",
+            "burp": "DISABLED" if not self.config.burp or not self.config.burp.enabled else
+                    "FAILED" if burp["status"] in {"BURP_UNAVAILABLE", "BURP_STOPPED"} else
+                    "DEGRADED" if burp["status"] == "BRIDGE_DISCONNECTED" or
+                    (burp["configured_listeners"] is not None and
+                     burp["reachable_listeners"] is not None and
+                     burp["reachable_listeners"] < burp["configured_listeners"]) else "OK",
+            "burp_storage": "DISABLED" if not self.config.burp or not self.config.burp.enabled else
+                            "OK" if burp_storage["state"] == "COMPLETE" else "DEGRADED",
+            "browser_manager": "OK" if browser_dependency and vnc_available else "DEGRADED",
+            "object_cleanup": "DEGRADED" if "OBJECT_STATUS_UNAVAILABLE" in warnings else "OK",
+            "research": "DEGRADED" if external_failed or local_failed or legacy_provider_failed or
+                        research_execution_failed else "OK",
+            "research_local": "DISABLED" if not self.research.local_providers else
+                              "UNVERIFIED" if last_research is None or
+                              research_execution_failed or legacy_provider_failed else
+                              "DEGRADED" if local_failed else "OK",
+            "research_external": "DISABLED" if not external_configured else
+                                 "UNVERIFIED" if last_external is None or
+                                 last_external["error_code"] == "PROVIDER_UNAVAILABLE" else
+                                 "DEGRADED" if external_failed else "OK",
+            "notifier": "DEGRADED" if "NOTIFIER_FAILURE" in warnings else
+                        "DISABLED" if not self.notifications.providers else "OK",
+        }
+        if processes["state"] == "UNKNOWN":
+            warnings.append("PROCESS_INVENTORY_UNAVAILABLE")
+        if processes["suspected_orphan_browser_pids"]:
+            warnings.append("SUSPECTED_BROWSER_ORPHAN")
+        if processes["suspected_orphan_display_pids"] or (
+                not vnc_available and processes["vnc_display_pids"]):
+            warnings.append("SUSPECTED_DISPLAY_ORPHAN")
+        maintenance = self.maintenance.status()
+        if maintenance.get("status") in {"FAILED", "INTERRUPTED"}:
+            warnings.append("MAINTENANCE_REVIEW")
+        return {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "version": __version__, "uptime_seconds": int(time.monotonic() - self.started_monotonic),
+            "state": "BLOCKED" if resource.state == "BLOCKED" else "DEGRADED" if warnings else "OK",
+            "warnings": warnings,
+            "components": components,
+            "storage": {"database_bytes": database.stat().st_size,
+                        "wal_bytes": (database.parent / (database.name + "-wal")).stat().st_size
+                        if (database.parent / (database.name + "-wal")).is_file() else 0,
+                        "schema_actual": schema, "schema_expected": _SCHEMA_VERSION,
+                        "artifact_count": artifact_stats[0],
+                        "artifact_logical_bytes": artifact_stats[1]},
+            "resources": resource.to_dict(),
+            "counts": counts, "objects": objects, "burp": burp,
+            "burp_storage": burp_storage,
+            "processes": processes,
+            "notifications": notifier, "backup": backup,
+            "maintenance": maintenance,
+            "retention": {"mode": "ORPHAN_AND_REVIEWED_TERMINAL_PROFILES",
+                          "orphan_grace_hours": self.config.retention.orphan_grace_hours,
+                          "orphan_scan_timeout_seconds":
+                              self.config.retention.orphan_scan_timeout_seconds,
+                          "traffic": {
+                              "anonymous_hours": self.config.retention.traffic_anonymous_hours,
+                              "authenticated_hours": self.config.retention.traffic_authenticated_hours,
+                              "execution_hours": self.config.retention.traffic_execution_hours,
+                              "target_override_count": len(self.config.retention.traffic_target_hours),
+                              "payload_cleanup": "CLI_REVIEWED",
+                              "physical_gc": "SEPARATE_REVIEW"},
+                          "anonymous_profile_grace_hours":
+                              self.config.retention.anonymous_profile_grace_hours,
+                          "disabled_identity_profile_grace_hours":
+                              self.config.retention.disabled_identity_profile_grace_hours,
+                          "active_identity_profile_grace_hours":
+                              self.config.retention.active_identity_profile_grace_hours},
+            "recon": recon_state,
+            "research": "CONFIGURED" if self.config.research and self.config.research.enabled else "DISABLED",
+        }
 
     def target_summary(self, package: TargetPackage) -> dict[str, object]:
         with self.store._connection() as connection:
@@ -776,6 +1141,16 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def unavailable(_exc):
         return jsonify(error="service_unavailable"), 503
 
+    @app.errorhandler(ResourceError)
+    def resource_unavailable(exc):
+        return jsonify(error="resource_unavailable", reason_code=exc.reason_code), 503
+
+    @app.errorhandler(MaintenanceError)
+    def maintenance_rejected(exc):
+        status = 409 if exc.reason_code == "MAINTENANCE_BUSY" else 503 if (
+            exc.reason_code == "CORRUPT_MAINTENANCE_STATE") else 400
+        return jsonify(error="maintenance_rejected", reason_code=exc.reason_code), status
+
     @app.errorhandler(HTTPException)
     def http_error(exc):
         return jsonify(error="request_rejected"), exc.code
@@ -789,6 +1164,33 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def health():
         return jsonify(service.health())
 
+    @app.get("/v1/ready")
+    def readiness():
+        result = service.readiness()
+        return jsonify(result), 503 if result["state"] == "NOT_READY" else 200
+
+    @app.get("/v1/operations")
+    def operations():
+        return jsonify(service.operations())
+
+    @app.get("/v1/operations/maintenance")
+    def maintenance_status():
+        return jsonify(service.maintenance.status())
+
+    @app.post("/v1/operations/maintenance")
+    def maintenance_start():
+        data = _body(frozenset({"action", "backup_id", "review_id", "confirmed",
+                                "target_id", "identity_id", "session_id"}))
+        if not isinstance(data.get("action"), str) or type(data.get("confirmed", False)) is not bool:
+            raise ValueError("invalid maintenance action")
+        return jsonify(service.maintenance.start(
+            data["action"], backup_id=data.get("backup_id"),
+            review_id=data.get("review_id"),
+            confirmed=data.get("confirmed", False),
+            target_id=data.get("target_id"),
+            identity_id=data.get("identity_id"),
+            session_id=data.get("session_id"))), 202
+
     @app.get("/v1/status")
     def status():
         return jsonify({"version": __version__, "runtime": "single_process",
@@ -799,7 +1201,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                         "notifications": service.notifications.status(),
                         "reports": service.report_store.stats(),
                         "object_factory": {"mode": "known_recipes_only", **service.objects.stats()},
-                        "recon_integration": "configured_read_only" if service.recon else "not_connected"})
+                        "recon_integration": service.recon_health()})
 
     @app.get("/v1/overview")
     def overview():
@@ -1016,6 +1418,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         refresh = data.get("refresh", False)
         if type(refresh) is not bool:
             raise ValueError("invalid refresh flag")
+        service.resources.admit(WorkKind.BOOTSTRAP,
+                                active=sum(thread.is_alive() for thread in service._bootstrap_threads.values()))
         run = service.bootstrap.create(package.id, limits=limits, identity_policy=policy,
                                        identity_id=identity_id)
         try:
@@ -1672,6 +2076,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if not isinstance(raw_limits, dict) or set(raw_limits) - set(LearningLimits.__dataclass_fields__):
             raise ValueError("Invalid learning limits")
         limits = LearningLimits(**raw_limits)
+        service.resources.admit(WorkKind.LEARNING,
+                                active=sum(thread.is_alive() for thread in service._behaviour_threads.values()))
         run = service.behaviour.create(package, limits)
 
         def work() -> None:
@@ -1757,12 +2163,18 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         package = service.package(package_id)
         gap = service.research_store.find_gap(package.target.id, gap_ref)
         with service._research_lock:
-            if len(service._research_threads) >= 2:
-                return jsonify(error="research_capacity_reached"), 429
             result = service.research.submit(gap, budget=budget, external=external,
                                              private_target=True, refresh=refresh)
             if result["status"] != "PENDING" or result["request_id"] in service._research_threads:
                 return jsonify(result), 200
+            try:
+                service.resources.admit(
+                    WorkKind.RESEARCH,
+                    active=sum(thread.is_alive() for thread in service._research_threads.values()))
+            except ResourceError as exc:
+                service.research_store.transition(result["request_id"], ResearchStatus.BLOCKED,
+                                                  error_code=exc.reason_code)
+                raise
 
             def work() -> None:
                 try:
@@ -1842,6 +2254,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if not isinstance(raw_limits, dict) or set(raw_limits) - set(PlannerLimits.__dataclass_fields__):
             raise ValueError("invalid planner limits")
         limits = PlannerLimits(**raw_limits)
+        service.resources.admit(WorkKind.PLANNER,
+                                active=sum(thread.is_alive() for thread in service._planner_threads.values()))
         run = service.planner.start(package, mode=mode, limits=limits)
         if mode is not PlannerMode.ANALYZE_ONLY:
             service.launch_planner(package.id, run.id)
@@ -2317,6 +2731,10 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         if type(body.get("rerun", False)) is not bool:
             raise ValueError("invalid rerun option")
         package = service.package(body.get("target", ""))
+        with service.store._connection() as db:
+            active = db.execute("SELECT count(*) FROM plan_runs WHERE status NOT IN "
+                                "('COMPLETED','REJECTED','FAILED','BUDGET_EXHAUSTED','CANCELLED')").fetchone()[0]
+        service.resources.admit(WorkKind.PLAN, active=active)
         return jsonify(service.orchestrator.start(plan_id, package.id,
                                                  rerun=body.get("rerun", False))), 201
 
@@ -2675,6 +3093,11 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         identity_id = body.get("identity_id")
         if type(anonymous) is not bool or anonymous == bool(identity_id):
             raise ValueError("invalid session identity")
+        with service.store._connection() as connection:
+            active_sessions = connection.execute(
+                "SELECT count(*) FROM browser_sessions WHERE status NOT IN ('STOPPED','FAILED','EXPIRED')"
+            ).fetchone()[0]
+        service.resources.admit(WorkKind.BROWSER, active=active_sessions)
         capture_provider = body.get("capture_provider", "DIRECT")
         if capture_provider == "BURP":
             service.ensure_burp_bridge(package)
@@ -2706,6 +3129,12 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         package, session = scoped_session(session_id)
         if package.status is not PackageStatus.TRACKED:
             raise ValueError("target is not active")
+        with service.store._connection() as connection:
+            running = connection.execute(
+                "SELECT count(*) FROM browser_sessions WHERE status IN "
+                "('STARTING','RUNNING','WAITING_LOGIN','VERIFYING_IDENTITY','NEEDS_MANUAL_REVIEW','VALID')"
+            ).fetchone()[0]
+        service.resources.admit(WorkKind.BROWSER, active=running)
         if session.identity_id and service.config.browser.display and not service._vnc_ready():
             return jsonify(error="vnc_not_ready"), 409
         service.audit("browser_start_requested", target_id=package.target.id,

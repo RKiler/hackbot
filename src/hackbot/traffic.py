@@ -5,17 +5,18 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import hashlib
 import json
 import re
 import sqlite3
-from typing import Protocol, overload
+from types import MappingProxyType
+from typing import Mapping, Protocol, overload
 from urllib.parse import unquote_plus, urlsplit
 
 from .browser import BrowserSessionManager, BrowserStatus, VerificationStatus
-from .config import AppConfig
+from .config import AppConfig, RetentionSettings
 from .domain import (ObservationState, RequestRecord, ResponseRecord, TrafficSource, new_entity_id,
                      normalize_content_type, normalize_method, normalize_url, validate_entity_id)
 from .evidence import Evidence, EvidenceProvenance, EvidenceType, RedactionStatus, Retention, Sensitivity
@@ -44,6 +45,44 @@ class ExchangeState(StrEnum):
     FAILED = "FAILED"
     ABORTED = "ABORTED"
     TIMEOUT = "TIMEOUT"
+
+
+@dataclass(frozen=True, slots=True)
+class TrafficRetentionPolicy:
+    anonymous_hours: int = 720
+    authenticated_hours: int = 2160
+    execution_hours: int = 4320
+    target_hours: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if (any(type(value) is not int or not 1 <= value <= 87_600 for value in
+                (self.anonymous_hours, self.authenticated_hours, self.execution_hours)) or
+                not isinstance(self.target_hours, Mapping) or
+                len(self.target_hours) > 1000 or
+                any(not isinstance(key, str) or
+                    not re.fullmatch(r"TARGET-[0-9a-f]{32}", key) or
+                    type(value) is not int or not 1 <= value <= 87_600
+                    for key, value in self.target_hours.items())):
+            raise TrafficError("Invalid traffic retention policy")
+        object.__setattr__(self, "target_hours", MappingProxyType(dict(self.target_hours)))
+
+    @classmethod
+    def from_settings(cls, settings: RetentionSettings) -> TrafficRetentionPolicy:
+        return cls(settings.traffic_anonymous_hours, settings.traffic_authenticated_hours,
+                   settings.traffic_execution_hours, settings.traffic_target_hours)
+
+    def for_capture(self, target_id: str, auth_state: AuthState, source: TrafficSource,
+                    observed_at: datetime) -> Retention:
+        validate_entity_id(target_id, "TARGET")
+        if not isinstance(auth_state, AuthState) or not isinstance(source, TrafficSource):
+            raise TrafficError("Invalid traffic retention classification")
+        observed = _utc(observed_at)
+        hours = self.target_hours.get(target_id)
+        if hours is None:
+            hours = (self.execution_hours if source is TrafficSource.HACKBOT else
+                     self.anonymous_hours if auth_state is AuthState.ANONYMOUS else
+                     self.authenticated_hours)
+        return Retention(retain=True, expires_at=observed + timedelta(hours=hours))
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
@@ -427,15 +466,19 @@ class TrafficExchange:
 class TrafficStore:
     """BugHunter-owned traffic rows plus protected Phase 3 Evidence bytes."""
 
-    def __init__(self, evidence: EvidenceFactStore, registry: IdentityRegistry | None = None) -> None:
+    def __init__(self, evidence: EvidenceFactStore, registry: IdentityRegistry | None = None,
+                 retention_policy: TrafficRetentionPolicy | None = None) -> None:
         self.evidence = evidence
         self.registry = registry or IdentityRegistry(evidence)
+        self.retention_policy = retention_policy
 
     @classmethod
     def from_config(cls, config: AppConfig) -> TrafficStore:
         if not isinstance(config, AppConfig):
             raise TrafficError("Invalid BugHunter configuration")
-        return cls(EvidenceFactStore.from_config(config))
+        return cls(EvidenceFactStore.from_config(config), retention_policy=(
+            TrafficRetentionPolicy.from_settings(config.retention)
+            if config.retention is not None else None))
 
     def initialize(self) -> None:
         self.evidence.initialize()
@@ -505,19 +548,16 @@ class TrafficStore:
         browser_session_id: str | None = None, declared_identity_id: str | None = None,
         anonymous: bool = False,
         provider_reference: str | None = None, browser_action_id: str | None = None,
-        correlation_id: str | None = None, retention: Retention = Retention(),
+        correlation_id: str | None = None, retention: Retention | None = None,
         scope_source_url: str | None = None,
         auth_material_observed: bool = False,
     ) -> TrafficExchange:
         if not isinstance(request, CapturedRequest) or not isinstance(source, TrafficSource):
             raise TrafficError("Invalid traffic capture")
         provider = capture_provider.upper() if isinstance(capture_provider, str) else ""
-        if not _PROVIDER.fullmatch(provider) or not isinstance(retention, Retention):
+        if not _PROVIDER.fullmatch(provider) or (retention is not None and
+                                               not isinstance(retention, Retention)):
             raise TrafficError("Invalid traffic provider or retention")
-        if retention.pinned and not retention.retain:
-            raise TrafficError("Pinned traffic must be retained")
-        if retention.expires_at is not None:
-            _utc(retention.expires_at)
         if type(auth_material_observed) is not bool:
             raise TrafficError("Invalid capture authentication signal")
         for value in (provider_reference, browser_action_id, correlation_id):
@@ -532,6 +572,14 @@ class TrafficStore:
                                         auth_material_present=(auth_material_observed
                                                                or _auth_material_present(request.headers, parsed.query)))
         observed = _utc(request.observed_at)
+        if retention is None:
+            retention = (self.retention_policy.for_capture(target.target.id,
+                         attribution.auth_state, source, observed)
+                         if self.retention_policy is not None else Retention())
+        if retention.pinned and not retention.retain:
+            raise TrafficError("Pinned traffic must be retained")
+        if retention.expires_at is not None:
+            _utc(retention.expires_at)
         origin = parsed.scheme + "://" + parsed.netloc
         display_path = _path_shape(parsed.path)
         query_names = _query_names(parsed.query)
@@ -705,7 +753,7 @@ class TrafficStore:
                        browser_manager: BrowserSessionManager | None = None,
                        declared_identity_id: str | None = None,
                        anonymous: bool = False,
-                       retention: Retention = Retention()) -> TrafficExchange:
+                       retention: Retention | None = None) -> TrafficExchange:
         if not isinstance(packet, CapturePacket):
             raise TrafficError("Invalid traffic capture")
         exchange = self.store_request(

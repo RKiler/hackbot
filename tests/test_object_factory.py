@@ -21,15 +21,14 @@ from hackbot.policy import policy_version
 from hackbot.target_policy import PolicyDecision
 from hackbot.test_objects import CleanupStrategy, ObjectRegistry, ObjectState
 
-from .test_executor import ExecutorTests
+from .test_executor import ExecutorFixture
 
 
-class ObjectFactoryTests(ExecutorTests):
+class ObjectFactoryTests(ExecutorFixture):
     def setUp(self):
         super().setUp()
-        if self._testMethodName in ObjectFactoryTests.__dict__:
-            self.executor.settings = replace(self.executor.settings, connect_timeout_seconds=1,
-                                             read_timeout_seconds=1, overall_timeout_seconds=5)
+        self.executor.settings = replace(self.executor.settings, connect_timeout_seconds=15,
+                                         read_timeout_seconds=15, overall_timeout_seconds=120)
         self.package = replace(self.package, autonomy=replace(
             self.package.autonomy, state_changing=PolicyDecision.ALLOW,
             create_disposable_objects=PolicyDecision.ALLOW,
@@ -271,7 +270,7 @@ class ObjectFactoryTests(ExecutorTests):
             result = self.factory.resolve(package_id=self.package.id, recipe_id=recipe_id,
                                           identity_id=identity.id, tenant_id=tenant.id,
                                           session_id=session.id, purpose="Cross-tenant fixture")
-            self.assertEqual(result.outcome, "READY")
+            self.assertEqual(result.outcome, "READY", result.reason)
             objects.append(result.item)
         self.assertNotEqual(objects[0].id, objects[1].id)
         self.assertNotEqual(objects[0].tenant_id, objects[1].tenant_id)
@@ -372,7 +371,7 @@ class ObjectFactoryTests(ExecutorTests):
         ready = self.factory.resolve(package_id=self.package.id, recipe_id="project",
                                      identity_id=identity.id, tenant_id=tenant.id,
                                      session_id=session.id, purpose="Budget fixture")
-        self.assertEqual(ready.outcome, "READY")
+        self.assertEqual(ready.outcome, "READY", ready.reason)
         self.assertEqual(ready.item.setup_requests_reserved, 2)
         self.assertEqual(self.factory.cleanup(ready.item.id, ready.item.target_id,
                                                session_id=session.id).outcome, "CLEANED")

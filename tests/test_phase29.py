@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from hackbot.artifacts import ArtifactStore
 from hackbot.config import NotificationSettings, StoreSettings
@@ -18,7 +18,7 @@ from hackbot.evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from hackbot.finding_workflow import FindingWorkflow
 from hackbot.notification_store import (DeliveryStatus, NotificationPriority,
                                        NotificationStore, NotificationType)
-from hackbot.notifications import (DeliveryError, DiscordNotifier, NotificationManager,
+from hackbot.notifications import (ConsoleNotifier, DeliveryError, DiscordNotifier, NotificationManager,
                                    NotificationMessage, SMTPNotifier)
 from hackbot.reports import ReportGenerator, ReportProvenance, ReportReadiness, ReportStore
 from hackbot.store import EvidenceFactStore
@@ -46,6 +46,22 @@ class FakeSecrets:
 
     def get(self, _reference: str):
         return SimpleNamespace(reveal=lambda **_kwargs: self.value)
+
+
+class ConsoleNotifierTests(unittest.TestCase):
+    def test_console_log_contains_only_validated_event_id(self):
+        logger = Mock()
+        notifier = ConsoleNotifier(logger)
+        secret = "credential-private-fixture-value"
+        event_id = "NOTIF-" + "a" * 32
+        notifier.send(NotificationMessage(secret, secret, event_id))
+        self.assertEqual(logger.info.call_args.kwargs["extra"],
+                         {"context": {"event_id": event_id}})
+        self.assertNotIn(secret, str(logger.info.call_args))
+        notifier.send(NotificationMessage(secret, secret, secret))
+        self.assertEqual(logger.info.call_args.kwargs["extra"],
+                         {"context": {"event_id": "[invalid]"}})
+        self.assertNotIn(secret, str(logger.info.call_args))
 
 
 class Phase29Tests(unittest.TestCase):
@@ -91,6 +107,18 @@ class Phase29Tests(unittest.TestCase):
         self.assertEqual(same_finding.id, finding.id)
         self.assertEqual(same_result.id, result.id)
         self.assertEqual(self.outbox.stats(self.target_id)["events"], 1)
+
+    def test_pending_confirmed_event_delivers_once_after_restart(self):
+        _, finding = self.confirmed()
+        self.assertEqual(self.notifier.messages, [])
+        restarted = NotificationManager(NotificationStore(self.store), self.fixture.results,
+            self.fixture.work.runs, self.fixture.fx.traffic, NotificationSettings(),
+            (self.notifier,))
+        self.assertEqual(restarted.process(), 1)
+        self.assertEqual(restarted.process(), 0)
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn(finding.id, self.notifier.messages[0].body)
+        self.assertEqual(self.outbox.stats(self.target_id)["sent"], 1)
 
     def test_duplicate_root_cause_does_not_enqueue_new_confirmed(self):
         _, finding = self.confirmed()
