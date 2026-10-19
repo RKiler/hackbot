@@ -103,6 +103,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()
 
+    def test_operator_target_create_accounts_and_import_are_local_only(self):
+        payload = {
+            "name": "Local Pilot Fixture", "id": "local-pilot-fixture",
+            "primary_domain": "app.local.test", "confirmed": True,
+            "scope": {"include": ["app.local.test", "api.local.test"],
+                      "exclude": ["billing.local.test"], "schemes": ["https"], "ports": [443]},
+            "source": {"kind": "RESEARCHER", "reference": "synthetic fixture",
+                       "operator": "test-operator"},
+            "rules": {"automated_testing_allowed": True,
+                      "account_creation_allowed": False,
+                      "forbidden_actions": ["credential_stuffing"]},
+            "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW",
+                         "bounded_active": "DENY", "state_changing": "DENY",
+                         "destructive": "DENY"},
+            "rate": {"requests_per_second": 1, "requests_per_minute": 30,
+                     "max_concurrency": 1, "burst": 1}}
+        self.assertIn("RESEARCHER", self.get("/v1/targets/setup-options")["source_kinds"])
+        self.assertEqual(self.client.get("/v1/targets/local-pilot-fixture").status_code, 404)
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            created = self.client.post("/v1/targets", json=payload)
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        self.assertEqual(created.get_json()["network_requests_sent"], 0)
+        self.assertEqual(self.get("/v1/targets/local-pilot-fixture")["primary_domain"], "app.local.test")
+        self.assertEqual(self.client.post("/v1/targets", json=payload).status_code, 409)
+        accounts_path = self.config.targets.root / "local-pilot-fixture" / "accounts.yaml"
+        self.assertFalse(accounts_path.exists())
+        saved = self.client.post("/v1/targets/local-pilot-fixture/accounts", json={"accounts": [
+            {"alias": "admin", "tenant": "company1", "role": "admin"},
+            {"alias": "member", "tenant": "company1", "role": "member"}]})
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        self.assertEqual(saved.get_json()["configured"], 2)
+        self.assertTrue(accounts_path.is_file())
+        self.assertEqual(self.get("/v1/targets/local-pilot-fixture/accounts")["items"][0][
+            "registration"], "NOT_REGISTERED")
+        imported = self.client.post("/v1/targets/local-pilot-fixture/import-identities", json={})
+        self.assertEqual(imported.status_code, 201, imported.get_data(as_text=True))
+        self.assertEqual(imported.get_json()["imported"], 2)
+        self.assertEqual(self.get("/v1/targets/local-pilot-fixture/accounts")["items"][0][
+            "registration"], "REGISTERED")
+        self.assertEqual(self.client.post("/v1/targets/local-pilot-fixture/accounts", json={
+            "accounts": [{"alias": "admin", "tenant": "company2", "role": "admin"}]}).status_code, 409)
+        self.assertEqual(self.client.get("/v1/targets/local-pilot-fixture/accounts").status_code, 200)
+
     def test_runtime_rejects_old_existing_schema_without_migration(self):
         database = self.runtime.store.db_path
         with sqlite3.connect(database) as connection:

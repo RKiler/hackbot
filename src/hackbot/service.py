@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import socket
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -96,8 +97,10 @@ from .skill_plans import (DOMPlanBinding, MessagePlanBinding, PrerequisiteChecke
 from .store import EvidenceFactStore, StoreNotInitialized, StoreSchemaError, _SCHEMA_VERSION
 from .artifacts import ArtifactStore
 from .target_loader import TargetPackageRepository
+from .target_operator import TargetPackageOperator, TargetSetupError
 from .target_package import PackageStatus, TargetPackage
-from .target_policy import RiskLevel
+from .target_policy import PolicyDecision, RatePolicy, RiskLevel
+from .target_scope import ScopeSourceKind
 from .traffic import TrafficRetentionPolicy, TrafficStore
 from .validation_store import FindingStatus, ValidationStatus, ValidationStore
 from .validator import DeterministicValidatorEngine, ValidatorRegistry
@@ -195,6 +198,8 @@ class BugHunterRuntime:
         self._burp_bridge_target: str | None = None
         self._burp_bridge_thread: Thread | None = None
         self.targets = TargetPackageRepository(config.targets.root)
+        self.target_operator = TargetPackageOperator(self.targets)
+        self._target_operator_lock = Lock()
         self.hypotheses = HypothesisStore(self.store)
         self.domxss_store = DOMXSSStore(
             self.store, js_retention_hours=config.retention.js_artifact_hours,
@@ -1004,6 +1009,53 @@ class BugHunterRuntime:
             "research": "CONFIGURED" if self.config.research and self.config.research.enabled else "DISABLED",
         }
 
+    def bootstrap_readiness(self, package: TargetPackage) -> dict[str, object]:
+        """Local-only preflight; the executor still rechecks every dispatch and redirect."""
+        settings = self.executor.settings
+        try:
+            binding = self.burp.anonymous_capture_binding(package.target.id)
+        except (BurpError, ValueError, sqlite3.Error):
+            binding = None
+        capture_ready = binding is not None
+        executor_enabled = settings.allow_direct or self.executor.proxy is not None
+        proxy_ready = False
+        seeds = self.bootstrap.seed_urls(package)
+        policy_reason = "NO_EXACT_SCOPE_SEED"
+        policy_ready = False
+        for url in seeds:
+            action = ProposedAction(package.target.id, package.id, ActionCategory.SAFE_READ,
+                                    ActorMode.ANONYMOUS, "cold_start_bootstrap",
+                                    "Bounded first-party discovery read", url=url, method="GET")
+            decision = self.policy.evaluate(package, action, record=False)
+            if decision.result is PolicyDecision.ALLOW:
+                policy_ready = True
+                try:
+                    proxy_ready = bool(self.executor.proxy and self.executor.proxy.route(action))
+                except (BurpError, ValueError, sqlite3.Error):
+                    proxy_ready = False
+                break
+            policy_reason = decision.reason_code
+        transport_ready = proxy_ready or (settings.allow_direct and not settings.capture_required)
+        blocked_reason = None
+        if package.status is not PackageStatus.TRACKED:
+            blocked_reason = "TARGET_NOT_TRACKED"
+        elif not policy_ready:
+            blocked_reason = policy_reason
+        elif settings.capture_required and not proxy_ready:
+            blocked_reason = "ANONYMOUS_BURP_CAPTURE_REQUIRED"
+        elif not transport_ready:
+            blocked_reason = "NO_EXECUTOR_TRANSPORT"
+        return {
+            "executor_enabled": executor_enabled,
+            "direct_enabled": settings.allow_direct,
+            "capture_required": settings.capture_required,
+            "transport_ready": transport_ready,
+            "burp_capture_ready": capture_ready,
+            "anonymous_listener_port": binding.proxy_port if binding else None,
+            "cold_start_available": blocked_reason is None,
+            "blocked_reason": blocked_reason,
+        }
+
     def target_summary(self, package: TargetPackage) -> dict[str, object]:
         with self.store._connection() as connection:
             counts = {
@@ -1201,6 +1253,11 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.errorhandler((ValueError))
     def bad_request(_exc):
         return jsonify(error="invalid_request"), 400
+
+    @app.errorhandler(TargetSetupError)
+    def target_setup_error(exc):
+        return jsonify(error=exc.code, field=exc.field), 409 if exc.code in {
+            "duplicate_target", "registered_account_immutable"} else 400
 
     @app.errorhandler(StoreNotInitialized)
     @app.errorhandler(StoreSchemaError)
@@ -1450,9 +1507,71 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         return jsonify({"items": [service.target_summary(item) for item in result.items],
                         "next_cursor": result.next_cursor})
 
+    @app.get("/v1/targets/setup-options")
+    def target_setup_options():
+        return jsonify({"source_kinds": [item.value for item in ScopeSourceKind],
+                        "decisions": [item.value for item in PolicyDecision],
+                        "risk_fields": ["passive", "safe_read", "bounded_active",
+                                        "state_changing", "destructive"],
+                        "defaults": {"scope": {"schemes": ["https"], "ports": [443]},
+                                     "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW",
+                                                  "bounded_active": "DENY", "state_changing": "DENY",
+                                                  "destructive": "DENY"},
+                                     "rate": RatePolicy(1, 30, 1, 1).to_dict()}})
+
+    @app.post("/v1/targets")
+    def target_create():
+        data = _body(frozenset({"name", "id", "primary_domain", "scope", "source",
+                                "rules", "autonomy", "rate", "confirmed"}))
+        with service._target_operator_lock:
+            package = service.target_operator.create(data)
+        return jsonify({"target": service.target_summary(package),
+                        "network_requests_sent": 0}), 201
+
     @app.get("/v1/targets/<package_id>")
     def target(package_id: str):
         return jsonify(service.target_summary(service.package(package_id)))
+
+    def target_account_view(package: TargetPackage) -> dict[str, object]:
+        rows = []
+        ready = 0
+        for account in package.accounts:
+            identity = service.registry.get_identity(package.target.id, account.alias)
+            browser = (service.browser.get_session_for_identity(package.target.id, identity.id)
+                       if identity else None)
+            verified = bool(browser and browser.verification_status.value == "MATCH"
+                            and browser.status.value == "VALID")
+            ready += int(verified)
+            rows.append({"alias": account.alias, "tenant": account.tenant_hint,
+                         "role": account.role_hint,
+                         "registration": "REGISTERED" if identity else "NOT_REGISTERED",
+                         "session": "SESSION_MISSING" if browser is None else (
+                             "IDENTITY_VERIFIED" if verified else "LOGIN_REQUIRED" if
+                             browser.status.value in {"WAITING_LOGIN", "REAUTH_REQUIRED", "EXPIRED"}
+                             else "SESSION_READY"),
+                         "identity_id": identity.id if identity else None})
+        return {"items": rows, "configured": len(rows), "sessions_ready": ready,
+                "secrets_stored": False}
+
+    @app.get("/v1/targets/<package_id>/accounts")
+    def target_accounts(package_id: str):
+        return jsonify(target_account_view(service.package(package_id)))
+
+    @app.post("/v1/targets/<package_id>/accounts")
+    def target_accounts_save(package_id: str):
+        data = _body(frozenset({"accounts"}))
+        with service._target_operator_lock:
+            package = service.package(package_id)
+            rows = data.get("accounts")
+            aliases = {item.alias for item in package.accounts}
+            if isinstance(rows, list):
+                aliases.update(row.get("alias") for row in rows if isinstance(row, dict)
+                               and isinstance(row.get("alias"), str))
+            registered = {alias for alias in aliases if service.registry.get_identity(
+                package.target.id, alias) is not None}
+            updated = service.target_operator.save_accounts(package_id, data,
+                                                            registered_aliases=registered)
+        return jsonify({**target_account_view(updated), "network_requests_sent": 0})
 
     @app.get("/v1/targets/<package_id>/bootstrap")
     def bootstrap_status(package_id: str):
@@ -1462,6 +1581,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         runs = service.bootstrap_store.list_runs(package.target.id, limit=10)
         return jsonify({"target_id": package.target.id,
                         "recon_availability": recon_status,
+                        "transport": service.bootstrap_readiness(package),
                         "discovery_state": state["state"] if state else (
                             "RECON_BACKED" if recon_status == "RECON_BACKED" else "COLD_START"),
                         "latest": runs[0].to_dict() if runs else None,
@@ -1470,6 +1590,9 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.post("/v1/targets/<package_id>/bootstrap")
     def bootstrap_start(package_id: str):
         package = service.package(package_id)
+        transport = service.bootstrap_readiness(package)
+        if not transport["cold_start_available"]:
+            return jsonify(error="bootstrap_not_ready", transport=transport), 409
         data = _body(frozenset({"identity_policy", "identity_id", "limits", "refresh"}))
         try:
             policy = BootstrapIdentityPolicy(data.get("identity_policy", "anonymous_plus_primary"))

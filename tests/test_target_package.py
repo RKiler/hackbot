@@ -4,8 +4,10 @@ from io import StringIO
 import json
 from pathlib import Path
 import shutil
+import stat
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -18,6 +20,7 @@ from hackbot.target_loader import (
 from hackbot.target_policy import (
     AutonomyAction, AutonomyPolicy, PolicyDecision, ProgramRules, RatePolicy, RiskLevel,
 )
+from hackbot.target_operator import TargetPackageOperator, TargetSetupError
 from hackbot.target_recon import resolve_recon_target
 from hackbot.target_scope import (
     HostRule, PathMatch, PathRule, ProgramScope, ScopeResult,
@@ -317,6 +320,123 @@ class TargetLoaderTests(unittest.TestCase):
                         environ={"HOME": directory}, stdout=output, stderr=errors)
             self.assertEqual(code, 2)
             self.assertEqual(output.getvalue(), "")
+
+
+class TargetOperatorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "targets"
+        self.root.mkdir()
+        self.operator = TargetPackageOperator(TargetPackageRepository(self.root))
+
+    def payload(self):
+        return {"name": "Fictional Sandbox", "id": "fictional-sandbox",
+                "primary_domain": "APP.EXAMPLE.TEST", "confirmed": True,
+                "scope": {"include": ["APP.EXAMPLE.TEST", "api.example.test"],
+                          "exclude": ["billing.example.test"],
+                          "schemes": ["https"], "ports": [443]},
+                "source": {"kind": "RESEARCHER", "reference": "local synthetic authorization",
+                           "operator": "fixture-operator"},
+                "rules": {"automated_testing_allowed": True,
+                          "account_creation_allowed": False,
+                          "forbidden_actions": ["credential_stuffing"],
+                          "data_handling_restrictions": "Only synthetic data"},
+                "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW",
+                             "bounded_active": "DENY", "state_changing": "DENY",
+                             "destructive": "DENY"},
+                "rate": {"requests_per_second": 1, "requests_per_minute": 30,
+                         "max_concurrency": 1, "burst": 1}}
+
+    def test_valid_multi_host_package_is_canonical_and_private(self):
+        package = self.operator.create(self.payload())
+        self.assertEqual(package.primary_domain, "app.example.test")
+        self.assertEqual([rule.pattern for rule in package.scope.include_hosts],
+                         ["app.example.test", "api.example.test"])
+        self.assertEqual(package.scope.exclude_hosts[0].pattern, "billing.example.test")
+        self.assertRegex(package.target.id, r"^TARGET-[0-9a-f]{32}$")
+        self.assertIsNotNone(package.configured_at.tzinfo)
+        self.assertEqual(package.rate.requests_per_minute, 30)
+        self.assertEqual(package.autonomy.safe_read, PolicyDecision.ALLOW)
+        self.assertEqual(self.operator.repository.get_target_package(package.id).target.id,
+                         package.target.id)
+        self.assertEqual(stat.S_IMODE((self.root / package.id).stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.root / package.id / "target.yaml").stat().st_mode), 0o600)
+        self.assertEqual([item.name for item in self.root.iterdir()], [package.id])
+
+    def test_duplicate_slug_and_symlink_are_not_overwritten(self):
+        self.operator.create(self.payload())
+        original = (self.root / "fictional-sandbox" / "target.yaml").read_bytes()
+        with self.assertRaisesRegex(TargetSetupError, "duplicate_target"):
+            self.operator.create(self.payload())
+        self.assertEqual((self.root / "fictional-sandbox" / "target.yaml").read_bytes(), original)
+        other = self.payload(); other["id"] = "linked"
+        (self.root / "linked").symlink_to(self.root / "fictional-sandbox", target_is_directory=True)
+        with self.assertRaisesRegex(TargetSetupError, "duplicate_target"):
+            self.operator.create(other)
+        self.assertTrue((self.root / "linked").is_symlink())
+
+    def test_invalid_scope_policy_rate_and_path_inputs_leave_no_package(self):
+        variants = []
+        for field, value in (("id", "../escape"), ("id", "/tmp/escape"),
+                             ("primary_domain", "https://app.example.test/path")):
+            body = self.payload(); body[field] = value; variants.append(body)
+        for include in (["app.example.test", "APP.EXAMPLE.TEST"],
+                        ["app.example.test", "*bad.example.test"],
+                        ["app.example.test/path"]):
+            body = self.payload(); body["scope"]["include"] = include; variants.append(body)
+        body = self.payload(); body["scope"]["exclude"] = ["app.example.test"]; variants.append(body)
+        body = self.payload(); body["scope"]["exclude"] = ["*.example.test"]; variants.append(body)
+        for field, value in (("ports", [0]), ("ports", [65536]),
+                             ("schemes", ["ftp"])):
+            body = self.payload(); body["scope"][field] = value; variants.append(body)
+        body = self.payload(); body["autonomy"]["safe_read"] = "APPROVAL_REQUIRED"; variants.append(body)
+        body = self.payload(); body["rate"]["requests_per_second"] = 0; variants.append(body)
+        body = self.payload(); body["rate"]["max_concurrency"] = -1; variants.append(body)
+        body = self.payload(); body["confirmed"] = False; variants.append(body)
+        for body in variants:
+            with self.subTest(body=body), self.assertRaises(TargetSetupError):
+                self.operator.create(body)
+            self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_failed_publish_removes_partial_directory(self):
+        with patch("hackbot.target_operator.os.replace", side_effect=OSError("fixture failure")):
+            with self.assertRaises(OSError):
+                self.operator.create(self.payload())
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_account_metadata_round_trip_and_secret_rejection(self):
+        package = self.operator.create(self.payload())
+        saved = self.operator.save_accounts(package.id, {"accounts": [
+            {"alias": "admin", "tenant": "company1", "role": "admin"},
+            {"alias": "employee", "tenant": "company1", "role": "employee"}]},
+            registered_aliases=set())
+        self.assertEqual([item.alias for item in saved.accounts], ["admin", "employee"])
+        account_path = self.root / package.id / "accounts.yaml"
+        self.assertEqual(stat.S_IMODE(account_path.stat().st_mode), 0o600)
+        before = account_path.read_bytes()
+        for rows in ([{"alias": "admin"}, {"alias": "admin"}],
+                     [{"alias": "../escape"}],
+                     [{"alias": "new", "role": "admin"}],
+                     [{"alias": "new", "tenant": "company1", "role": "password=abc"}],
+                     [{"alias": "new", "tenant": "company1", "role": "member", "cookie": "x"}]):
+            with self.subTest(rows=rows), self.assertRaises(TargetSetupError):
+                self.operator.save_accounts(package.id, {"accounts": rows}, registered_aliases=set())
+            self.assertEqual(account_path.read_bytes(), before)
+        with self.assertRaisesRegex(TargetSetupError, "registered_account_immutable"):
+            self.operator.save_accounts(package.id, {"accounts": [
+                {"alias": "admin", "tenant": "company2", "role": "admin"}]},
+                registered_aliases={"admin"})
+        self.assertEqual(account_path.read_bytes(), before)
+
+    def test_account_symlink_is_rejected(self):
+        package = self.operator.create(self.payload())
+        outside = Path(self.temp.name) / "outside.yaml"
+        outside.write_text("outside")
+        (self.root / package.id / "accounts.yaml").symlink_to(outside)
+        with self.assertRaises(ValueError):
+            self.operator.save_accounts(package.id, {"accounts": []}, registered_aliases=set())
+        self.assertEqual(outside.read_text(), "outside")
 
 
 if __name__ == "__main__":

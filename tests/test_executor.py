@@ -11,7 +11,11 @@ import http.client
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import select
 import shutil
+import socket
+import ssl
+import subprocess
 from tempfile import TemporaryDirectory
 import threading
 import time
@@ -501,6 +505,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class TunnelProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_CONNECT(self):
+        self.server.received.append(self.path)
+        if self.path != f"127.0.0.1:{self.server.target.server_port}":
+            self.send_error(403)
+            return
+        with socket.create_connection(("127.0.0.1", self.server.target.server_port), timeout=3) as upstream:
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            while True:
+                ready, _, _ = select.select((self.connection, upstream), (), (), 5)
+                if not ready:
+                    break
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    (upstream if source is self.connection else self.connection).sendall(data)
+
+
 class FakeDriver:
     name = "FIXTURE"
 
@@ -638,6 +665,70 @@ class ExecutorFixture(unittest.TestCase):
         return identity, session
 
 class ExecutorTests(ExecutorFixture):
+    def test_captured_https_transport_scope_redirect_and_budget(self):
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is required for the local TLS fixture")
+        cert, key = self.root / "fixture.crt", self.root / "fixture.key"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-days", "1", "-subj", "/CN=127.0.0.1",
+                        "-addext", "subjectAltName=IP:127.0.0.1",
+                        "-keyout", str(key), "-out", str(cert)],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        https = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        https.received = []
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        https.socket = context.wrap_socket(https.socket, server_side=True)
+        https_thread = threading.Thread(target=https.serve_forever, daemon=True)
+        https_thread.start()
+        self.addCleanup(https.server_close)
+        self.addCleanup(https.shutdown)
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), TunnelProxyHandler)
+        proxy.received = []
+        proxy.target = https
+        proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        proxy_thread.start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+
+        self.base = f"https://127.0.0.1:{https.server_port}"
+        self.package = replace(self.package, scope=replace(
+            self.package.scope, include_hosts=(HostRule("127.0.0.1", ("https",),
+                                                        (https.server_port,)),),
+            default_schemes=("https",), default_ports=(https.server_port,)))
+        self.targets.package = self.package
+
+        class LocalCaptureRoute:
+            def route(self, _action):
+                return ProxyRoute(f"http://127.0.0.1:{proxy.server_port}", cert)
+
+        self.executor.proxy = LocalCaptureRoute()
+        self.executor.settings = replace(self.executor.settings,
+                                         allow_direct=False, capture_required=True)
+        result = self.run_action(self.action())
+        self.assertEqual((result.error, result.status_code), (None, 200))
+        self.assertEqual(proxy.received, [f"127.0.0.1:{https.server_port}"])
+        self.assertEqual(https.received[0][1], "/ok")
+        exchange = self.traffic.get_exchange(result.exchange_ids[0])
+        self.assertEqual(exchange.attribution.auth_state, AuthState.ANONYMOUS)
+        self.assertIsNotNone(exchange.response)
+
+        before = len(proxy.received)
+        with self.assertRaises(PermitError):
+            self.run_action(replace(self.action(), url=f"https://localhost:{https.server_port}/ok"))
+        self.assertEqual(len(proxy.received), before)
+        redirected = self.run_action(self.action("/redirect-out"))
+        self.assertEqual(redirected.error, ExecutionError.REDIRECT_DENIED)
+        self.assertEqual(len(proxy.received), before + 1)
+        first = self.run_action(self.action(), experiment_id="https_budget",
+                                budget=ExperimentBudget(max_requests=1))
+        self.assertIsNone(first.error)
+        before = len(proxy.received)
+        second = self.run_action(self.action(), experiment_id="https_budget",
+                                 budget=ExperimentBudget(max_requests=1))
+        self.assertIn(second.error, {ExecutionError.POLICY_DENIED, ExecutionError.RATE_LIMITED})
+        self.assertEqual(len(proxy.received), before)
+
     def test_empty_schema_seed_keeps_fixture_databases_isolated(self):
         other = ExecutorFixture(methodName="runTest")
         other.setUp()

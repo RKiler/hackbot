@@ -32,7 +32,7 @@ from hackbot.browser import (BrowserError, BrowserSessionManager, IdentityObserv
                              IdentityVerificationRule)
 from hackbot.browser_trust import ProfileTrustError, install_profile_ca
 from hackbot.browser_playwright import PlaywrightBrowserDriver
-from hackbot.burp import BurpError, BurpProxyProvider
+from hackbot.burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
 from hackbot.burp_bridge import (BurpBridgeServer, BurpCaptureProvider,
                                  BurpObservation, _BridgeHandler)
 from hackbot.burp_temp import (BurpTempCollector, BurpTempError, BurpTempPolicy)
@@ -42,6 +42,7 @@ from hackbot.config import (BrowserSettings, BurpSettings, ConfigError, SecretBi
 from hackbot.domain import TrafficSource, new_entity_id
 from hackbot.identity import IdentityStatus
 from hackbot.identity_registry import IdentityRegistry
+from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction
 from hackbot.secrets import RoutedSecretProvider, SecretValue
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
@@ -352,6 +353,47 @@ class BurpTests(unittest.TestCase):
         self.assertEqual(status["reachable_listeners"], 1)
         self.assertTrue(status["bridge_connected"])
         self.assertIsNotNone(status["last_heartbeat_at"])
+
+    def test_cold_start_routes_only_through_anonymous_target_listener(self) -> None:
+        identity, verified_session, authenticated = self.session("org1_admin", 38080)
+        self.assertIsNotNone(identity)
+        adapter = BurpExecutionProxyAdapter(self.proxy)
+        action = ProposedAction(self.target, self.package.id, ActionCategory.SAFE_READ,
+                                ActorMode.ANONYMOUS, "cold_start_bootstrap",
+                                "Bounded first-party discovery read",
+                                url="https://example.test/", method="GET")
+        with patch.object(self.proxy, "listener_reachable", return_value=True), \
+             patch.object(self.proxy, "bridge_connected", return_value=True):
+            self.assertIsNone(adapter.route(action))
+            _, anonymous, binding = self.session(None, 38081)
+            route = adapter.route(action)
+            self.assertIsNotNone(route)
+            self.assertEqual(route.url, "http://127.0.0.1:38081")
+            self.assertNotEqual(binding.listener_key, authenticated.listener_key)
+            captured = self.capture.ingest_bytes(observation(
+                "cold-start-anonymous", binding.listener_key, response=True,
+                authenticated=False))
+            exchange = self.traffic.get_exchange(captured.exchange_id)
+            self.assertEqual(exchange.attribution.auth_state, AuthState.ANONYMOUS)
+            self.assertIsNone(exchange.attribution.verified_identity_id)
+            self.assertEqual(exchange.attribution.browser_session_id, anonymous.id)
+            authenticated_action = replace(action, actor=ActorMode.AUTHENTICATED,
+                                           identity_id=identity.id,
+                                           session_id=verified_session.id)
+            authenticated_route = adapter.route(authenticated_action)
+            self.assertIsNotNone(authenticated_route)
+            self.assertEqual(authenticated_route.url, "http://127.0.0.1:38080")
+            authenticated_capture = self.capture.ingest_bytes(observation(
+                "cold-start-authenticated-control", authenticated.listener_key,
+                response=True, authenticated=True))
+            authenticated_exchange = self.traffic.get_exchange(authenticated_capture.exchange_id)
+            self.assertEqual(authenticated_exchange.attribution.auth_state, AuthState.VERIFIED)
+            self.assertEqual(authenticated_exchange.attribution.verified_identity_id, identity.id)
+            self.assertIsNone(adapter.route(replace(action, source="unrelated_action")))
+            self.assertIsNone(adapter.route(replace(action, target_id=new_entity_id("TARGET"))))
+            self.assertIsNone(adapter.route(replace(action, method="POST")))
+        with patch.object(self.proxy, "bridge_connected", return_value=False):
+            self.assertIsNone(adapter.route(action))
 
     def test_request_response_incomplete_retry_and_protected_artifacts(self) -> None:
         identity, session, binding = self.session("org1_admin", 38080)

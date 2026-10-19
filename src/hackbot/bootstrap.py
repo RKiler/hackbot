@@ -150,6 +150,8 @@ class ReconDiscoveryProvider:
             return None, "NOT_CONFIGURED"
         try:
             target = self.recon.resolve_target(package.primary_domain)
+        except ValueError:
+            return None, "NO_RECON_HISTORY"
         except ReconQueryError:
             return None, "RECON_UNAVAILABLE"
         return target, "RECON_BACKED" if target else "NO_RECON_HISTORY"
@@ -422,6 +424,26 @@ class TargetBootstrapper:
                                   recon_domain_id=recon_target.domain_id if recon_target else None,
                                   campaign_work_id=campaign_work_id)
 
+    @staticmethod
+    def seed_urls(package: TargetPackage) -> tuple[str, ...]:
+        seeds: list[str] = []
+        for host in package.scope.include_hosts[:8]:
+            if host.pattern.startswith("*."):
+                continue
+            schemes = host.schemes or package.scope.default_schemes
+            for scheme, default in (("https", 443), ("http", 80)):
+                if scheme not in schemes:
+                    continue
+                ports = host.ports or package.scope.default_ports or ()
+                selected = next((item for item in ports if item == default),
+                                ports[0] if ports else default)
+                root = f"{scheme}://{host.pattern}" + (f":{selected}" if selected != default else "") + "/"
+                url = _safe_url(root, root, package)
+                if url:
+                    seeds.append(url)
+                    break
+        return tuple(seeds)
+
     def capture_browser_signals(self, package: TargetPackage,
                                 run: BootstrapResult) -> tuple[DiscoverySignal, ...]:
         """Snapshot an already open page on the browser-owning service thread."""
@@ -539,21 +561,8 @@ class TargetBootstrapper:
                 limitations.add("NO_RECON_HISTORY")
             elif run.mode is BootstrapMode.COLD_START and recon_status == "NOT_CONFIGURED":
                 limitations.add("RECON_NOT_CONFIGURED")
-            for host in package.scope.include_hosts[:8]:
-                if host.pattern.startswith("*."):
-                    continue  # Wildcard scope is not a host seed or subdomain authorization.
-                schemes = host.schemes or package.scope.default_schemes
-                for scheme in ("https", "http"):
-                    if scheme not in schemes:
-                        continue
-                    port = (host.ports or package.scope.default_ports or ())
-                    default = 443 if scheme == "https" else 80
-                    selected = next((item for item in port if item == default), port[0] if port else default)
-                    root = f"{scheme}://{host.pattern}" + (f":{selected}" if selected != default else "") + "/"
-                    url = _safe_url(root, root, package)
-                    if url:
-                        pages.append((url, 0))
-                        break
+            for url in self.seed_urls(package):
+                pages.append((url, 0))
             if not pages:
                 limitations.add("NO_EXACT_HOST_SEED")
 

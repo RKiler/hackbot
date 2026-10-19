@@ -254,7 +254,27 @@ class BurpProxyProvider:
     def ready(self, session_id: str) -> bool:
         binding = self.binding_for_session(session_id)
         return bool(self.settings.enabled and binding is not None and binding.state == "ACTIVE"
+                    and (self.settings.ca_certificate is None or self.settings.ca_certificate.is_file())
                     and self.bridge_connected(binding.target_id) and self.listener_reachable(binding.proxy_port))
+
+    def anonymous_capture_binding(self, target_id: str) -> BurpListenerBinding | None:
+        """Find a live, target-scoped anonymous listener; never borrow an identity's listener."""
+        validate_entity_id(target_id, "TARGET")
+        if self.browser is None:
+            return None
+        for binding in self.list_bindings(target_id, limit=100):
+            if binding.state != "ACTIVE":
+                continue
+            session = self.browser.get(binding.browser_session_id)
+            if (session is None or session.target_id != target_id or session.identity_id is not None
+                    or session.status is not BrowserStatus.RUNNING or not self.ready(session.id)):
+                continue
+            try:
+                self.resolve_listener(target_id, binding.listener_key)
+            except BurpError:
+                continue
+            return binding
+        return None
 
     def start_browser(self, session_id: str, *, package: TargetPackage | None = None) -> BrowserSession:
         if self.browser is None:
@@ -348,8 +368,19 @@ class BurpExecutionProxyAdapter:
 
     def route(self, action: object):
         from .executor import ProxyRoute
+        from .policy_models import ActionCategory, ActorMode
         session_id = getattr(action, "session_id", None)
         target_id = getattr(action, "target_id", None)
+        if (session_id is None and isinstance(target_id, str)
+                and getattr(action, "source", None) == "cold_start_bootstrap"
+                and getattr(action, "actor", None) is ActorMode.ANONYMOUS
+                and getattr(action, "category", None) is ActionCategory.SAFE_READ
+                and getattr(action, "method", None) == "GET"):
+            binding = self.provider.anonymous_capture_binding(target_id)
+            if binding is not None:
+                return ProxyRoute(f"http://127.0.0.1:{binding.proxy_port}",
+                                  self.provider.settings.ca_certificate)
+            return None
         if not isinstance(session_id, str) or not isinstance(target_id, str):
             return None
         binding = self.provider.binding_for_session(session_id)

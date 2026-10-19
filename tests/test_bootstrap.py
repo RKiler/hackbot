@@ -144,6 +144,11 @@ class UnavailableRecon:
         raise ReconQueryError("fixture read-only recon unavailable")
 
 
+class InvalidReconDomain:
+    def resolve_target(self, _identity):
+        raise ValueError("fixture primary domain is not a recon root")
+
+
 class FixedTargets:
     def __init__(self, package):
         self.package = package
@@ -223,6 +228,30 @@ class Phase24Tests(unittest.TestCase):
         self.runtime.bootstrap.run(second.bootstrap_id, "example")
         self.assertEqual(self.server.visits.count("/app.js"), 1)
         self.assertLess(result.counts["requests_used"], run.limits.max_requests)
+
+    def test_capture_required_preflight_blocks_before_a_run_is_created(self):
+        self.runtime.executor.settings = replace(self.runtime.executor.settings,
+                                                 allow_direct=False, capture_required=True)
+        client = create_app(runtime=self.runtime).test_client()
+        status = client.get("/v1/targets/example/bootstrap")
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json["transport"]["burp_capture_ready"])
+        self.assertFalse(status.json["transport"]["cold_start_available"])
+        self.assertEqual(status.json["transport"]["blocked_reason"],
+                         "ANONYMOUS_BURP_CAPTURE_REQUIRED")
+        attempt = client.post("/v1/targets/example/bootstrap", json={"identity_policy": "anonymous_only"})
+        self.assertEqual(attempt.status_code, 409)
+        self.assertEqual(attempt.json["error"], "bootstrap_not_ready")
+        self.assertEqual(self.runtime.bootstrap_store.list_runs(self.package.target.id), ())
+
+        with patch.object(self.runtime.burp, "anonymous_capture_binding",
+                          return_value=SimpleNamespace(proxy_port=38081)):
+            ready = client.get("/v1/targets/example/bootstrap")
+        self.assertEqual(ready.status_code, 200)
+        self.assertTrue(ready.json["transport"]["burp_capture_ready"])
+        self.assertTrue(ready.json["transport"]["transport_ready"])
+        self.assertTrue(ready.json["transport"]["cold_start_available"])
+        self.assertEqual(ready.json["transport"]["anonymous_listener_port"], 38081)
 
     def test_recon_transition_keeps_target_identity_and_evidence(self):
         first = self.runtime.bootstrap.create("example", identity_policy=BootstrapIdentityPolicy.ANONYMOUS_ONLY)
@@ -353,6 +382,14 @@ class Phase24Tests(unittest.TestCase):
         self.assertEqual(result.mode, BootstrapMode.COLD_START)
         self.assertEqual(result.status, BootstrapStatus.COMPLETED)
         self.assertIn("RECON_UNAVAILABLE", result.limitations)
+
+    def test_recon_root_validation_does_not_block_cold_start_status(self):
+        self.runtime.bootstrap.recon_provider.recon = InvalidReconDomain()
+        response = create_app(runtime=self.runtime).test_client().get(
+            "/v1/targets/example/bootstrap")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["recon_availability"], "NO_RECON_HISTORY")
+        self.assertIn("transport", response.json)
 
     def test_explicit_refresh_detects_js_hash_change_without_losing_old_artifact(self):
         url = f"http://127.0.0.1:{self.server.server_port}/app.js"
