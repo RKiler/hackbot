@@ -274,8 +274,8 @@ class DOMXSSSpecialist:
                 or exchange.response.record.content_type not in {"text/html", "application/xhtml+xml"}
                 or exchange.request.query_names):
             raise ValueError("Observed successful page GET is required")
-        route = exchange.request.origin + exchange.request.display_path
-        if (len(route) > 2048 or "[" in route or "]" in route
+        route = traffic.observed_request_url(exchange)
+        if (route is None or "[" in route or "]" in route
                 or SecretRedactor.from_environment().text(route) != route
                 or package.scope.evaluate_url(route).result is not ScopeResult.IN_SCOPE):
             raise ValueError("Observed route is unsafe or outside scope")

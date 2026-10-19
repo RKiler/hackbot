@@ -1,0 +1,13 @@
+{
+  "case_id": "local_mutation_b",
+  "version": 1,
+  "category": "SECURE_NEGATIVE_CASE",
+  "difficulty": "ADVANCED",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": null,
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["OWNER_UPDATE_IS_NOT_FOREIGN_EFFECT"],
+  "known_controls": ["owner_update", "foreign_patch_denial", "owner_readback"],
+  "tags": ["synthetic", "local", "authorization", "cross_tenant", "mutation", "secure"]
+}

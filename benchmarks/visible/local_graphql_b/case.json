@@ -1,0 +1,13 @@
+{
+  "case_id": "local_graphql_b",
+  "version": 1,
+  "fixture_id": "benchmark",
+  "target_package": "package/target.yaml",
+  "scope_hosts": ["127.0.0.1"],
+  "identity_aliases": ["owner", "foreign"],
+  "input_files": [],
+  "context_file": null,
+  "budget": {"requests": 80, "browser_actions": 0, "research_calls": 0, "tokens": 0, "seconds": 240},
+  "visible_hash": "35a0151a05b61d2f6c64ca693c0c0f627a763a879921774087a898f6264f47c0",
+  "fixture_kind": "LOCAL_GRAPHQL_OBJECT"
+}

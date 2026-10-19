@@ -1,0 +1,22 @@
+{
+  "case_id": "local_advice_d",
+  "version": 1,
+  "category": "UNAUTHENTICATED_DOWNLOAD",
+  "difficulty": "BASIC",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "UNAUTHENTICATED_DOWNLOAD",
+    "operation": "GET /fixture/tenant-a/documents/{object_id}",
+    "boundary": "DATA_EXPOSURE",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "c2e057210765d9ee3ab1ee7ec77e278702eec2ca9501399414ffe592a355cc84",
+    "acceptable_categories": ["UNAUTHENTICATED_DOWNLOAD", "UNAUTHENTICATED_RESOURCE"],
+    "candidate_fingerprints": ["41251af3043f31eac8aefc5e9db6e985bfde770dfaed8be4a8e2c1d6894c8ff3"]
+  }],
+  "expected_specialist": "EXPOSURE",
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["HTTP_200_ALONE_IS_NOT_PROOF"],
+  "known_controls": ["owner_read", "anonymous_read", "missing_object"],
+  "tags": ["synthetic", "local", "download", "noise", "model_comparison"]
+}

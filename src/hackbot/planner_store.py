@@ -26,6 +26,7 @@ _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _REF = re.compile(r"(?:PLAN|RUN|VALIDATION|FINDING|RREQ|RBRF|TESTOBJ|IDENTITY|HYP|EV|"
                   r"PROF|LEARN|EXCHANGE|FA)-[0-9a-f]{32}\Z")
 MAX_RUN_TASKS = 320
+MAX_APPROVED_CHILD_RESUMES = 32
 
 
 def _now() -> str:
@@ -542,7 +543,11 @@ class PlannerStore:
             if run is None or task is None or run[0] not in {"READY", "RUNNING"} or task["status"] not in {
                     "READY", "PENDING"}:
                 return None
-            if task["attempt"] >= 2:
+            approved_child_resume = (
+                task["task_type"] == PlannerTaskType.RUN_PLAN.value and
+                task["reason_code"] == "APPROVAL_RESOLVED" and
+                self._approved_child_ready(db, target_id, run_id, task["candidate_id"]))
+            if task["attempt"] >= 2 and not approved_child_resume:
                 return None
             if db.execute("SELECT 1 FROM planner_task_dependencies d JOIN planner_tasks p "
                           "ON p.task_id=d.depends_on WHERE d.task_id=? AND p.status!='COMPLETED' LIMIT 1",
@@ -552,14 +557,26 @@ class PlannerStore:
                           (run_id,)).fetchone():
                 return None
             at = _now()
-            db.execute("UPDATE planner_tasks SET status='RUNNING',attempt=attempt+1,"
+            db.execute("UPDATE planner_tasks SET status='RUNNING',attempt=attempt+?,"
                        "started_at=COALESCE(started_at,?),updated_at=? WHERE task_id=?",
-                       (at, at, task_id))
+                       (0 if approved_child_resume and task["attempt"] >= 2 else 1,
+                        at, at, task_id))
             db.execute("UPDATE planner_runs SET status='RUNNING',started_at=COALESCE(started_at,?),"
                        "updated_at=? WHERE run_id=?", (at, at, run_id))
             self._event(db, run_id, "TASK_STARTED", task["task_type"],
                         candidate_id=task["candidate_id"], task_id=task_id)
         return self.task(target_id, run_id, task_id)
+
+    @staticmethod
+    def _approved_child_ready(db: sqlite3.Connection, target_id: str,
+                              run_id: str, candidate_id: str) -> bool:
+        row = db.execute(
+            "SELECT p.status FROM planner_candidates c JOIN plan_runs p "
+            "ON p.run_id=c.plan_run_id AND p.target_id=c.target_id "
+            "AND p.plan_id=c.plan_id WHERE c.target_id=? AND c.run_id=? "
+            "AND c.candidate_id=? LIMIT 1",
+            (target_id, run_id, candidate_id)).fetchone()
+        return row is not None and row["status"] in {"READY", "RUNNING", "COMPLETED"}
 
     def wake_waiting_task(self, target_id: str, run_id: str, task_id: str,
                           reason: str) -> PlannerTask:
@@ -570,7 +587,20 @@ class PlannerStore:
             row = db.execute("SELECT t.* FROM planner_tasks t JOIN planner_runs r ON r.run_id=t.run_id "
                              "WHERE r.target_id=? AND t.run_id=? AND t.task_id=?",
                              (target_id, run_id, task_id)).fetchone()
-            if row is None or row["status"] != "WAITING" or row["attempt"] >= 2:
+            if row is None or row["status"] != "WAITING":
+                raise ValueError("Waiting task cannot be retried")
+            approved_child_resume = (
+                row["task_type"] == PlannerTaskType.RUN_PLAN.value and
+                row["reason_code"] == "APPROVAL_PENDING" and
+                reason == "APPROVAL_RESOLVED" and
+                self._approved_child_ready(db, target_id, run_id, row["candidate_id"]))
+            if approved_child_resume:
+                resumed = db.execute(
+                    "SELECT COUNT(*) FROM planner_events WHERE run_id=? AND task_id=? "
+                    "AND event_type='TASK_REQUEUED' AND reason_code='APPROVAL_RESOLVED'",
+                    (run_id, task_id)).fetchone()[0]
+                approved_child_resume = resumed < MAX_APPROVED_CHILD_RESUMES
+            if row["attempt"] >= 2 and not approved_child_resume:
                 raise ValueError("Waiting task cannot be retried")
             db.execute("UPDATE planner_tasks SET status='READY',reason_code=?,updated_at=? "
                        "WHERE task_id=?", (reason, _now(), task_id))

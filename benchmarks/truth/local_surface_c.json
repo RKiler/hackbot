@@ -1,0 +1,13 @@
+{
+  "case_id": "local_surface_c",
+  "version": 1,
+  "category": "NOISY_FALSE_POSITIVE_CASE",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": null,
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["PUBLIC_CONFIG_IS_NOT_A_SECRET"],
+  "known_controls": ["guarded_owned_document", "public_sample", "inert_client_signals"],
+  "tags": ["synthetic", "local", "noisy", "secure"]
+}

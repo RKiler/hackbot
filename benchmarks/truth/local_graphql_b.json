@@ -1,0 +1,13 @@
+{
+  "case_id": "local_graphql_b",
+  "version": 1,
+  "category": "SECURE_NEGATIVE_CASE",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": "API_GRAPHQL",
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["GRAPHQL_HTTP_200_ALONE_IS_NOT_ACCESS", "REST_DENIAL_DOES_NOT_PROVE_GRAPHQL_SAFE"],
+  "known_controls": ["owner_query", "foreign_query_denied", "invalid_object", "rest_foreign_denial"],
+  "tags": ["synthetic", "local", "graphql", "secure"]
+}

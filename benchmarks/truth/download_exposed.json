@@ -1,0 +1,21 @@
+{
+  "case_id": "download_exposed",
+  "version": 1,
+  "category": "UNAUTHENTICATED_DOWNLOAD",
+  "difficulty": "BASIC",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "UNAUTHENTICATED_DOWNLOAD",
+    "operation": "GET /api/files/{id}/download",
+    "boundary": "ANONYMOUS_PRIVATE_READ",
+    "object_type": "file",
+    "protocol": "REST",
+    "fingerprint": "503f0617f002d96602f846afbc8a807f704d3059cf0bc318959411f9c3736778",
+    "acceptable_categories": ["UNAUTHENTICATED_DOWNLOAD"]
+  }],
+  "expected_specialist": "EXPOSURE",
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["HTTP_200_ALONE_IS_NOT_PROOF"],
+  "known_controls": ["missing_file", "guarded_equivalent"],
+  "tags": ["synthetic", "download"]
+}

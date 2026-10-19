@@ -1,0 +1,22 @@
+{
+  "case_id": "local_tenant_a",
+  "version": 1,
+  "category": "CROSS_TENANT_BOLA",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "CROSS_TENANT_BOLA",
+    "operation": "GET /fixture/{tenant}/documents/{object_id}",
+    "boundary": "TENANT",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "ebaaa71365cd72f7df6df831979baf42c021c9aa0c8977024767193747fef441",
+    "acceptable_categories": ["CROSS_TENANT_BOLA"],
+    "candidate_fingerprints": []
+  }],
+  "expected_specialist": "AUTHORIZATION",
+  "expected_skill_ids": ["cross-tenant-object-authorization"],
+  "forbidden_interpretations": ["STATUS_CODE_ALONE_IS_NOT_PROOF"],
+  "known_controls": ["owner_a_read", "owner_b_read", "invalid_object", "foreign_read_reproduced"],
+  "tags": ["synthetic", "local", "authorization", "cross_tenant"]
+}

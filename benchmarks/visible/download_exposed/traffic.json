@@ -1,0 +1,16 @@
+[
+  {
+    "method": "GET",
+    "url": "https://benchmark.test/api/files/fixture-001/download",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"id\":\"fixture-001\",\"tenant\":\"tenant-a\",\"classification\":\"private\",\"content\":\"synthetic-only\"}"
+  },
+  {
+    "method": "GET",
+    "url": "https://benchmark.test/api/files/missing/download",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"not_found\"}"
+  }
+]

@@ -1,0 +1,21 @@
+{
+  "case_id": "local_message_b",
+  "version": 1,
+  "fixture_id": "benchmark",
+  "target_package": "package/target.yaml",
+  "scope_hosts": [
+    "127.0.0.1"
+  ],
+  "identity_aliases": [],
+  "input_files": [],
+  "context_file": null,
+  "budget": {
+    "requests": 40,
+    "browser_actions": 12,
+    "research_calls": 0,
+    "tokens": 0,
+    "seconds": 240
+  },
+  "visible_hash": "c10d0b70cde7488ba94ebacde67f7ba7d0811862553529a036d36c398ef55c56",
+  "fixture_kind": "LOCAL_POSTMESSAGE"
+}

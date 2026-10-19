@@ -1,0 +1,22 @@
+{
+  "case_id": "local_graphql_a",
+  "version": 1,
+  "category": "GRAPHQL_OBJECT_AUTH",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "GRAPHQL_OBJECT_AUTH",
+    "operation": "POST /fixture/graphql",
+    "boundary": "TENANT",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "24b00c3b5e51aa37bac7294268680402e887d9892dee7899c3fc05e300fdb1ba",
+    "acceptable_categories": ["GRAPHQL_OBJECT_AUTH"],
+    "candidate_fingerprints": []
+  }],
+  "expected_specialist": "API_GRAPHQL",
+  "expected_skill_ids": ["api-observed-read"],
+  "forbidden_interpretations": ["GRAPHQL_HTTP_200_ALONE_IS_NOT_ACCESS", "REST_DENIAL_DOES_NOT_PROVE_GRAPHQL_SAFE"],
+  "known_controls": ["owner_query", "foreign_query", "invalid_object", "rest_foreign_denial"],
+  "tags": ["synthetic", "local", "graphql", "object_authorization"]
+}

@@ -368,6 +368,36 @@ def main(
     approvals_list.add_argument("target")
     approvals_list.add_argument("--limit", type=int, default=20)
     approvals_list.add_argument("--cursor")
+    benchmark = commands.add_parser("benchmark", help="synthetic-only evaluation")
+    benchmark.add_argument("--fixtures-root", type=Path,
+                           default=Path(__file__).resolve().parents[2] / "benchmarks")
+    benchmark_commands = benchmark.add_subparsers(dest="benchmark_command", required=True)
+    benchmark_commands.add_parser("list", help="list synthetic benchmark suites")
+    benchmark_coverage = benchmark_commands.add_parser(
+        "coverage", help="audit low-resource fixture pairs without running targets")
+    benchmark_coverage.add_argument("suite")
+    benchmark_run = benchmark_commands.add_parser("run", help="run a deterministic synthetic suite")
+    benchmark_run.add_argument("suite")
+    benchmark_run.add_argument("--mode", choices=("offline", "local"), default="offline")
+    benchmark_run.add_argument("--trials", type=int, default=1,
+                               help="bounded repeated trials (1-5; default 1)")
+    benchmark_run.add_argument("--seed", type=int, default=0,
+                               help="recorded random seed for reproducibility")
+    benchmark_run.add_argument("--ablation", action="append", default=[],
+                               choices=("NO_TRAFFIC", "NO_MODEL", "NO_CHALLENGER"),
+                               help="operator-invoked, suite-specific ablation")
+    benchmark_run.add_argument("--fake-providers", action="store_true",
+                               help="synthetic primary/challenger ordering diagnostic")
+    benchmark_resume = benchmark_commands.add_parser(
+        "resume", help="resume pending synthetic cases without replaying an ambiguous case")
+    benchmark_resume.add_argument("run_id")
+    benchmark_show = benchmark_commands.add_parser("show", help="show one benchmark report")
+    benchmark_show.add_argument("run_id")
+    benchmark_compare = benchmark_commands.add_parser("compare", help="compare two benchmark runs")
+    benchmark_compare.add_argument("baseline_id")
+    benchmark_compare.add_argument("current_id")
+    readiness = commands.add_parser("readiness", help="show synthetic evaluation readiness")
+    readiness.add_argument("run_id", nargs="?")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -379,6 +409,112 @@ def main(
     except ConfigError as exc:
         print(f"hackbot: {exc}", file=err)
         return 2
+
+    if args.command in {"benchmark", "readiness"}:
+        from .benchmark_catalog import BenchmarkCatalog
+        from .benchmark_compare import compare_reports
+        from .benchmark_fake_provider import FixtureOrderingProvider
+        from .benchmark_models import (BenchmarkRunConfig, ModelLane, ModelRole,
+                                       ModelSelection)
+        from .benchmark_report import build_benchmark_report, write_benchmark_report
+        from .benchmark_local_runner import BenchmarkLocalRunner
+        from .benchmark_runner import BenchmarkOfflineRunner
+        from .benchmark_store import BenchmarkStore
+        from .store import _SCHEMA_VERSION
+
+        state = BenchmarkStore(config.paths.state / "benchmark.sqlite3")
+        exit_code = 0
+        try:
+            if args.command == "benchmark" and args.benchmark_command in {"list", "coverage", "run", "resume"}:
+                fixture_root = args.fixtures_root.resolve(strict=True)
+                catalog = BenchmarkCatalog(fixture_root / "visible", fixture_root / "truth")
+                if args.benchmark_command == "list":
+                    result = {"label": "SYNTHETIC / EVALUATION", "suites": [
+                        {"name": name, "case_count": len(catalog.suite(name))}
+                        for name in catalog.suites()]}
+                elif args.benchmark_command == "coverage":
+                    from .benchmark_acceptance import assess_low_resource_fixture_coverage
+                    result = assess_low_resource_fixture_coverage(
+                        catalog, args.suite).to_dict()
+                    result["label"] = "SYNTHETIC / EVALUATION"
+                else:
+                    work_root = config.paths.artifacts / "benchmark-work"
+                    if args.benchmark_command == "run":
+                        mode = args.mode
+                        selections = (
+                            ModelSelection(ModelRole.PLANNER_ADVISOR, "fixture", "primary",
+                                           lane=ModelLane.PRIMARY),
+                            ModelSelection(ModelRole.PLANNER_ADVISOR, "fixture", "challenger",
+                                           lane=ModelLane.CHALLENGER),
+                        ) if args.fake_providers else ()
+                    else:
+                        state.initialize()
+                        prior = state.get(args.run_id)
+                        if prior is None:
+                            raise LookupError("Benchmark run unavailable")
+                        selections = BenchmarkRunConfig.from_dict(prior["config"]).models
+                        mode = {"SYNTHETIC_OFFLINE": "offline",
+                                "SYNTHETIC_LOCAL": "local"}.get(
+                                    prior["environment"].get("mode"))
+                    if mode == "local":
+                        providers = {}
+                        for selection in selections:
+                            if selection.provider == "fixture" and selection.model in {
+                                    "primary", "challenger"}:
+                                providers[(selection.role, selection.lane,
+                                           selection.provider, selection.model)] = (
+                                               FixtureOrderingProvider(
+                                                   reverse=selection.lane is
+                                                   ModelLane.CHALLENGER))
+                        runner = BenchmarkLocalRunner(
+                            catalog, state, work_root, fixture_root / "harness",
+                            providers=providers)
+                    elif mode == "offline":
+                        runner = BenchmarkOfflineRunner(catalog, state, work_root)
+                    else:
+                        raise ValueError("Unknown benchmark mode")
+                    run_id = (runner.run(BenchmarkRunConfig(
+                                         args.suite, trials=args.trials, seed=args.seed,
+                                         ablations=tuple(args.ablation),
+                                         models=selections,
+                                         planner_mode=(
+                                             "BOUNDED_AUTONOMOUS" if mode == "local"
+                                             else "ANALYZE_ONLY")),
+                                         bughunter_version=__version__,
+                                         bughunter_schema=_SCHEMA_VERSION)
+                              if args.benchmark_command == "run" else
+                              runner.resume(args.run_id))
+                    report = build_benchmark_report(state, run_id)
+                    json_path, md_path = write_benchmark_report(
+                        report, config.paths.artifacts / "benchmark-reports")
+                    result = {"run_id": run_id, "status": report["status"],
+                              "readiness": report["readiness"]["conclusion"],
+                              "report_json": str(json_path), "report_markdown": str(md_path)}
+                    if report["status"] != "COMPLETED":
+                        exit_code = 1
+            elif args.command == "benchmark" and args.benchmark_command == "show":
+                result = build_benchmark_report(state, args.run_id)
+            elif args.command == "benchmark" and args.benchmark_command == "compare":
+                before = build_benchmark_report(state, args.baseline_id)
+                after = build_benchmark_report(state, args.current_id)
+                result = compare_reports(before, after)
+                result["label"] = "SYNTHETIC / EVALUATION"
+                result["readiness"] = after["readiness"]["conclusion"]
+            else:
+                run_id = args.run_id
+                if run_id is None:
+                    latest = state.list(limit=1)
+                    if not latest:
+                        raise LookupError("No benchmark runs")
+                    run_id = latest[0]["run_id"]
+                report = build_benchmark_report(state, run_id)
+                result = {"run_id": run_id, "readiness": report["readiness"],
+                          "case_status_counts": report["case_status_counts"]}
+        except (OSError, ValueError, LookupError, TypeError, KeyError, sqlite3.Error):
+            print("hackbot: synthetic benchmark unavailable or invalid", file=err)
+            return 2
+        print(json.dumps(result, sort_keys=True), file=out)
+        return exit_code
 
     if args.command == "ops":
         try:

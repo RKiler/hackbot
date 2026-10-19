@@ -1,0 +1,34 @@
+{
+  "case_id": "local_mixed_a",
+  "version": 1,
+  "category": "OTHER",
+  "difficulty": "ADVANCED",
+  "split": "DEVELOPMENT",
+  "roots": [
+    {
+      "category": "UNAUTHENTICATED_DOWNLOAD",
+      "operation": "GET /fixture/tenant-a/documents/{object_id}",
+      "boundary": "DATA_EXPOSURE",
+      "object_type": "document",
+      "protocol": "HTTP",
+      "fingerprint": "c2e057210765d9ee3ab1ee7ec77e278702eec2ca9501399414ffe592a355cc84",
+      "acceptable_categories": ["UNAUTHENTICATED_DOWNLOAD", "UNAUTHENTICATED_RESOURCE"],
+      "candidate_fingerprints": []
+    },
+    {
+      "category": "CROSS_TENANT_BOLA",
+      "operation": "GET /fixture/{tenant}/documents/{object_id}",
+      "boundary": "TENANT",
+      "object_type": "document",
+      "protocol": "HTTP",
+      "fingerprint": "ebaaa71365cd72f7df6df831979baf42c021c9aa0c8977024767193747fef441",
+      "acceptable_categories": ["CROSS_TENANT_BOLA"],
+      "candidate_fingerprints": []
+    }
+  ],
+  "expected_specialist": null,
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["PUBLIC_CONFIG_IS_NOT_SECRET", "GRAPHQL_ERROR_IS_NOT_AUTH_BYPASS", "ROUTE_NAME_IS_NOT_PROOF"],
+  "known_controls": ["owner_a_read", "owner_b_read", "anonymous_a", "cross_tenant_b", "public_noise"],
+  "tags": ["synthetic", "local", "mixed", "exposure", "authorization", "noise"]
+}

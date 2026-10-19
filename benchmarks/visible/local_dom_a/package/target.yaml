@@ -1,0 +1,51 @@
+version: 1
+id: benchmark
+target_id: TARGET-11111111111141118111111111111111
+name: Synthetic Browser Benchmark
+primary_domain: benchmark.test
+status: TRACKED
+configured_at: "2026-10-18T12:00:00+00:00"
+updated_at: "2026-10-18T12:00:00+00:00"
+source:
+  kind: RESEARCHER
+  reference: synthetic-benchmark
+  operator: benchmark
+scope:
+  include: [benchmark.test]
+  exclude: []
+  schemes: [https]
+  ports: [443]
+rules:
+  automated_testing_allowed: true
+  account_creation_allowed: false
+  excluded_vulnerability_classes: []
+  forbidden_actions: []
+  third_party_restrictions: Synthetic target only
+  data_handling_restrictions: Fictional data only
+autonomy:
+  passive: ALLOW
+  safe_read: ALLOW
+  bounded_active: DENY
+  state_changing: DENY
+  destructive: DENY
+  create_disposable_objects: DENY
+  modify_disposable_objects: DENY
+  delete_disposable_objects: DENY
+  cross_identity_testing: DENY
+  owned_test_objects_only: true
+  account_creation: DENY
+  external_side_effects: DENY
+  permission_changes: DENY
+  financial: DENY
+rate:
+  requests_per_second: 1
+  requests_per_minute: 30
+  max_concurrency: 1
+  burst: 1
+context:
+  description: Fictional browser application used for local evaluation.
+  known_features: [browser preview, window messaging]
+  terminology:
+    workspace: tenant
+  research_priorities: [client-side trust boundaries]
+  known_limitations: [no public network target]

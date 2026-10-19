@@ -112,9 +112,10 @@ class PostMessageSpecialist:
                 or exchange.response.record.content_type not in {"text/html", "application/xhtml+xml"}
                 or exchange.request.query_names):
             raise ValueError("Observed successful in-scope page GET is required")
-        route = exchange.request.origin + exchange.request.display_path
-        parsed = urlsplit(route)
-        if (len(route) > 2048 or parsed.username or parsed.password or parsed.query or parsed.fragment
+        route = traffic.observed_request_url(exchange)
+        parsed = urlsplit(route) if route is not None else None
+        if (route is None or parsed is None or parsed.username or parsed.password
+                or parsed.query or parsed.fragment
                 or "[" in route or "]" in route
                 or SecretRedactor.from_environment().text(route) != route
                 or package.scope.evaluate_url(route).result is not ScopeResult.IN_SCOPE):

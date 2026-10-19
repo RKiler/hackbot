@@ -1,0 +1,22 @@
+{
+  "case_id": "local_graphql_field_a",
+  "version": 1,
+  "category": "GRAPHQL_FIELD_AUTH",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "GRAPHQL_FIELD_AUTH",
+    "operation": "POST /fixture/graphql",
+    "boundary": "TENANT",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "63db3250c315afc6ede035d3b65b6e7eaddeb5fa35c30c5b2eee8cf557d9f092",
+    "acceptable_categories": ["GRAPHQL_FIELD_AUTH"],
+    "candidate_fingerprints": []
+  }],
+  "expected_specialist": "API_GRAPHQL",
+  "expected_skill_ids": ["api-observed-read"],
+  "forbidden_interpretations": ["PUBLIC_FIELDS_ARE_NOT_PRIVATE_EMAIL", "REST_DENIAL_DOES_NOT_PROVE_GRAPHQL_SAFE"],
+  "known_controls": ["owner_full_query", "foreign_owned_full_query", "foreign_public_fields", "invalid_object"],
+  "tags": ["synthetic", "local", "graphql", "field_authorization"]
+}

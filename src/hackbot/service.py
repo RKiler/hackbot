@@ -19,6 +19,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 from . import __version__
+from .benchmark_api import install_evaluation_routes
 from .auth import AuthContextManager, AuthMechanism
 from .backup import BackupError, BackupManager
 from .authorization import AuthorizationSpecialist
@@ -1169,6 +1170,9 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     app.config["JSON_SORT_KEYS"] = True
     if runtime is None:
         service.delta_scheduler.start()
+    evaluation_config = config if config is not None else getattr(service, "config", None)
+    if isinstance(evaluation_config, AppConfig):
+        install_evaluation_routes(app, evaluation_config)
 
     @app.after_request
     def no_store(response):

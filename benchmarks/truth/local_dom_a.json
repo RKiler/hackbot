@@ -1,0 +1,42 @@
+{
+  "case_id": "local_dom_a",
+  "version": 1,
+  "category": "DOM_XSS",
+  "difficulty": "INTERMEDIATE",
+  "split": "HELD_OUT",
+  "roots": [
+    {
+      "category": "DOM_XSS",
+      "operation": "GET /preview",
+      "boundary": "CLIENT_SERVER_TRUST",
+      "object_type": "BROWSER_DOCUMENT",
+      "protocol": "DOM",
+      "fingerprint": "b36b268fe74f61eb18d07b89090645aca19d4fedd379482228706e4fad6d16e1",
+      "acceptable_categories": [
+        "DOM_XSS"
+      ],
+      "candidate_fingerprints": []
+    }
+  ],
+  "expected_specialist": "DOM_XSS",
+  "expected_skill_ids": [
+    "check-before-transform-dom-xss"
+  ],
+  "forbidden_interpretations": [
+    "STATIC_SINK_IS_NOT_EXECUTION",
+    "CSP_MUST_BE_ENFORCED_BY_BROWSER"
+  ],
+  "known_controls": [
+    "inert_marker",
+    "benign_url",
+    "direct_dangerous",
+    "encoded_scheme",
+    "fresh_browser_context"
+  ],
+  "tags": [
+    "synthetic",
+    "local",
+    "dom",
+    "vulnerable"
+  ]
+}

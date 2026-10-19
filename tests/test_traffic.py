@@ -71,6 +71,13 @@ class FakeBrowser:
 
 
 class TrafficTests(unittest.TestCase):
+    def test_observed_request_url_requires_exact_safe_observation(self):
+        good = self.capture(self.packet(url="https://app.example.test/preview"))
+        self.assertEqual(self.traffic.observed_request_url(good),
+                         "https://app.example.test/preview")
+        query = self.capture(self.packet(url="https://app.example.test/preview?x=1"))
+        self.assertIsNone(self.traffic.observed_request_url(query))
+
     def test_direct_traffic_reference_checks_use_indexes(self):
         checked = 0
         with self.evidence._connection() as db:

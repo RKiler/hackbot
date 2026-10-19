@@ -1,0 +1,13 @@
+{
+  "case_id": "local_graphql_field_b",
+  "version": 1,
+  "category": "SECURE_NEGATIVE_CASE",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": "API_GRAPHQL",
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["GRAPHQL_HTTP_200_ALONE_IS_NOT_ACCESS", "PUBLIC_FIELDS_ARE_NOT_PRIVATE_EMAIL"],
+  "known_controls": ["owner_full_query", "foreign_owned_full_query", "foreign_field_denial", "invalid_object"],
+  "tags": ["synthetic", "local", "graphql", "field_authorization", "secure"]
+}

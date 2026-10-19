@@ -1319,6 +1319,27 @@ class PlannerStoreTests(unittest.TestCase):
     def test_external_approval_resume_wakes_waiting_planner_task(self):
         self._assert_external_child_resume("APPROVAL_PENDING")
 
+    def test_approved_child_resume_is_capped_without_consuming_new_attempts(self):
+        run, (candidate,) = self.portfolio(mode=PlannerMode.BOUNDED_AUTONOMOUS)
+        task = self.store.add_task(run, candidate, PlannerTaskType.RUN_PLAN)
+        with patch.object(self.store, "_approved_child_ready", return_value=True):
+            for index in range(32):
+                claimed = self.store.claim_task(run.target_id, run.id, task.id)
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.attempt, min(index + 1, 2))
+                self.store.finish_task(run.target_id, run.id, task.id,
+                                       PlannerTaskStatus.WAITING, "APPROVAL_PENDING")
+                self.store.wake_waiting_task(run.target_id, run.id, task.id,
+                                             "APPROVAL_RESOLVED")
+            claimed = self.store.claim_task(run.target_id, run.id, task.id)
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.attempt, 2)
+            self.store.finish_task(run.target_id, run.id, task.id,
+                                   PlannerTaskStatus.WAITING, "APPROVAL_PENDING")
+            with self.assertRaises(ValueError):
+                self.store.wake_waiting_task(run.target_id, run.id, task.id,
+                                             "APPROVAL_RESOLVED")
+
     def test_external_human_step_resume_wakes_waiting_planner_task(self):
         self._assert_external_child_resume("CHILD_HUMAN_REVIEW")
 

@@ -230,6 +230,39 @@ class PlannerRunner:
                 return "OBJECT_REQUIRED", None
         return None
 
+    def _owned_exposure_binding(self, package: TargetPackage,
+                                candidate_id: str) -> tuple[str, str] | None:
+        """Find one exact ready fixture behind an observed owner GET, if any."""
+        source = self.exposure.store.get(package.target.id, candidate_id)
+        if source is None or source.source.value != "TRAFFIC":
+            return None
+        sessions = self._sessions(package.target.id)
+        matches: dict[str, str] = {}
+        for link in self.exposure.store.source_links(package.target.id, candidate_id):
+            exchange = self.exposure.traffic.get_exchange(str(link["source_ref"]))
+            if (exchange is None or exchange.target_id != package.target.id or
+                    exchange.package_id != package.id or exchange.response is None or
+                    exchange.response.record.status_code != 200 or
+                    exchange.request.record.method != "GET"):
+                continue
+            identity_id = exchange.attribution.verified_identity_id
+            if identity_id is None or identity_id not in sessions:
+                continue
+            page = self.objects.list_for_identity(
+                package.target.id, identity_id, state=ObjectState.READY, limit=50)
+            if page.next_cursor is not None:
+                return None
+            for item in page.items:
+                if (item.package_id == package.id and
+                        exchange.request.observation_evidence_id in
+                        item.verification_evidence_ids):
+                    matches[item.id] = sessions[identity_id]
+                    if len(matches) > 1:
+                        return None
+        if len(matches) != 1:
+            return None
+        return next(iter(matches.items()))
+
     def _complete(self, run: PlannerRun, task: PlannerTask, reason: str,
                   ref: str | None = None) -> None:
         self.store.finish_task(run.target_id, run.id, task.id,
@@ -622,6 +655,12 @@ class PlannerRunner:
         elif candidate.source_kind == "EXPOSURE":
             prepared = self.exposure.prepare_candidate(package, source, hypotheses=self.hypotheses,
                 contexts=self.contexts, router=self.router, planner=self.skill_planner, profile=profile)
+            owned = self._owned_exposure_binding(package, source)
+            if owned is not None:
+                prepared = self.exposure.bind_owned_read(
+                    package, source, test_object_id=owned[0], owner_session_id=owned[1],
+                    objects=self.objects, hypotheses=self.hypotheses,
+                    contexts=self.contexts, planner=self.skill_planner, profile=profile)
             plan_id, hypothesis_id = prepared.plan_id, prepared.hypothesis_id
         elif candidate.source_kind == "HYPOTHESIS":
             hypothesis = self.hypotheses.get(source, run.target_id)

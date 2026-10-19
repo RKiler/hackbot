@@ -1,0 +1,12 @@
+{
+  "case_id": "download_exposed",
+  "version": 1,
+  "fixture_id": "benchmark",
+  "target_package": "package/target.yaml",
+  "scope_hosts": ["benchmark.test"],
+  "identity_aliases": [],
+  "input_files": ["traffic.json"],
+  "context_file": null,
+  "budget": {"requests": 0, "browser_actions": 0, "research_calls": 0, "tokens": 0, "seconds": 120},
+  "visible_hash": "2494d998950a809270370cc76bd34d35d81d64c5826c382dfe1810252270983e"
+}

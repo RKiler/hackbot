@@ -1,0 +1,13 @@
+{
+  "case_id": "local_mixed_b",
+  "version": 1,
+  "category": "SECURE_NEGATIVE_CASE",
+  "difficulty": "ADVANCED",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": null,
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["PUBLIC_CONFIG_IS_NOT_SECRET", "ROUTE_NAME_IS_NOT_PROOF"],
+  "known_controls": ["owner_a_read", "owner_b_read", "anonymous_a_denied", "cross_tenant_b_denied", "public_noise"],
+  "tags": ["synthetic", "local", "mixed", "secure", "noise"]
+}

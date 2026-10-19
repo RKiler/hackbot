@@ -31,6 +31,16 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_exposure_static.py", "test_research_sources.py", "test_test_matrix.py",
         "test_resources.py", "test_db_maintenance.py", "test_process_health.py",
         "test_systemd_unit.py", "test_burp_storage.py", "test_notification_recovery.py",
+        "test_benchmark_advice.py", "test_benchmark_authorization.py",
+        "test_benchmark_acceptance.py",
+        "test_benchmark_eval.py", "test_benchmark_trace.py",
+        "test_benchmark_readiness.py",
+        "test_benchmark_cost.py",
+        "test_benchmark_fixture_server.py",
+        "test_benchmark_browser_fixture.py",
+        "test_benchmark_local.py",
+        "test_benchmark_cli.py",
+        "test_benchmark_compare.py",
     ),
     "store-migrations": (
         "test_store.py", "test_backup.py", "test_retention.py", "test_maintenance.py",
@@ -39,6 +49,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_traffic.py", "test_planner_store.py", "test_domxss_store.py",
         "test_recon.py", "test_object_factory.py", "test_phase12.py",
         "test_profile_retention.py", "test_research_retention.py",
+        "test_benchmark_store.py",
     ),
     "api-specialists": (
         "test_api_graphql.py", "test_api_runtime.py", "test_api_specialist.py",
@@ -54,6 +65,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_behaviour.py", "test_bootstrap.py", "test_planner_multisurface.py",
         "test_research.py", "test_campaign_flow.py", "test_campaign_store.py",
         "test_phase32_delta.py",
+        "test_benchmark_runner.py",
+        "test_benchmark_local_runner.py",
     ),
     "execution-specialists": (
         "test_executor.py", "test_orchestrator.py", "test_typed_mutations.py",
@@ -66,6 +79,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "service-gateway": (
         "test_service.py", "test_phase29.py", "test_burp.py",
+        "test_benchmark_api.py",
     ),
 }
 

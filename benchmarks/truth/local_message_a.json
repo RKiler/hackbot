@@ -1,0 +1,41 @@
+{
+  "case_id": "local_message_a",
+  "version": 1,
+  "category": "POSTMESSAGE",
+  "difficulty": "INTERMEDIATE",
+  "split": "HELD_OUT",
+  "roots": [
+    {
+      "category": "POSTMESSAGE",
+      "operation": "MESSAGE /victim",
+      "boundary": "CROSS_ORIGIN",
+      "object_type": "BROWSER_MESSAGE_PORT",
+      "protocol": "POSTMESSAGE",
+      "fingerprint": "705e7f49a1a3de486cca8d735ce953f4d96977543867ea98a9239b9967ee9208",
+      "acceptable_categories": [
+        "POSTMESSAGE"
+      ],
+      "candidate_fingerprints": []
+    }
+  ],
+  "expected_specialist": "POSTMESSAGE",
+  "expected_skill_ids": [
+    "postmessage-trust-analysis"
+  ],
+  "forbidden_interpretations": [
+    "MESSAGE_LISTENER_IS_NOT_CAPABILITY",
+    "ORIGIN_CHECK_MUST_BE_TESTED"
+  ],
+  "known_controls": [
+    "trusted_sender",
+    "foreign_sender",
+    "wrong_message_type",
+    "fresh_browser_context"
+  ],
+  "tags": [
+    "synthetic",
+    "local",
+    "message",
+    "vulnerable"
+  ]
+}

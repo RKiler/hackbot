@@ -1,0 +1,22 @@
+{
+  "case_id": "local_horizontal_a",
+  "version": 1,
+  "category": "HORIZONTAL_IDOR",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "HORIZONTAL_IDOR",
+    "operation": "GET /fixture/tenant-a/documents/{object_id}",
+    "boundary": "OBJECT",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "736ce192f38ba9e97ebb9221d4d666c200a30f45ed9d2c6ea3966884630b8add",
+    "acceptable_categories": ["HORIZONTAL_IDOR"],
+    "candidate_fingerprints": []
+  }],
+  "expected_specialist": "AUTHORIZATION",
+  "expected_skill_ids": ["horizontal-object-authorization"],
+  "forbidden_interpretations": ["SAME_TENANT_MEMBERSHIP_IS_NOT_OWNERSHIP", "HTTP_200_ALONE_IS_NOT_PROOF"],
+  "known_controls": ["owner_a_read", "owner_b_read", "invalid_object", "cross_owner_read_reproduced"],
+  "tags": ["synthetic", "local", "authorization", "same_tenant", "horizontal"]
+}

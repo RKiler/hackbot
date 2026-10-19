@@ -483,6 +483,31 @@ class TrafficStore:
     def initialize(self) -> None:
         self.evidence.initialize()
 
+    def observed_request_url(self, exchange: TrafficExchange) -> str | None:
+        """Recover a no-query URL from its target-bound protected observation."""
+        if exchange.request.query_names:
+            return None
+        item = self.evidence.get_evidence(exchange.request.observation_evidence_id)
+        if item is None or item.target_ref != exchange.target_id:
+            return None
+        try:
+            observation = json.loads(self.evidence.read_content(
+                item.evidence_id, allow_sensitive=True, max_bytes=8192))
+            if not isinstance(observation, dict):
+                return None
+            url = observation.get("url")
+            parsed = urlsplit(url) if isinstance(url, str) else None
+        except (ValueError, UnicodeDecodeError, PermissionError):
+            return None
+        if (not isinstance(observation, dict) or
+                observation.get("method") != exchange.request.record.method or
+                parsed is None or parsed.scheme not in {"http", "https"} or
+                not parsed.hostname or parsed.username or parsed.password or
+                parsed.query or parsed.fragment or len(url) > 2048 or
+                parsed.scheme + "://" + parsed.netloc != exchange.request.origin):
+            return None
+        return url
+
     def _limit(self, limit: int) -> int:
         if type(limit) is not int or limit < 1:
             raise TrafficError("Traffic page size must be positive")

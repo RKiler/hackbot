@@ -1,0 +1,22 @@
+{
+  "case_id": "local_mutation_a",
+  "version": 1,
+  "category": "CROSS_TENANT_BOLA",
+  "difficulty": "ADVANCED",
+  "split": "DEVELOPMENT",
+  "roots": [{
+    "category": "CROSS_TENANT_BOLA",
+    "operation": "PATCH /fixture/{tenant}/documents/{object_id}",
+    "boundary": "TENANT",
+    "object_type": "document",
+    "protocol": "HTTP",
+    "fingerprint": "aeee72f7ca0a87acdd32744addb204d888d573c3d62f720b52b18e04e9867325",
+    "acceptable_categories": ["CROSS_TENANT_BOLA"],
+    "candidate_fingerprints": []
+  }],
+  "expected_specialist": "AUTHORIZATION",
+  "expected_skill_ids": ["typed-authorization-mutation"],
+  "forbidden_interpretations": ["HTTP_200_ALONE_IS_NOT_PROOF", "OWNER_UPDATE_IS_NOT_FOREIGN_EFFECT"],
+  "known_controls": ["owner_update", "foreign_read_denial", "owner_readback", "restore_readback"],
+  "tags": ["synthetic", "local", "authorization", "cross_tenant", "mutation"]
+}

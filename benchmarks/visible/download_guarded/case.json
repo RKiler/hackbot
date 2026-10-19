@@ -1,0 +1,12 @@
+{
+  "case_id": "download_guarded",
+  "version": 1,
+  "fixture_id": "benchmark",
+  "target_package": "package/target.yaml",
+  "scope_hosts": ["benchmark.test"],
+  "identity_aliases": [],
+  "input_files": ["traffic.json"],
+  "context_file": null,
+  "budget": {"requests": 0, "browser_actions": 0, "research_calls": 0, "tokens": 0, "seconds": 120},
+  "visible_hash": "fb2b86a19816b5b731e4401c396a5529d3dd0136bfda85a28e55e920223b4737"
+}

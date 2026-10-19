@@ -1,0 +1,13 @@
+{
+  "case_id": "local_horizontal_b",
+  "version": 1,
+  "category": "SECURE_NEGATIVE_CASE",
+  "difficulty": "INTERMEDIATE",
+  "split": "DEVELOPMENT",
+  "roots": [],
+  "expected_specialist": "AUTHORIZATION",
+  "expected_skill_ids": [],
+  "forbidden_interpretations": ["DENIAL_IS_NOT_A_BYPASS", "SAME_TENANT_MEMBERSHIP_IS_NOT_OWNERSHIP"],
+  "known_controls": ["owner_a_read", "owner_b_read", "invalid_object", "cross_owner_denied"],
+  "tags": ["synthetic", "local", "authorization", "same_tenant", "secure"]
+}
