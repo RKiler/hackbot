@@ -18,6 +18,7 @@ from .profile import TargetProfile
 from .recon import ReconJsAsset, ReconRepository
 from .skill_plans import SkillContextBuilder, SkillPlanner, SkillRouter
 from .target_loader import TargetPackageRepository
+from .target_recon import ReconDomainResolver, resolve_recon_target
 from .target_scope import ScopeResult
 from .traffic import ExchangeState, TrafficStore
 from .logging import SecretRedactor
@@ -87,7 +88,7 @@ class DOMXSSSpecialist:
 
     def inventory(self, package_id: str) -> tuple[DOMAssetLead, ...]:
         package = self._package(package_id)
-        recon_target = self.recon.resolve_target(package.target.root_domain)
+        recon_target = resolve_recon_target(package, self.recon)
         if recon_target is None:
             return ()
         recent_ids: set[int] = set()
@@ -110,7 +111,7 @@ class DOMXSSSpecialist:
             asset = self.recon.get_js_asset(recon_target.domain_id, asset_id)
             if asset is not None:
                 assets_by_id[asset.asset_id] = asset
-        hosts = self.recon.list_hosts(recon_target.domain_id, limit=self.MAX_HOSTS).items
+        hosts = ReconDomainResolver(self.recon).select_hosts(package).hosts[:self.MAX_HOSTS]
         for host in hosts:
             if package.scope.evaluate_url(host.url).result is not ScopeResult.IN_SCOPE:
                 continue
@@ -153,7 +154,7 @@ class DOMXSSSpecialist:
 
     def _observed_asset(self, package_id: str, asset: ReconJsAsset) -> bool:
         package = self._package(package_id)
-        recon_target = self.recon.resolve_target(package.target.root_domain)
+        recon_target = resolve_recon_target(package, self.recon)
         if recon_target is None:
             return False
         observed = self.recon.get_js_asset(recon_target.domain_id, asset.asset_id)

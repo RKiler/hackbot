@@ -28,7 +28,7 @@ class FakeCursor:
             self.rows = [] if self.connection.outside_scope else [{"one": 1}]
         elif sql.lstrip().startswith("SELECT set_config"):
             self.rows = [{"set_config": "3000"}]
-        elif sql.lstrip().startswith("SELECT"):
+        elif sql.lstrip().startswith(("SELECT", "WITH")):
             self.rows = self.connection.result(sql, tuple(params))
         else:
             self.rows = []
@@ -94,6 +94,44 @@ class ReconTests(unittest.TestCase):
         self.assertIn("lh.url=%s AND s.domain_id=%s", query)
         with self.assertRaises(ValueError):
             self.repo.resolve_host(5, "https://app.zapier.com/private")
+
+    def test_subdomain_membership_resolves_root_without_live_host(self):
+        self.connection.result = lambda _sql, _params: [{
+            "subdomain_id": 34, "subdomain": "app.example.co.uk", "host_id": None,
+            "domain_id": 5, "domain": "example.co.uk", "active": True,
+            "include_subdomains": True, "created_at": NOW,
+        }]
+        membership = self.repo.resolve_host_membership("APP.EXAMPLE.CO.UK")
+        self.assertEqual(membership.target.root_domain, "example.co.uk")
+        self.assertEqual(membership.subdomain_id, 34)
+        self.assertIsNone(membership.host_id)
+        query, params = self.connection.calls[-2]
+        self.assertIn("JOIN domains d ON d.id=s.domain_id", query)
+        self.assertIn("s.subdomain=%s", query)
+        self.assertEqual(params, ("app.example.co.uk",))
+
+    def test_wildcard_queries_are_root_bound_and_read_only(self):
+        def result(sql, _params):
+            if "AS known" in sql:
+                return [{"known": 559, "live": 194, "latest_scan": 184}]
+            if "AS endpoint_count" in sql:
+                return [{"id": 12, "endpoint_count": 10, "js_count": 3, "api_count": 1}]
+            return [{"id": 12, "url": "https://app.zapier.com", "status_code": 200,
+                     "last_seen": NOW, "subdomain": "app.zapier.com", "domain_id": 5}]
+        self.connection.result = result
+        counts = self.repo.wildcard_counts(5, "zapier.com")
+        self.assertEqual((counts.known, counts.live, counts.latest_scan), (559, 194, 184))
+        self.assertEqual(self.repo.list_wildcard_hosts(5, "zapier.com").items[0].hostname,
+                         "app.zapier.com")
+        self.assertEqual(self.repo.host_signals(5, (12,))[12].api_count, 1)
+        queries = [(sql, params) for sql, params in self.connection.calls if "FROM subdomains s" in sql]
+        self.assertTrue(all("s.domain_id=%s" in sql for sql, _ in queries))
+        self.assertTrue(any(params == (5, "%.zapier.com", 3) for _, params in queries))
+        self.assertFalse(any("UPDATE " in sql or "DELETE " in sql for sql, _ in self.connection.calls))
+        with self.assertRaises(ValueError):
+            self.repo.list_wildcard_hosts(5, "%.zapier.com")
+        with self.assertRaises(ValueError):
+            self.repo.host_signals(5, tuple(range(1, 34)))
 
     def test_host_cursor_paginates_without_offset(self):
         rows = [
@@ -218,6 +256,10 @@ class ReconTests(unittest.TestCase):
         self.assertEqual(surface.provenance.qualification, "recon_hint")
         self.assertEqual(snapshot.provenance.qualification, "completed_scan")
         self.assertEqual(event.provenance.source_table, "asset_events")
+        self.repo.list_api_surfaces(5, "graphql", host_id=12)
+        query, params = self.connection.calls[-2]
+        self.assertIn("live_host_id=%s", query)
+        self.assertEqual(params, (5, "graphql", 12, 3))
         with self.assertRaises(ValueError):
             self.repo.list_asset_events(5, NOW - timedelta(days=32), NOW)
 

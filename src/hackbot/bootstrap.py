@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 import hashlib
 import json
@@ -28,11 +28,12 @@ from .policy_models import ActionCategory, ActorMode, ProposedAction
 from .profile import AttackSurfaceProfiler, _FEATURES, _shape, _tokens
 from .postmessage_static import PostMessageStaticAnalyzer
 from .postmessage_store import PostMessageStore
-from .recon import ReconRepository
+from .recon import ReconHost, ReconRepository
 from .recon_postgres import ReconQueryError
 from .store import EvidenceFactStore
 from .target_loader import TargetPackageRepository
 from .target_package import TargetPackage
+from .target_recon import ReconDomainResolver, ReconHostSelection
 from .target_scope import ScopeResult
 from .traffic import TrafficStore
 
@@ -93,6 +94,23 @@ def _safe_url(base: str, value: str, package: TargetPackage) -> str | None:
         return None
 
 
+def _redirect_denial_reason(destination: str, package: TargetPackage) -> str:
+    try:
+        parsed = urlsplit(destination)
+        if parsed.scheme not in {"http", "https"}:
+            return "UNSUPPORTED_SCHEME"
+        if package.scope.evaluate_url(destination).result is not ScopeResult.IN_SCOPE:
+            return "OUT_OF_SCOPE"
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=16)
+        if any(key.lower() not in _SAFE_QUERY or len(value) > 32 or
+               not re.fullmatch(r"[A-Za-z0-9_.-]*", value)
+               for key, value in pairs):
+            return "UNSAFE_QUERY"
+    except (ValueError, UnicodeError):
+        pass
+    return "OTHER_POLICY"
+
+
 def _display(url: str) -> str:
     parsed = urlsplit(url)
     return ((parsed.hostname or "unknown") + _shape(parsed.path or "/"))[:180]
@@ -149,7 +167,7 @@ class ReconDiscoveryProvider:
         if self.recon is None:
             return None, "NOT_CONFIGURED"
         try:
-            target = self.recon.resolve_target(package.primary_domain)
+            target = ReconDomainResolver(self.recon).resolve(package).target
         except ValueError:
             return None, "NO_RECON_HISTORY"
         except ReconQueryError:
@@ -159,20 +177,32 @@ class ReconDiscoveryProvider:
     def resolve(self, package: TargetPackage):
         return self.lookup(package)[0]
 
-    def collect(self, package: TargetPackage) -> tuple[DiscoverySignal, ...]:
-        target = self.resolve(package)
-        if target is None or self.recon is None:
+    def exact_hosts(self, package: TargetPackage, domain_id: int) -> tuple[ReconHost, ...]:
+        if self.recon is None:
+            return ()
+        selection = self.select_hosts(package)
+        return selection.hosts if selection.resolution.target and selection.resolution.target.domain_id == domain_id else ()
+
+    def select_hosts(self, package: TargetPackage) -> ReconHostSelection:
+        if self.recon is None:
+            raise ValueError("Recon is not configured")
+        return ReconDomainResolver(self.recon).select_hosts(
+            package, exact_urls=TargetBootstrapper.seed_urls(package))
+
+    def collect(self, package: TargetPackage, *, hosts: tuple[ReconHost, ...] | None = None,
+                domain_id: int | None = None) -> tuple[DiscoverySignal, ...]:
+        target = self.resolve(package) if domain_id is None else None
+        resolved_id = domain_id if domain_id is not None else target.domain_id if target else None
+        if resolved_id is None or self.recon is None:
             return ()
         signals = []
         try:
-            for host in self.recon.list_hosts(target.domain_id, limit=8).items:
-                if package.scope.evaluate_url(host.url).result is not ScopeResult.IN_SCOPE:
-                    continue
+            for host in (hosts if hosts is not None else self.exact_hosts(package, resolved_id)):
                 signals.append(DiscoverySignal(self.name, "HOST_OBSERVED", _hash(host.url),
                                                _display(host.url), str(host.host_id)))
-                for endpoint in self.recon.list_endpoints(target.domain_id, host.host_id, limit=8).items:
-                    url = urljoin(host.url + "/", endpoint.path.lstrip("/"))
-                    if package.scope.evaluate_url(url).result is not ScopeResult.IN_SCOPE:
+                for endpoint in self.recon.list_endpoints(resolved_id, host.host_id, limit=8).items:
+                    url = _safe_url(host.url + "/", endpoint.path, package)
+                    if url is None:
                         continue
                     code = next((_API_TOKENS[token] for token in _tokens(endpoint.path)
                                  if token in _API_TOKENS), "ENDPOINT_OBSERVED")
@@ -181,6 +211,187 @@ class ReconDiscoveryProvider:
         except ReconQueryError:
             pass  # Current local discovery remains valid when the read-only accelerator fails.
         return tuple(signals[:80])
+
+
+@dataclass(frozen=True, slots=True)
+class ReconBootstrapSeed:
+    url: str
+    source: str
+    source_ref: str
+    family: str
+    score: int
+    observed_at: float
+    recon_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconBootstrapPlan:
+    seeds: tuple[ReconBootstrapSeed, ...]
+    candidates_seen: int
+    candidates_in_scope: int
+    candidates_deduped: int
+
+
+class ReconBootstrapSeedBuilder:
+    """Bounded read-only sampling; the TargetPackage and executor still authorize every fetch."""
+
+    ENDPOINT_WINDOW = 120
+    JS_WINDOW = 24
+    API_WINDOW = 8
+    EVENT_WINDOW = 64
+    MAX_RECON_SEEDS = 8
+
+    def __init__(self, recon: ReconRepository) -> None:
+        self.recon = recon
+
+    @staticmethod
+    def _family(url: str) -> str:
+        parts = [part for part in urlsplit(url).path.lower().split("/") if part]
+        return "/".join(parts[:2]) or "/"
+
+    @staticmethod
+    def _safe_candidate(base: str, raw: str, package: TargetPackage, *, js: bool = False) -> str | None:
+        if not isinstance(raw, str) or any(part in raw for part in ("{", "}", "<", ">", "*")):
+            return None
+        url = _safe_url(base, raw, package)
+        if url is None:
+            return None
+        if not js:
+            path = urlsplit(url).path
+            if any(re.fullmatch(r"[0-9]+|[a-fA-F0-9]{16,}|[a-fA-F0-9]{8}-[a-fA-F0-9-]{27,}", part)
+                   for part in path.split("/")):
+                return None
+        return url
+
+    def build(self, package: TargetPackage, domain_id: int, hosts: tuple[ReconHost, ...],
+              limits: BootstrapLimits, root_count: int) -> ReconBootstrapPlan:
+        seen = 0
+        in_scope = 0
+        candidates: dict[str, ReconBootstrapSeed] = {}
+        recent: set[str] = set()
+        try:
+            snapshots = self.recon.list_scan_snapshots(domain_id, limit=4).items
+            deltas = [item for item in snapshots if not item.first_run][:2]
+            end = (max((item.finished_at for item in deltas), default=datetime.now(timezone.utc))
+                   .replace(tzinfo=None) + timedelta(seconds=1))
+            start = max(end - timedelta(days=14),
+                        min((item.started_at.replace(tzinfo=None) for item in deltas), default=end - timedelta(days=14)))
+            for event in self.recon.list_asset_events(domain_id, start, end,
+                                                      limit=self.EVENT_WINDOW).items:
+                seen += 1
+                if event.location:
+                    url = self._safe_candidate(event.location, event.location, package,
+                                               js=event.entity_type == "js_asset")
+                    if url:
+                        recent.add(url)
+        except (ReconQueryError, ValueError):
+            pass
+
+        def add(raw: str, host: ReconHost, source: str, ref: int, score: int,
+                observed: datetime | None, *, js: bool = False,
+                recon_sha256: str | None = None) -> None:
+            nonlocal seen, in_scope
+            seen += 1
+            url = self._safe_candidate(host.url + "/", raw, package, js=js)
+            if url is None:
+                return
+            if not js and urlsplit(url).hostname != urlsplit(host.url).hostname:
+                return
+            in_scope += 1
+            score += 12 if url in recent else 0
+            score += min(12, 3 * len(set(_tokens(urlsplit(url).path)) & {
+                "api", "graphql", "openapi", "swagger", "dashboard", "settings", "projects", "workspace"}))
+            seed = ReconBootstrapSeed(url, source, str(ref), self._family(url), score,
+                                      observed.timestamp() if observed else 0.0, recon_sha256)
+            old = candidates.get(url)
+            if old is None or (seed.score, seed.observed_at, seed.source) > (
+                    old.score, old.observed_at, old.source):
+                candidates[url] = seed
+
+        for host in hosts:
+            endpoints = []
+            try:
+                page = self.recon.list_endpoints(domain_id, host.host_id, limit=40)
+                for _ in range(3):
+                    endpoints.extend(page.items)
+                    if not page.next_cursor:
+                        break
+                    page = self.recon.list_endpoints(domain_id, host.host_id, limit=40,
+                                                     cursor=page.next_cursor)
+                linked: set[int] = set()
+                parameterized: set[int] = set()
+                for endpoint in endpoints[:4]:
+                    if (endpoint.method or "").upper() not in {"GET", "HEAD"}:
+                        continue
+                    if self.recon.list_parameters(domain_id, endpoint.endpoint_id, limit=4).items:
+                        parameterized.add(endpoint.endpoint_id)
+                    for ref in self.recon.list_endpoint_js_references(
+                            domain_id, endpoint.endpoint_id, limit=2).items:
+                        asset = self.recon.get_js_asset(domain_id, ref.asset_id)
+                        if asset and asset.http_status == 200 and self._safe_candidate(
+                                host.url + "/", asset.asset_url, package, js=True):
+                            analysis = self.recon.get_js_analysis(domain_id, asset.asset_id)
+                            if analysis and any(analysis.signal_counts.values()):
+                                linked.add(endpoint.endpoint_id)
+                for endpoint in endpoints:
+                    if (endpoint.method or "").upper() not in {"GET", "HEAD"}:
+                        seen += 1
+                        continue
+                    if endpoint.status_code is not None and endpoint.status_code >= 500:
+                        seen += 1
+                        continue
+                    score = 72 + (8 if endpoint.endpoint_id in linked else 0)
+                    if "?" in endpoint.path or endpoint.endpoint_id in parameterized:
+                        score += 4
+                    add(endpoint.path, host, "RECON_ENDPOINT", endpoint.endpoint_id,
+                        score, endpoint.provenance.observed_at)
+                for asset in self.recon.list_js_assets(domain_id, host.host_id,
+                                                       limit=self.JS_WINDOW).items:
+                    if asset.http_status != 200 or (asset.size_bytes is not None and
+                                                    asset.size_bytes > limits.max_asset_bytes):
+                        seen += 1
+                        continue
+                    add(asset.asset_url, host, "RECON_JS", asset.asset_id, 83,
+                        asset.provenance.observed_at, js=True,
+                        recon_sha256=asset.latest_sha256)
+                for kind in ("graphql", "openapi", "api_docs"):
+                    for surface in self.recon.list_api_surfaces(
+                            domain_id, kind, host_id=host.host_id, limit=self.API_WINDOW).items:
+                        if surface.status_code is not None and surface.status_code >= 500:
+                            seen += 1
+                            continue
+                        add(surface.location, host, "RECON_API", surface.surface_id,
+                            92 if kind == "graphql" else 88,
+                            surface.provenance.observed_at)
+            except (ReconQueryError, ValueError):
+                continue
+
+        maximum = max(0, min(self.MAX_RECON_SEEDS, limits.max_requests - root_count - 2))
+        chosen: list[ReconBootstrapSeed] = []
+        host_counts: dict[str, int] = {}
+        family_counts: dict[tuple[str, str], int] = {}
+        source_counts: dict[str, int] = {}
+        remaining = list(candidates.values())
+        while remaining and len(chosen) < maximum:
+            eligible = [item for item in remaining if source_counts.get(item.source, 0) < {
+                "RECON_ENDPOINT": 4, "RECON_API": 2,
+                "RECON_JS": min(2, limits.max_js_assets),
+            }[item.source]]
+            if not eligible:
+                break
+            best = max(eligible, key=lambda item: (
+                item.score - 18 * host_counts.get(urlsplit(item.url).netloc, 0)
+                - 28 * family_counts.get((item.source, item.family), 0)
+                - 12 * source_counts.get(item.source, 0),
+                item.observed_at, item.url))
+            chosen.append(best)
+            remaining.remove(best)
+            hostname = urlsplit(best.url).netloc
+            host_counts[hostname] = host_counts.get(hostname, 0) + 1
+            family_key = (best.source, best.family)
+            family_counts[family_key] = family_counts.get(family_key, 0) + 1
+            source_counts[best.source] = source_counts.get(best.source, 0) + 1
+        return ReconBootstrapPlan(tuple(chosen), seen, in_scope, len(candidates))
 
 
 class TrafficDiscoveryProvider:
@@ -478,7 +689,7 @@ class TargetBootstrapper:
         predicate = "uses_technology" if signal.code.startswith("TECHNOLOGY_") else "bootstrap_signal"
         value = signal.code.removeprefix("TECHNOLOGY_") if predicate == "uses_technology" else signal.code
         self.evidence.create_fact("bootstrap:" + signal.surface_key, predicate, value,
-                                  confidence=0.65 if signal.source != "RECON" else 0.55,
+                                  confidence=0.55 if signal.source.startswith("RECON") else 0.65,
                                   evidence_ids=(observation.evidence_id,), source=signal.source,
                                   target_ref=run.target_id)
         counts["facts_created"] += 1
@@ -490,7 +701,8 @@ class TargetBootstrapper:
             counts["features_detected"] += 1
 
     def _fetch(self, run: BootstrapResult, package: TargetPackage, url: str,
-               kind: str | None, deadline: float):
+               kind: str | None, deadline: float, known_urls: set[str],
+               visited: set[str], counts: dict[str, int]):
         current = self.ledger.get(run.bootstrap_id, run.target_id)
         assert current is not None
         remaining = current.limits.max_requests - current.counts["requests_used"]
@@ -503,15 +715,42 @@ class TargetBootstrapper:
         try:
             permit = self.executor.authorize(action, template)
         except (ValueError, RuntimeError):
-            return None
-        return self.executor.execute(
+            return None, None, url
+        redirect_outcome = None
+        allowed: dict[str, str] = {}
+
+        def guard(destination: str) -> bool:
+            nonlocal redirect_outcome
+            normalized = _safe_url(destination, destination, package)
+            if normalized is None:
+                redirect_outcome = _redirect_denial_reason(destination, package)
+                counts["redirect_denied_" + redirect_outcome.lower()] += 1
+                return False
+            if normalized in known_urls or normalized in visited:
+                redirect_outcome = "DUPLICATE"
+                counts["redirect_duplicates"] += 1
+                return False
+            allowed[hashlib.sha256(destination.encode()).hexdigest()] = normalized
+            return True
+
+        result = self.executor.execute(
             action, permit, template, max_dispatches=min(remaining, run.limits.max_redirects + 1),
             artifact_capture_kind=kind,
             continue_dispatch=lambda: time.monotonic() < deadline and
                 not self.ledger.cancelled(run.bootstrap_id, run.target_id),
             on_dispatch=lambda _exchange_id: self.ledger.reserve_request(run.bootstrap_id, run.target_id),
-            redirect_guard=lambda destination: _safe_url(destination, destination, package) is not None,
+            redirect_guard=guard,
         )
+        effective_url = url
+        for hop in result.redirects:
+            if hop.followed and hop.destination_sha256 in allowed:
+                effective_url = allowed[hop.destination_sha256]
+                known_urls.add(effective_url)
+                visited.add(effective_url)
+        if result.error is ExecutionError.REDIRECT_DENIED and redirect_outcome is None:
+            redirect_outcome = "OTHER_POLICY"
+            counts["redirect_denied_other_policy"] += 1
+        return result, redirect_outcome, effective_url
 
     def _body(self, exchange_id: str, max_bytes: int) -> bytes | None:
         exchange = self.traffic.get_exchange(exchange_id)
@@ -545,26 +784,79 @@ class TargetBootstrapper:
         map_urls: deque[tuple[str, str]] = deque()
         spec_urls: deque[str] = deque()
         visited: set[str] = set()
+        known_urls: set[str] = set()
         seen_js: set[str] = set()
+        recon_js_metadata: dict[str, tuple[int, str | None]] = {}
         exchanges: set[str] = set()
         auth_required = False
         browser_profiled = False
 
         try:
-            _, recon_status = self.recon_provider.lookup(package)
+            recon_target, recon_status = self.recon_provider.lookup(package)
             if recon_status == "RECON_UNAVAILABLE":
                 limitations.add("RECON_UNAVAILABLE")
-            for provider in (self.manual, self.recon_provider, self.traffic_provider):
+            hosts: tuple[ReconHost, ...] = ()
+            if recon_target is not None:
+                try:
+                    selection = self.recon_provider.select_hosts(package)
+                    hosts = selection.hosts
+                    counts["recon_wildcard_matches"] = selection.wildcard_matches
+                    counts["recon_live_matches"] = selection.live_matches
+                    counts["recon_latest_scan_matches"] = selection.latest_scan_matches
+                    counts["recon_related_hosts_selected"] = len(selection.related_hosts)
+                    counts["recon_hosts_rejected"] = selection.rejected_count
+                except ReconQueryError:
+                    limitations.add("RECON_UNAVAILABLE")
+            counts["recon_hosts_resolved"] = len(hosts)
+            for provider in (self.manual, self.traffic_provider):
                 for signal in provider.collect(package):
+                    self._record(run, signal, counts)
+            if recon_target is not None:
+                for signal in self.recon_provider.collect(
+                        package, hosts=hosts, domain_id=recon_target.domain_id):
                     self._record(run, signal, counts)
             if run.mode is BootstrapMode.COLD_START and recon_status == "NO_RECON_HISTORY":
                 limitations.add("NO_RECON_HISTORY")
             elif run.mode is BootstrapMode.COLD_START and recon_status == "NOT_CONFIGURED":
                 limitations.add("RECON_NOT_CONFIGURED")
-            for url in self.seed_urls(package):
+            roots = self.seed_urls(package)
+            counts["root_seeds_selected"] = len(roots)
+            for url in roots:
                 pages.append((url, 0))
+                known_urls.add(url)
             if not pages:
                 limitations.add("NO_EXACT_HOST_SEED")
+            if recon_target is not None and self.recon is not None and hosts:
+                plan = ReconBootstrapSeedBuilder(self.recon).build(
+                    package, recon_target.domain_id, hosts, limits, len(roots))
+                counts["recon_candidates_seen"] = plan.candidates_seen
+                counts["recon_candidates_in_scope"] = plan.candidates_in_scope
+                counts["recon_candidates_deduped"] = plan.candidates_deduped
+                for seed in plan.seeds:
+                    if seed.url in known_urls:
+                        continue
+                    known_urls.add(seed.url)
+                    counts["recon_seeds_selected"] += 1
+                    self._record(run, DiscoverySignal("RECON", "SEED_" + seed.source.removeprefix("RECON_"), _hash(seed.url),
+                                                      _display(seed.url), seed.source_ref), counts)
+                    if seed.source == "RECON_JS":
+                        if seed.url not in seen_js:
+                            js_urls.append(seed.url)
+                            seen_js.add(seed.url)
+                            digest = seed.recon_sha256
+                            recon_js_metadata[seed.url] = (
+                                int(seed.source_ref), digest.lower() if digest and
+                                re.fullmatch(r"[0-9a-fA-F]{64}", digest) else None)
+                            counts["js_assets_discovered"] += 1
+                            counts["recon_js_seeds"] += 1
+                    elif seed.source == "RECON_API":
+                        spec_urls.append(seed.url)
+                        counts["recon_api_seeds"] += 1
+                        if "graphql" in _tokens(urlsplit(seed.url).path):
+                            counts["recon_graphql_seeds"] += 1
+                    else:
+                        pages.append((seed.url, 0))
+                        counts["recon_endpoint_seeds"] += 1
 
             if run.identity_policy is not BootstrapIdentityPolicy.ANONYMOUS_ONLY:
                 signals = browser_signals if browser_signals is not None else self.capture_browser_signals(package, run)
@@ -601,25 +893,30 @@ class TargetBootstrapper:
                     if url in visited:
                         continue
                     visited.add(url)
-                    result = self._fetch(run, package, url, None, deadline)
+                    result, redirect_outcome, effective_url = self._fetch(
+                        run, package, url, None, deadline, known_urls, visited, counts)
                     if result is None:
                         limitations.add("POLICY_OR_EXECUTOR_UNAVAILABLE")
                         continue
                     exchanges.update(result.exchange_ids)
-                    if result.error:
+                    if result.error and redirect_outcome != "DUPLICATE":
                         limitations.add(result.error.value)
+                    url = effective_url
                     if result.status_code in {401, 403} or urlsplit(url).path.lower().startswith(("/login", "/signin")):
                         auth_required = True
                         self._record(run, DiscoverySignal("COLD_START_TRAFFIC", "BOUNDARY_AUTHENTICATED",
                                       _hash(url + "auth-boundary"), _display(url),
                                       result.exchange_ids[-1] if result.exchange_ids else None), counts)
                     if (result.status_code != 200 or result.content_type not in
-                            {"text/html", "application/xhtml+xml"} or result.truncated or not result.exchange_ids):
+                            {"text/html", "application/xhtml+xml"} or not result.exchange_ids):
                         continue
                     body = self._body(result.exchange_ids[-1], min(limits.max_asset_bytes, 262_144))
                     if body is None:
                         limitations.add("HTML_BODY_UNAVAILABLE")
                         continue
+                    if result.truncated:
+                        counts["html_pages_truncated"] += 1
+                        limitations.add("HTML_PREFIX_ONLY")
                     counts["pages_visited"] += 1
                     counts["anonymous_pages"] += 1
                     self._record(run, DiscoverySignal("COLD_START_TRAFFIC", "PAGE_OBSERVED",
@@ -643,6 +940,7 @@ class TargetBootstrapper:
                         if script and script not in seen_js:
                             js_urls.append(script)
                             seen_js.add(script)
+                            known_urls.add(script)
                             counts["js_assets_discovered"] += 1
                             self._record(run, DiscoverySignal("COLD_START_TRAFFIC", "JS_ASSET",
                                           _hash(script), _display(script), result.exchange_ids[-1]), counts)
@@ -658,7 +956,9 @@ class TargetBootstrapper:
                     for raw in html.specs[:2]:
                         spec = _safe_url(url, raw, package)
                         if spec:
-                            spec_urls.append(spec)
+                            if spec not in known_urls:
+                                spec_urls.append(spec)
+                                known_urls.add(spec)
                     navigable: set[str] = set()
                     for raw in html.links[:40]:
                         link = _safe_url(url, raw, package)
@@ -701,8 +1001,9 @@ class TargetBootstrapper:
                                     feature, result.exchange_ids[-1]), counts)
                     if depth < limits.max_navigation_depth:
                         for link in sorted(navigable, key=_navigation_priority):
-                            if link not in visited and len(pages) < limits.max_pages * 4:
+                            if link not in known_urls and link not in visited and len(pages) < limits.max_pages * 4:
                                 pages.append((link, depth + 1))
+                                known_urls.add(link)
                     continue
 
                 if js_urls and counts["js_assets_acquired"] < limits.max_js_assets:
@@ -710,7 +1011,8 @@ class TargetBootstrapper:
                     previous_asset = self.js.cached_cold_start_asset(run.target_id, url)
                     asset = None if refresh else previous_asset
                     if asset is None:
-                        result = self._fetch(run, package, url, "JS", deadline)
+                        result, _, effective_url = self._fetch(
+                            run, package, url, "JS", deadline, known_urls, visited, counts)
                         if result is None:
                             limitations.add("JS_POLICY_BLOCKED")
                             continue
@@ -728,8 +1030,13 @@ class TargetBootstrapper:
                         if _looks_like_html(body):
                             limitations.add("JS_NON_SCRIPT_RESPONSE")
                             continue
+                        if effective_url != url:
+                            previous_asset = None
+                            url = effective_url
+                        recon_asset_id, recon_sha256 = recon_js_metadata.get(url, (None, None))
                         asset = self.js.record_artifact(target_id=run.target_id, asset_url=url, body=body,
-                                                        recon_asset_id=None, recon_sha256=None,
+                                                        recon_asset_id=recon_asset_id,
+                                                        recon_sha256=recon_sha256,
                                                         source="CONTROLLED_HTTP",
                                                         retrieval_exchange_id=result.exchange_ids[-1],
                                                         capture_evidence_id=result.artifact_evidence_id)
@@ -787,7 +1094,9 @@ class TargetBootstrapper:
                             limitations.add("JS_EXPOSURE_ANALYSIS_UNAVAILABLE")
                     map_url = referenced_source_map(url, body)
                     if map_url and _safe_url(url, map_url, package) == map_url and len(map_urls) < 2:
-                        map_urls.append((map_url, asset.artifact_id))
+                        if map_url not in known_urls:
+                            map_urls.append((map_url, asset.artifact_id))
+                            known_urls.add(map_url)
                     elif map_url:
                         limitations.add("SOURCE_MAP_OUT_OF_SCOPE_OR_UNSAFE")
                     continue
@@ -797,7 +1106,8 @@ class TargetBootstrapper:
                     if self.js.get_source_map(run.target_id, asset_id):
                         counts["source_maps_acquired"] += 1
                         continue
-                    result = self._fetch(run, package, url, "SOURCE_MAP", deadline)
+                    result, _, effective_url = self._fetch(
+                        run, package, url, "SOURCE_MAP", deadline, known_urls, visited, counts)
                     if result and result.status_code == 200 and not result.truncated and result.artifact_evidence_id:
                         exchanges.update(result.exchange_ids)
                         try:
@@ -808,7 +1118,7 @@ class TargetBootstrapper:
                             limitations.add("SOURCE_MAP_EXCEEDS_LIMIT")
                             continue
                         self.js.record_source_map(target_id=run.target_id, js_artifact_id=asset_id,
-                                                  map_url=url, body=body, source="CONTROLLED_HTTP",
+                                                  map_url=effective_url, body=body, source="CONTROLLED_HTTP",
                                                   retrieval_exchange_id=result.exchange_ids[-1],
                                                   capture_evidence_id=result.artifact_evidence_id)
                         counts["source_maps_acquired"] += 1
@@ -818,7 +1128,8 @@ class TargetBootstrapper:
 
                 if spec_urls:
                     url = spec_urls.popleft()
-                    result = self._fetch(run, package, url, None, deadline)
+                    result, _, effective_url = self._fetch(
+                        run, package, url, None, deadline, known_urls, visited, counts)
                     if result:
                         exchanges.update(result.exchange_ids)
                         if result.status_code == 200 and not result.truncated and result.exchange_ids:
@@ -829,7 +1140,7 @@ class TargetBootstrapper:
                                 data = None
                             if isinstance(data, dict) and ("openapi" in data or "swagger" in data):
                                 self._record(run, DiscoverySignal("COLD_START_TRAFFIC", "API_OPENAPI",
-                                              _hash(url), _display(url), result.exchange_ids[-1]), counts)
+                                              _hash(effective_url), _display(effective_url), result.exchange_ids[-1]), counts)
                     continue
 
                 break

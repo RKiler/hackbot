@@ -108,6 +108,12 @@ class BootstrapResult:
     evidence_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
+        seed_sources = [name for name, key in (
+            ("TARGET_ROOT", "root_seeds_selected"),
+            ("RECON_ENDPOINT", "recon_endpoint_seeds"),
+            ("RECON_JS", "recon_js_seeds"),
+            ("RECON_API", "recon_api_seeds"),
+        ) if self.counts.get(key, 0)]
         return {"bootstrap_id": self.bootstrap_id, "target_id": self.target_id,
                 "package_id": self.package_id, "mode": self.mode.value,
                 "status": self.status.value,
@@ -127,6 +133,7 @@ class BootstrapResult:
                 "features_detected": self.counts["features_detected"],
                 "traffic_exchanges_recorded": self.counts["traffic_exchanges_recorded"],
                 "facts_created": self.counts["facts_created"],
+                "seed_sources": seed_sources,
                 "evidence_ids": list(self.evidence_ids),
                 "limitations": list(self.limitations), "stop_reason": self.stop_reason,
                 "cancel_requested": self.cancel_requested}
@@ -136,7 +143,15 @@ _COUNT_KEYS = ("requests_used", "pages_visited", "js_assets_discovered", "js_ass
                "js_assets_changed",
                "api_surfaces_observed", "technologies_detected", "features_detected",
                "traffic_exchanges_recorded", "facts_created", "anonymous_pages",
-               "authenticated_pages", "source_maps_acquired")
+               "authenticated_pages", "source_maps_acquired", "root_seeds_selected",
+               "recon_hosts_resolved", "recon_candidates_seen", "recon_candidates_in_scope",
+               "recon_wildcard_matches", "recon_live_matches", "recon_latest_scan_matches",
+               "recon_related_hosts_selected", "recon_hosts_rejected",
+               "recon_candidates_deduped", "recon_seeds_selected", "recon_endpoint_seeds",
+               "recon_js_seeds", "recon_api_seeds", "recon_graphql_seeds",
+               "html_pages_truncated", "redirect_duplicates", "redirect_denied_out_of_scope",
+               "redirect_denied_unsafe_query", "redirect_denied_unsupported_scheme",
+               "redirect_denied_other_policy")
 _ACTIVE = {BootstrapStatus.CREATED, BootstrapStatus.READY, BootstrapStatus.RUNNING}
 
 

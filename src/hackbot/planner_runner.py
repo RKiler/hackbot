@@ -30,6 +30,7 @@ from .postmessage import PostMessageSpecialist
 from .research import KnowledgeGap, ResearchBudget, ResearchCoordinator
 from .skill_plans import SkillContextBuilder, SkillPlanner, SkillRouter
 from .target_package import TargetPackage
+from .target_recon import resolve_recon_target
 from .target_policy import PolicyDecision
 from .test_objects import ObjectRegistry, ObjectState, TestObject
 from .validation_store import ValidationStatus
@@ -524,7 +525,7 @@ class PlannerRunner:
                                                           requests=3):
                         self._block(run, task, candidate, "BUDGET_TOO_LOW")
                         return
-                    recon_target = self.dom.recon.resolve_target(package.target.root_domain)
+                    recon_target = resolve_recon_target(package, self.dom.recon)
                     observed = (self.dom.recon.get_js_asset(recon_target.domain_id,
                                  old.recon_asset_id) if recon_target else None)
                     if (observed is None or observed.asset_id != old.recon_asset_id or

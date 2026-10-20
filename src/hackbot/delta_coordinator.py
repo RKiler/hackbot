@@ -16,6 +16,7 @@ from .planner_models import PlannerMode, Specialist
 from .recon_postgres import ReconQueryError
 from .resources import ResourceError, WorkKind
 from .target_package import TargetPackage
+from .target_recon import resolve_recon_target
 from .target_scope import ScopeResult
 
 if TYPE_CHECKING:
@@ -52,7 +53,7 @@ class DeltaCoordinator:
         source_ref = str(candidate["source_ref"])
         if not source_ref.startswith("asset_events:") or not source_ref[13:].isdecimal():
             return None
-        target = self.recon.resolve_target(package.primary_domain)
+        target = resolve_recon_target(package, self.recon)
         if target is None or not target.active_in_recon:
             return None
         event = self.recon.get_asset_event(target.domain_id, int(source_ref[13:]))

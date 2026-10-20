@@ -15,6 +15,7 @@ from .domxss_store import DOMXSSStore
 from .recon import Provenance, ReconAssetEvent, ReconRepository
 from .recon_postgres import ReconQueryError
 from .target_package import PackageStatus, TargetPackage
+from .target_recon import resolve_recon_target
 from .target_scope import ScopeResult
 
 if TYPE_CHECKING:
@@ -169,7 +170,7 @@ class DeltaWatcher:
                 bootstrap_highwater=cold_highwater, backlog_min_count=cold_backlog,
                 events_scanned=cold_count,
                 baseline=cold_baseline)
-        target = self.recon.resolve_target(package.primary_domain)
+        target = resolve_recon_target(package, self.recon)
         if target is None or not target.active_in_recon:
             return self.ledger.finish_watch(
                 package, watch_id, source=DeltaSource.COLD_START,

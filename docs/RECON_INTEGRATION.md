@@ -64,3 +64,19 @@ Before any active operation in a later phase, independently validate the
 program's scope source and the parsed request hostname. A row in this DB,
 an `active` domain flag, a CDN reference, or an allowed recon crawler target
 does not authorize BugHunter testing.
+
+## Focus-host and wildcard resolution
+
+`ReconDomainResolver` first checks the exact `domains` row, then the exact
+`subdomains` row and its `domain_id` foreign key (whether or not a `live_hosts`
+row exists). Only if neither exists does it try a bounded parent suffix that
+must itself have a `domains` row. This is recon identity, not authorization.
+For an explicit TargetPackage wildcard, the read-only adapter counts known,
+live-host, and latest-scan subdomains and pages at most 200 recent live-host
+origins per wildcard. The resolver checks each candidate against the package's
+full origin scope, scores up to 32 host records, and selects at most four
+related hosts. Bootstrap still has its own smaller request and seed budgets;
+no wildcard host is contacted merely because it appears in recon. In this
+schema endpoints and JS assets are children of `live_hosts`, so an exact
+subdomain without a live host can resolve the recon root but cannot provide
+host-bound endpoint/JS seeds.

@@ -250,7 +250,8 @@ class HypothesisStore:
             return self._row(db, row) if row else None
 
     def list(self, target_id: str, *, limit: int = 20, cursor: str | None = None,
-             status: str | None = None, category: str | None = None) -> dict[str, object]:
+             status: str | None = None, category: str | None = None,
+             include_archived: bool = False) -> dict[str, object]:
         if type(limit) is not int or not 1 <= limit <= 50:
             raise ValueError("invalid page size")
         if status is not None:
@@ -261,6 +262,9 @@ class HypothesisStore:
             raise ValueError("invalid cursor")
         clauses = ["target_id=?"]
         args: list[object] = [target_id]
+        if not include_archived:
+            clauses.append("NOT EXISTS (SELECT 1 FROM hypothesis_events AS e WHERE "
+                           "e.hypothesis_id=hypotheses.hypothesis_id AND e.event_type='ARCHIVED')")
         if status:
             clauses.append("status=?"); args.append(status)
         if category:
@@ -276,6 +280,30 @@ class HypothesisStore:
             items = [self._row(db, row) for row in rows[:limit]]
         return {"items": [item.to_dict() for item in items],
                 "next_cursor": f"{items[-1].priority}:{items[-1].id}" if len(rows) > limit else None}
+
+    def archive(self, target_id: str, hypothesis_id: str) -> bool:
+        if not re.fullmatch(r"HYP-[0-9a-f]{32}", hypothesis_id):
+            raise ValueError("Invalid hypothesis ID")
+        with self.evidence._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,priority FROM hypotheses WHERE target_id=? AND hypothesis_id=?",
+                             (target_id, hypothesis_id)).fetchone()
+            if row is None:
+                raise LookupError("hypothesis not found")
+            if db.execute("""SELECT 1 FROM plan_runs WHERE target_id=? AND hypothesis_id=?
+                AND status NOT IN ('BLOCKED','COMPLETED','REJECTED','FAILED',
+                                   'BUDGET_EXHAUSTED','CANCELLED') LIMIT 1""",
+                (target_id, hypothesis_id)).fetchone():
+                raise ValueError("Active plan run depends on hypothesis")
+            if db.execute("""SELECT 1 FROM hypothesis_events WHERE hypothesis_id=?
+                AND event_type='ARCHIVED'""", (hypothesis_id,)).fetchone():
+                return False
+            db.execute("""INSERT INTO hypothesis_events
+                (hypothesis_id,changed_at,actor,event_type,old_status,new_status,
+                 old_priority,new_priority,reason) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (hypothesis_id, _now().isoformat(), "OPERATOR", "ARCHIVED", row["status"],
+                 row["status"], row["priority"], row["priority"], "operator_view_archive"))
+        return True
 
     def history(self, hypothesis_id: str, target_id: str) -> tuple[dict[str, object], ...]:
         if self.get(hypothesis_id, target_id) is None:

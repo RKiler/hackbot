@@ -47,7 +47,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_finding_evidence_hold.py",
         "test_auth.py", "test_identity_registry.py",
         "test_traffic.py", "test_planner_store.py", "test_domxss_store.py",
-        "test_recon.py", "test_object_factory.py", "test_phase12.py",
+        "test_recon.py", "test_target_recon_resolver.py", "test_object_factory.py", "test_phase12.py",
         "test_profile_retention.py", "test_research_retention.py",
         "test_benchmark_store.py",
     ),

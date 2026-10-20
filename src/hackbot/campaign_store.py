@@ -14,6 +14,7 @@ from .campaign_models import (
 )
 from .planner_models import PlannerMode
 from .delta_models import DeltaFocus
+from .domain import validate_entity_id
 from .store import EvidenceFactStore
 from .target_package import TargetPackage
 from .target_scope import ScopeResult
@@ -270,7 +271,7 @@ class CampaignStore:
         return self._campaign(row) if row else None
 
     def list(self, *, target_id: str | None = None, limit: int = 30,
-             before: str | None = None) -> tuple[Campaign, ...]:
+             before: str | None = None, include_archived: bool = False) -> tuple[Campaign, ...]:
         if type(limit) is not int or not 1 <= limit <= 50:
             raise ValueError("Invalid campaign page size")
         if before is not None and not _CAMPAIGN_ID.fullmatch(before):
@@ -285,6 +286,9 @@ class CampaignStore:
             if target_id is not None:
                 where.append("target_id=?")
                 args.append(target_id)
+            if not include_archived:
+                where.append("NOT EXISTS (SELECT 1 FROM campaign_events AS e WHERE "
+                             "e.campaign_id=campaigns.campaign_id AND e.event_type='operator_archived')")
             if anchor is not None:
                 where.append("(created_at,campaign_id)<(?,?)")
                 args.extend(anchor)
@@ -293,6 +297,28 @@ class CampaignStore:
                               " ORDER BY created_at DESC,campaign_id DESC LIMIT ?",
                               (*args, limit)).fetchall()
         return tuple(self._campaign(row) for row in rows)
+
+    def archive(self, campaign_id: str, target_id: str) -> bool:
+        if not _CAMPAIGN_ID.fullmatch(campaign_id):
+            raise ValueError("Invalid campaign ID")
+        validate_entity_id(target_id, "TARGET")
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM campaigns WHERE campaign_id=? AND target_id=?",
+                             (campaign_id, target_id)).fetchone()
+            if row is None:
+                raise LookupError("Campaign not found")
+            if row["status"] not in {"COMPLETED", "CANCELLED", "BLOCKED", "FAILED",
+                                     "BUDGET_EXHAUSTED", "TIME_EXHAUSTED"}:
+                raise ValueError("Campaign is not safely terminal")
+            if db.execute("""SELECT 1 FROM campaign_events WHERE campaign_id=?
+                AND event_type='operator_archived'""", (campaign_id,)).fetchone():
+                return False
+            db.execute("""INSERT INTO campaign_events
+                (campaign_id,cycle_number,work_id,event_type,reason_code,occurred_at)
+                VALUES (?,NULL,NULL,'operator_archived','OPERATOR_ARCHIVE',?)""",
+                (campaign_id, datetime.now(timezone.utc).isoformat()))
+        return True
 
     def stats(self, target_id: str | None = None) -> dict[str, int]:
         predicate = " WHERE target_id=?" if target_id is not None else ""

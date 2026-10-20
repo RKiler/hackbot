@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
@@ -13,12 +14,15 @@ import time
 import unittest
 from unittest.mock import patch
 
-from hackbot.bootstrap import BrowserDiscoveryProvider, _HTMLSignals, _safe_url
+from hackbot.bootstrap import (BrowserDiscoveryProvider, ReconBootstrapSeedBuilder,
+                              ReconDiscoveryProvider, _HTMLSignals, _redirect_denial_reason, _safe_url)
 from hackbot.bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, BootstrapMode,
                                     BootstrapStatus)
 from hackbot.config import TargetSettings, load_config
 from hackbot.domain import TrafficSource
-from hackbot.recon import Page, Provenance, ReconEndpoint, ReconHost, ReconTarget
+from hackbot.recon import (Page, Provenance, ReconApiSurface, ReconAssetEvent, ReconEndpoint,
+                           ReconEndpointJsReference, ReconHost, ReconJsAsset,
+                           ReconScanSnapshot, ReconTarget)
 from hackbot.recon_postgres import ReconQueryError
 from hackbot.resources import ResourceBudgetManager
 from hackbot.service import BugHunterRuntime, create_app
@@ -53,6 +57,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
                         '<a href="/out">External</a><a href="/go">Go</a>'
                         '<form action="/delete" method="post"></form>'
                         '</html>').encode()
+                if self.server.oversized_html:
+                    body += b" " * 300_000
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
         elif self.path == "/dashboard":
@@ -60,6 +66,22 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     b'<a href="/api/projects?tenant_id=123">Projects</a></html>')
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+        elif self.path == "/alias":
+            body = b""
+            self.send_response(302)
+            self.send_header("Location", "/")
+        elif self.path == "/fresh":
+            body = b""
+            self.send_response(302)
+            self.send_header("Location", "/nested/page")
+        elif self.path == "/nested/page":
+            body = b'<html><script src="chunk.js"></script></html>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+        elif self.path == "/nested/chunk.js":
+            body = b'fetch("/api/nested")'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
         elif self.path == "/out":
             body = b""
             self.send_response(302)
@@ -104,10 +126,16 @@ class EmptyRecon:
     def list_hosts(self, _domain_id, *, limit, cursor=None):
         return Page((), None)
 
+    def resolve_host(self, _domain_id, _exact_url):
+        return None
+
     def list_scan_snapshots(self, _domain_id, *, limit, cursor=None):
         return Page((), None)
 
-    def list_api_surfaces(self, _domain_id, _type, *, limit, cursor=None):
+    def list_api_surfaces(self, _domain_id, _type, *, host_id=None, limit, cursor=None):
+        return Page((), None)
+
+    def list_asset_events(self, _domain_id, _start, _end, *, limit, cursor=None):
         return Page((), None)
 
 
@@ -120,6 +148,12 @@ class BoundedRecon(EmptyRecon):
         return Page((ReconHost(host_id=9, domain_id=7, hostname="127.0.0.1",
                                url=self.host_url, status_code=200,
                                provenance=self.provenance),), None)
+
+    def resolve_host(self, _domain_id, exact_url):
+        return self.list_hosts(_domain_id, limit=1).items[0] if exact_url == self.host_url.rstrip("/") else None
+
+    def get_js_asset(self, *_args, **_kwargs):
+        return None
 
     def list_endpoints(self, _domain_id, _host_id, *, limit, cursor=None):
         return Page((ReconEndpoint(endpoint_id=11, host_id=9, path="/api/projects",
@@ -137,6 +171,73 @@ class BoundedRecon(EmptyRecon):
 
     def get_js_analysis(self, *_args, **_kwargs):
         return None
+
+
+class LargeScopedRecon(EmptyRecon):
+    def __init__(self):
+        self.now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+        self.provenance = Provenance("fixture", 1, self.now, "fixture")
+        self.hosts = tuple(ReconHost(i, 7, name, f"https://{name}", 200, self.provenance)
+                           for i, name in enumerate(("alpha.example.test", "beta.example.test",
+                                                     "unrelated.example.test"), 1))
+        paths = ("/api/projects", "/api/users", "/dashboard", "/settings",
+                 "/graphql", "/api/reports", "/api/projects?page=1")
+        self.endpoints = {host.host_id: tuple(
+            ReconEndpoint(host.host_id * 10_000 + i, host.host_id, paths[i % len(paths)],
+                          "POST" if i % 19 == 0 else "GET", 200, "fixture", self.provenance)
+            for i in range(1200)) for host in self.hosts}
+        self.calls = []
+
+    def list_hosts(self, *_args, **_kwargs):
+        raise AssertionError("lexical domain-host sampling is forbidden")
+
+    def resolve_host(self, _domain_id, exact_url):
+        self.calls.append(("resolve_host", exact_url))
+        return next((host for host in self.hosts if host.url == exact_url), None)
+
+    def list_endpoints(self, _domain_id, host_id, *, limit, cursor=None):
+        self.calls.append(("endpoints", host_id, limit))
+        offset = int(cursor or 0)
+        rows = self.endpoints[host_id]
+        selected = rows[offset:offset + limit]
+        return Page(selected, str(offset + limit) if offset + limit < len(rows) else None)
+
+    def list_endpoint_js_references(self, _domain_id, endpoint_id, *, limit, cursor=None):
+        return Page((ReconEndpointJsReference(1, endpoint_id, 1, self.provenance),), None)
+
+    def list_parameters(self, *_args, **_kwargs):
+        return Page((), None)
+
+    def get_js_asset(self, _domain_id, asset_id):
+        return ReconJsAsset(asset_id, 1, "https://alpha.example.test/app.js", "a" * 64,
+                            100, 200, self.provenance)
+
+    def get_js_analysis(self, *_args, **_kwargs):
+        return None
+
+    def list_js_assets(self, _domain_id, host_id, *, limit, cursor=None):
+        self.calls.append(("js", host_id, limit))
+        return Page(tuple(ReconJsAsset(host_id * 100 + i, host_id,
+                          (f"https://{self.hosts[host_id - 1].hostname}/app{i % 4}.js"
+                           if i < 20 else "https://unrelated.example.test/out.js"),
+                          "a" * 64, 100, 200, self.provenance) for i in range(limit)), None)
+
+    def list_api_surfaces(self, _domain_id, kind, *, host_id=None, limit, cursor=None):
+        self.calls.append(("api", host_id, kind, limit))
+        if host_id is None:
+            raise AssertionError("API surfaces must be host-filtered")
+        path = "/graphql" if kind == "graphql" else "/openapi.json"
+        return Page((ReconApiSurface(host_id * 1000 + len(kind), 7, host_id, kind, path,
+                                     200, 3, self.provenance),), None)
+
+    def list_scan_snapshots(self, _domain_id, *, limit, cursor=None):
+        return Page((ReconScanSnapshot(1, 7, self.now - timedelta(days=1), self.now,
+                                       False, self.provenance),), None)
+
+    def list_asset_events(self, _domain_id, _start, _end, *, limit, cursor=None):
+        return Page((ReconAssetEvent(1, 7, "js_asset_changed", "js_asset", 1,
+                                     "https://alpha.example.test/app0.js", "medium",
+                                     self.provenance),), None)
 
 
 class UnavailableRecon:
@@ -181,6 +282,7 @@ class Phase24Tests(unittest.TestCase):
         self.server.login_required = False
         self.server.login_form = False
         self.server.js_heavy = False
+        self.server.oversized_html = False
         self.server.js_body = (b'fetch("/graphql"); const channel = new MessageChannel(); ApolloClient;'
                                b'\n//# sourceMappingURL=app.js.map')
         self.server.js_type = "application/javascript"
@@ -284,6 +386,119 @@ class Phase24Tests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["recon_availability"], "RECON_BACKED")
         self.assertEqual(response.json["discovery_state"], "RECON_BACKED")
+        self.assertEqual(response.json["recon_resolution"]["primary_focus"], "example.test")
+        self.assertEqual(response.json["recon_resolution"]["recon_root"], "example.test")
+        self.assertEqual(response.json["recon_resolution"]["active_requests_started"], 0)
+
+    def test_recon_seed_builder_is_exact_host_bounded_diverse_and_deterministic(self):
+        recon = LargeScopedRecon()
+        scope = replace(self.package.scope, include_hosts=(
+            HostRule("alpha.example.test", ("https",), (443,)),
+            HostRule("beta.example.test", ("https",), (443,))),
+            default_schemes=("https",), default_ports=(443,))
+        package = replace(self.package, scope=scope)
+        hosts = ReconDiscoveryProvider(recon).exact_hosts(package, 7)
+        self.assertEqual([host.hostname for host in hosts],
+                         ["alpha.example.test", "beta.example.test"])
+        builder = ReconBootstrapSeedBuilder(recon)
+        first = builder.build(package, 7, hosts, BootstrapLimits(), 2)
+        second = builder.build(package, 7, hosts, BootstrapLimits(), 2)
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first.seeds), 8)
+        self.assertLess(first.candidates_seen, 500)
+        self.assertGreater(first.candidates_seen, 200)
+        self.assertLess(first.candidates_deduped, first.candidates_in_scope)
+        self.assertEqual({seed.source for seed in first.seeds},
+                         {"RECON_ENDPOINT", "RECON_JS", "RECON_API"})
+        self.assertGreaterEqual(len({seed.family for seed in first.seeds}), 3)
+        self.assertTrue(all("unrelated" not in seed.url for seed in first.seeds))
+        self.assertTrue(all("POST" not in seed.url for seed in first.seeds))
+        self.assertFalse(any(call[0] == "resolve_host" and "unrelated" in call[1]
+                             for call in recon.calls))
+        self.assertLessEqual(sum(seed.source == "RECON_JS" for seed in first.seeds), 2)
+        small = builder.build(package, 7, hosts, BootstrapLimits(max_requests=3, max_js_assets=1), 2)
+        self.assertEqual(small.seeds, ())
+
+    def test_recon_js_refresh_is_bounded_and_recorded(self):
+        class ReconWithJs(BoundedRecon):
+            def list_js_assets(self, _domain_id, host_id, *, limit, cursor=None):
+                return Page((ReconJsAsset(21, host_id,
+                             f"http://127.0.0.1:{self_port}/app.js", "f" * 64,
+                             120, 200, self.provenance),), None)
+
+        self_port = self.server.server_port
+        recon = ReconWithJs(f"http://127.0.0.1:{self_port}/")
+        self.runtime.bootstrap.recon = recon
+        self.runtime.bootstrap.recon_provider.recon = recon
+        run = self.runtime.bootstrap.create("example", identity_policy=BootstrapIdentityPolicy.ANONYMOUS_ONLY)
+        result = self.runtime.bootstrap.run(run.bootstrap_id, "example", refresh=True)
+        self.assertEqual(result.mode, BootstrapMode.RECON_BACKED)
+        self.assertGreaterEqual(result.counts["recon_candidates_seen"], 2)
+        self.assertEqual(result.counts["recon_js_seeds"], 1)
+        self.assertEqual(result.counts["js_assets_acquired"], 1)
+        self.assertEqual(self.server.visits.count("/app.js"), 1)
+        self.assertIn("RECON_JS", result.to_dict()["seed_sources"])
+        acquired = next(item for item in self.runtime.bootstrap_store.list_observations(
+            self.package.target.id, run_id=run.bootstrap_id) if item.code == "JS_ACQUIRED")
+        artifact = self.runtime.domxss_store.get_asset(self.package.target.id, acquired.source_ref)
+        self.assertEqual(artifact.recon_asset_id, 21)
+        self.assertEqual(artifact.state, "RECON_HASH_DRIFT")
+
+    def test_oversized_html_prefix_is_parsed_without_raising_executor_limit(self):
+        self.server.oversized_html = True
+        self.runtime.executor.settings = replace(self.runtime.executor.settings,
+                                                 max_response_bytes=262_144)
+        run = self.runtime.bootstrap.create("example", identity_policy=BootstrapIdentityPolicy.ANONYMOUS_ONLY)
+        result = self.runtime.bootstrap.run(run.bootstrap_id, "example")
+        self.assertGreaterEqual(result.counts["pages_visited"], 1)
+        self.assertGreaterEqual(result.counts["html_pages_truncated"], 1)
+        self.assertGreaterEqual(result.counts["js_assets_discovered"], 1)
+        self.assertIn("HTML_PREFIX_ONLY", result.limitations)
+        self.assertEqual(self.runtime.executor.settings.max_response_bytes, 262_144)
+
+    def test_queued_root_redirect_is_not_fetched_twice(self):
+        class AliasRecon(BoundedRecon):
+            def list_endpoints(self, _domain_id, _host_id, *, limit, cursor=None):
+                return Page((ReconEndpoint(11, 9, "/alias", "GET", 302, "fixture",
+                                           self.provenance),), None)
+
+        recon = AliasRecon(f"http://127.0.0.1:{self.server.server_port}/")
+        self.runtime.bootstrap.recon = recon
+        self.runtime.bootstrap.recon_provider.recon = recon
+        run = self.runtime.bootstrap.create("example", identity_policy=BootstrapIdentityPolicy.ANONYMOUS_ONLY)
+        result = self.runtime.bootstrap.run(run.bootstrap_id, "example")
+        self.assertIn("/alias", self.server.visits)
+        self.assertEqual(self.server.visits.count("/"), 1)
+        self.assertEqual(result.counts["redirect_duplicates"], 1)
+        self.assertEqual(result.counts["redirect_denied_other_policy"], 1)  # /go -> /logout
+        self.assertLessEqual(result.counts["requests_used"], run.limits.max_requests)
+
+    def test_followed_redirect_parses_relative_assets_at_final_url(self):
+        class FreshRecon(BoundedRecon):
+            def list_endpoints(self, _domain_id, _host_id, *, limit, cursor=None):
+                return Page((ReconEndpoint(11, 9, "/fresh", "GET", 302, "fixture",
+                                           self.provenance),), None)
+
+        recon = FreshRecon(f"http://127.0.0.1:{self.server.server_port}/")
+        self.runtime.bootstrap.recon = recon
+        self.runtime.bootstrap.recon_provider.recon = recon
+        run = self.runtime.bootstrap.create("example", identity_policy=BootstrapIdentityPolicy.ANONYMOUS_ONLY)
+        result = self.runtime.bootstrap.run(run.bootstrap_id, "example")
+        self.assertIn("/fresh", self.server.visits)
+        self.assertIn("/nested/page", self.server.visits)
+        self.assertIn("/nested/chunk.js", self.server.visits)
+        self.assertNotIn("/chunk.js", self.server.visits)
+        self.assertGreaterEqual(result.counts["js_assets_acquired"], 2)
+
+    def test_redirect_denial_reasons_preserve_safety(self):
+        root = f"http://127.0.0.1:{self.server.server_port}/"
+        self.assertEqual(_redirect_denial_reason("javascript:alert(1)", self.package),
+                         "UNSUPPORTED_SCHEME")
+        self.assertEqual(_redirect_denial_reason("https://outside.invalid/", self.package),
+                         "OUT_OF_SCOPE")
+        self.assertEqual(_redirect_denial_reason(root + "dashboard?redirectTo=private", self.package),
+                         "UNSAFE_QUERY")
+        self.assertIsNone(_safe_url(root, root + "dashboard?redirectTo=private", self.package))
 
     def test_recon_and_verified_browser_observations_merge(self):
         self.runtime.bootstrap.recon = BoundedRecon(f"http://127.0.0.1:{self.server.server_port}/")

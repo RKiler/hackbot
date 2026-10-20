@@ -33,6 +33,7 @@ from .recon import Page, ReconRepository
 from .response_compare import ResponseComparator
 from .store import EvidenceFactStore
 from .target_package import PackageStatus, TargetPackage
+from .target_recon import ReconDomainResolver, resolve_recon_target
 from .target_policy import PolicyDecision
 from .target_scope import ScopeResult
 from .test_objects import ObjectState, TestObject
@@ -831,7 +832,7 @@ class APISpecialist:
                                   self._safe_endpoint(package, url))
                 elif asset.recon_asset_id and self.recon is not None:
                     try:
-                        recon_target = self.recon.resolve_target(package.primary_domain)
+                        recon_target = resolve_recon_target(package, self.recon)
                         record = self.recon.get_js_asset(recon_target.domain_id, asset.recon_asset_id) \
                             if recon_target else None
                         scoped = bool(record and record.http_status == 200 and
@@ -926,34 +927,44 @@ class APISpecialist:
         if self.recon is None:
             return 0, ("RECON_UNAVAILABLE",)
         try:
-            target = self.recon.resolve_target(package.primary_domain)
+            target = resolve_recon_target(package, self.recon)
         except (ValueError, RuntimeError, OSError):
             return 0, ("RECON_UNAVAILABLE",)
         if target is None:
             return 0, ("RECON_TARGET_MISSING",)
         count = 0
-        for surface_type in ("GRAPHQL", "OPENAPI", "REST", "RPC"):
-            try:
-                page = self.recon.list_api_surfaces(target.domain_id, surface_type,
-                                                    limit=min(limit, 20))
-            except (ValueError, RuntimeError, OSError):
-                continue
-            for surface in page.items:
-                endpoint = self._safe_endpoint(package, surface.location)
-                if not endpoint:
+        try:
+            hosts = ReconDomainResolver(self.recon).select_hosts(package).hosts
+        except (ValueError, RuntimeError, OSError):
+            hosts = ()
+        host_ids: tuple[int | None, ...] = tuple(host.host_id for host in hosts) + (None,)
+        seen: set[int] = set()
+        for host_id in host_ids:
+            for surface_type in ("GRAPHQL", "OPENAPI", "REST", "RPC"):
+                try:
+                    page = self.recon.list_api_surfaces(target.domain_id, surface_type,
+                                                        host_id=host_id, limit=min(limit, 20))
+                except (ValueError, RuntimeError, OSError):
                     continue
-                name = "Surface_" + surface_type
-                self.registry.upsert_operation(
-                    target_id=package.target.id, package_id=package.id, name=name,
-                    kind=APIOperationType.UNKNOWN, endpoint=endpoint, method="UNKNOWN",
-                    version_hash=_hash(str(surface.surface_id), surface_type),
-                    source_refs=("RECON_API_SURFACE:" + str(surface.surface_id),),
-                    feature=self._feature(endpoint, name),
-                    observed_at=surface.provenance.observed_at.isoformat()
-                    if surface.provenance.observed_at else None)
-                count += 1
-                if count >= limit:
-                    return count, ()
+                for surface in page.items:
+                    if surface.surface_id in seen:
+                        continue
+                    endpoint = self._safe_endpoint(package, surface.location)
+                    if not endpoint:
+                        continue
+                    seen.add(surface.surface_id)
+                    name = "Surface_" + surface_type
+                    self.registry.upsert_operation(
+                        target_id=package.target.id, package_id=package.id, name=name,
+                        kind=APIOperationType.UNKNOWN, endpoint=endpoint, method="UNKNOWN",
+                        version_hash=_hash(str(surface.surface_id), surface_type),
+                        source_refs=("RECON_API_SURFACE:" + str(surface.surface_id),),
+                        feature=self._feature(endpoint, name),
+                        observed_at=surface.provenance.observed_at.isoformat()
+                        if surface.provenance.observed_at else None)
+                    count += 1
+                    if count >= limit:
+                        return count, ()
         return count, ()
 
     def profile(self, package: TargetPackage, *, limits: APIAnalysisLimits = APIAnalysisLimits(),

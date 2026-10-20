@@ -316,7 +316,8 @@ class PlanRunStore:
                           for row in step_rows],
                 "timeline": [dict(row) for row in reversed(events)]}
 
-    def list(self, target_id: str, *, limit: int = 20, cursor: str | None = None) -> dict[str, object]:
+    def list(self, target_id: str, *, limit: int = 20, cursor: str | None = None,
+             include_archived: bool = False) -> dict[str, object]:
         if type(limit) is not int or not 1 <= limit <= 50:
             raise ValueError("invalid run page size")
         if cursor is not None and (not cursor.isdecimal() or int(cursor) < 1):
@@ -325,9 +326,31 @@ class PlanRunStore:
         with self.store._connection() as db:
             rows = db.execute(
                 "SELECT rowid AS cursor_id,* FROM plan_runs WHERE target_id=? AND (? IS NULL OR rowid<?) "
+                + ("" if include_archived else "AND NOT EXISTS (SELECT 1 FROM plan_run_events AS e "
+                   "WHERE e.run_id=plan_runs.run_id AND e.event_type='OPERATOR_ARCHIVED') ") +
                 "ORDER BY rowid DESC LIMIT ?", (target_id, marker, marker, limit + 1)).fetchall()
         return {"items": [self._run(row).to_dict() for row in rows[:limit]],
                 "next_cursor": str(rows[limit - 1]["cursor_id"]) if len(rows) > limit else None}
+
+    def archive(self, run_id: str, target_id: str) -> bool:
+        if not _RUN_ID.fullmatch(run_id):
+            raise ValueError("invalid run ID")
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM plan_runs WHERE run_id=? AND target_id=?",
+                             (run_id, target_id)).fetchone()
+            if row is None:
+                raise LookupError("run not found")
+            if row["status"] not in _TERMINAL:
+                raise ValueError("run is not terminal")
+            if db.execute("""SELECT 1 FROM plan_run_events WHERE run_id=?
+                AND event_type='OPERATOR_ARCHIVED'""", (run_id,)).fetchone():
+                return False
+            db.execute("""INSERT INTO plan_run_events
+                (run_id,step_id,event_type,reason_code,occurred_at)
+                VALUES (?,NULL,'OPERATOR_ARCHIVED','OPERATOR_VIEW_ARCHIVE',?)""",
+                (run_id, datetime.now(timezone.utc).isoformat()))
+        return True
 
     def list_for_plan(self, plan_id: str, target_id: str, *, limit: int = 20,
                       cursor: str | None = None) -> dict[str, object]:

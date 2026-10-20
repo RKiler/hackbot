@@ -23,6 +23,7 @@ from .profile import TargetProfile
 from .recon import ReconRepository
 from .skill_plans import AuthorizationPlanBinding, SkillContextBuilder, SkillPlanner, SkillRouter
 from .target_package import TargetPackage
+from .target_recon import ReconDomainResolver, resolve_recon_target
 from .target_scope import ScopeResult
 from .traffic import ExchangeState, TrafficStore
 from .test_objects import ObjectRegistry, ObjectState
@@ -213,7 +214,7 @@ class ExposureSpecialist:
         else:
             if asset.source != "CONTROLLED_HTTP" or self.recon is None or asset.recon_asset_id is None:
                 raise ValueError("Externally current JavaScript retrieval is required")
-            target = self.recon.resolve_target(package.target.root_domain)
+            target = resolve_recon_target(package, self.recon)
             if target is None:
                 raise ValueError("Recon target is unavailable")
             current = self.recon.get_js_asset(target.domain_id, asset.recon_asset_id)
@@ -245,7 +246,7 @@ class ExposureSpecialist:
             return True
         if asset.source != "CONTROLLED_HTTP" or self.recon is None or asset.recon_asset_id is None:
             return False
-        target = self.recon.resolve_target(package.target.root_domain)
+        target = resolve_recon_target(package, self.recon)
         if target is None:
             return False
         current = self.recon.get_js_asset(target.domain_id, asset.recon_asset_id)
@@ -413,7 +414,7 @@ class ExposureSpecialist:
         """Bounded metadata discovery; does not fetch, fuzz, or test a route."""
         if self.recon is None:
             return ExposureAnalysisResult((), 0, 0, False, False)
-        target = self.recon.resolve_target(package.target.root_domain)
+        target = resolve_recon_target(package, self.recon)
         if target is None:
             return ExposureAnalysisResult((), 0, 0, False, False)
         recent_ids: set[int] = set()
@@ -426,7 +427,7 @@ class ExposureSpecialist:
             recent_ids.update(item.entity_id for item in events
                               if item.entity_id and item.entity_type.lower() in {"endpoint", "endpoints"})
         ids: list[str] = []
-        hosts = self.recon.list_hosts(target.domain_id, limit=self.MAX_HOSTS).items
+        hosts = ReconDomainResolver(self.recon).select_hosts(package).hosts[:self.MAX_HOSTS]
         for host in hosts:
             if package.scope.evaluate_url(host.url).result is not ScopeResult.IN_SCOPE:
                 continue

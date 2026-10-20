@@ -43,6 +43,7 @@ from .campaign_models import (CampaignLimits, CampaignPreset, CampaignStatus,
 from .delta_coordinator import DeltaCoordinator
 from .delta_models import ContinuousSettings, DeltaCadence, DeltaStatus
 from .delta_scheduler import DeltaScheduler
+from .domain import validate_entity_id
 from .config import (AppConfig, ConfigError, ExecutorSettings, NotificationSettings,
                      ObjectSettings, ResourceSettings, load_config)
 from .domxss import DOMXSSSpecialist
@@ -89,7 +90,7 @@ from .research_sources import BraveWebResearchProvider, FindingKnowledgeProvider
 from .retention import ArtifactGarbageCollector, OrphanPolicy
 from .reports import ReportGenerator, ReportStore
 from .resources import ResourceBudgetManager, ResourceError, ResourceSnapshot, WorkKind
-from .recon_postgres import PostgresReconRepository
+from .recon_postgres import PostgresReconRepository, ReconQueryError
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
 from .skill_plans import (DOMPlanBinding, MessagePlanBinding, PrerequisiteChecker, SkillContextBuilder,
@@ -110,6 +111,7 @@ _AUDIT_EVENTS = frozenset({
     "target_registered", "identities_imported", "auth_prepared", "browser_created",
     "browser_start_requested", "browser_started", "manual_login_completed",
     "identity_verification_finished", "browser_stopped", "browser_reconciled",
+    "browser_deleted", "account_removed", "target_deleted",
     "validation_started", "validation_confirmed", "validation_rejected",
     "validation_review_required", "validation_insufficient", "validation_duplicate",
     "finding_created",
@@ -1112,6 +1114,61 @@ class BugHunterRuntime:
         result["vnc_url"] = (self.config.browser.vnc_url if result["vnc_available"] else None)
         return result
 
+    def target_cleanup_dependencies(self, target_id: str) -> dict[str, int]:
+        with self.store._connection() as db:
+            checks = {
+                "browser_sessions": """SELECT count(*) FROM browser_sessions AS s WHERE s.target_id=?
+                    AND NOT EXISTS (SELECT 1 FROM browser_session_events AS e
+                        WHERE e.session_id=s.session_id AND e.event_type='browser_deleted')""",
+                "active_capture_bindings": """SELECT count(*) FROM burp_listener_bindings
+                    WHERE target_id=? AND state='ACTIVE'""",
+                "active_campaigns": """SELECT count(*) FROM campaigns WHERE target_id=? AND status NOT IN
+                    ('COMPLETED','BLOCKED','FAILED','CANCELLED','BUDGET_EXHAUSTED',
+                     'TIME_EXHAUSTED','CLEANUP_REQUIRED')""",
+                "active_planner_runs": """SELECT count(*) FROM planner_runs WHERE target_id=? AND status NOT IN
+                    ('COMPLETED','BLOCKED','FAILED','CANCELLED','BUDGET_EXHAUSTED')""",
+                "active_plan_runs": """SELECT count(*) FROM plan_runs WHERE target_id=? AND status NOT IN
+                    ('BLOCKED','COMPLETED','REJECTED','FAILED','BUDGET_EXHAUSTED','CANCELLED')""",
+                "active_bootstrap_runs": """SELECT count(*) FROM bootstrap_runs WHERE target_id=? AND status IN
+                    ('CREATED','READY','RUNNING','WAITING_LOGIN')""",
+                "active_behaviour_runs": """SELECT count(*) FROM behaviour_runs WHERE target_id=? AND status IN
+                    ('CREATED','READY','RUNNING','WAITING_LOGIN')""",
+                "pending_approvals": """SELECT count(*) FROM policy_approvals WHERE target_id=? AND status='PENDING'""",
+                "cleanup_objects": """SELECT count(*) FROM test_objects WHERE target_id=?
+                    AND cleanup_required=1 AND lifecycle!='CLEANED'""",
+                "continuous_enabled": """SELECT count(*) FROM continuous_targets WHERE target_id=?
+                    AND enabled=1""",
+                "active_delta_watches": """SELECT count(*) FROM delta_watch_runs WHERE target_id=?
+                    AND status='RUNNING'""",
+            }
+            return {key: db.execute(sql, (target_id,)).fetchone()[0] for key, sql in checks.items()}
+
+    def delete_browser_session(self, package: TargetPackage, session: BrowserSession) -> None:
+        if session.target_id != package.target.id:
+            raise LookupError("session not found")
+        dependencies = self.target_cleanup_dependencies(package.target.id)
+        if any(value for key, value in dependencies.items()
+               if key.startswith("active_") and key != "active_capture_bindings"):
+            raise TargetSetupError("active_target_work")
+        if session.status is not BrowserStatus.STOPPED:
+            if not self.browser.driver.is_running(session.id) and session.status in {
+                BrowserStatus.STARTING, BrowserStatus.RUNNING, BrowserStatus.WAITING_LOGIN,
+                BrowserStatus.VERIFYING_IDENTITY, BrowserStatus.NEEDS_MANUAL_REVIEW,
+                BrowserStatus.VALID,
+            }:
+                self.browser.reconcile_stale(session.id)
+            self.browser.stop(session.id)
+        if self.burp.binding_for_session(session.id) is not None:
+            self.burp.release(session.id)
+        self.browser.retire(session.id)
+        with self.store._connection() as db:
+            active_bindings = db.execute(
+                "SELECT count(*) FROM burp_listener_bindings WHERE state='ACTIVE'").fetchone()[0]
+        if active_bindings == 0 and self._burp_bridge_target == package.target.id:
+            self.close_burp_bridge()
+        self.audit("browser_deleted", target_id=package.target.id,
+                   identity_id=session.identity_id, session_id=session.id)
+
     def verification_rule(self, package: TargetPackage, identity_id: str) -> IdentityVerificationRule | None:
         """Optional private, server-side rule; never accept expected identity from the client."""
         identity = self.registry.get_identity(package.target.id, identity_id)
@@ -1257,7 +1314,7 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.errorhandler(TargetSetupError)
     def target_setup_error(exc):
         return jsonify(error=exc.code, field=exc.field), 409 if exc.code in {
-            "duplicate_target", "registered_account_immutable"} else 400
+            "duplicate_target", "registered_account_immutable", "active_target_work"} else 400
 
     @app.errorhandler(StoreNotInitialized)
     @app.errorhandler(StoreSchemaError)
@@ -1507,6 +1564,17 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         return jsonify({"items": [service.target_summary(item) for item in result.items],
                         "next_cursor": result.next_cursor})
 
+    @app.get("/v1/target-tombstones")
+    def target_tombstones():
+        with service.store._connection() as db:
+            rows = db.execute("""SELECT r.package_id,r.target_id,max(e.occurred_at) AS deleted_at
+                FROM service_events AS e JOIN registry_targets AS r ON r.target_id=e.target_id
+                WHERE e.event_type='target_deleted' GROUP BY r.package_id,r.target_id
+                ORDER BY deleted_at DESC LIMIT 50""").fetchall()
+        return jsonify({"items": [{"package_id": row["package_id"], "target_id": row["target_id"],
+                                    "label": row["package_id"] + " (deleted)",
+                                    "deleted_at": row["deleted_at"]} for row in rows]})
+
     @app.get("/v1/targets/setup-options")
     def target_setup_options():
         return jsonify({"source_kinds": [item.value for item in ScopeSourceKind],
@@ -1524,6 +1592,8 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         data = _body(frozenset({"name", "id", "primary_domain", "scope", "source",
                                 "rules", "autonomy", "rate", "confirmed"}))
         with service._target_operator_lock:
+            if service.registry.target_id_for_package(data.get("id", "")) is not None:
+                raise TargetSetupError("duplicate_target", "id")
             package = service.target_operator.create(data)
         return jsonify({"target": service.target_summary(package),
                         "network_requests_sent": 0}), 201
@@ -1531,6 +1601,83 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     @app.get("/v1/targets/<package_id>")
     def target(package_id: str):
         return jsonify(service.target_summary(service.package(package_id)))
+
+    @app.get("/v1/targets/<package_id>/delete-preview")
+    def target_delete_preview(package_id: str):
+        package = service.package(package_id)
+        dependencies = service.target_cleanup_dependencies(package.target.id)
+        with service.store._connection() as db:
+            registered = db.execute("SELECT count(*) FROM registry_identities WHERE target_id=?",
+                                    (package.target.id,)).fetchone()[0]
+            captures = db.execute("SELECT count(*) FROM burp_listener_bindings WHERE target_id=?",
+                                  (package.target.id,)).fetchone()[0]
+        return jsonify(package_id=package.id, dependencies=dependencies,
+                       configured_accounts=len(package.accounts), registered_identities=registered,
+                       historical_capture_bindings=captures,
+                       can_delete=not any(dependencies.values()),
+                       retained=["registry attribution", "Evidence", "TrafficStore", "validations",
+                                 "findings", "reports", "audit events", "recon data"])
+
+    @app.post("/v1/targets/<package_id>/clean-runtime")
+    def target_clean_runtime(package_id: str):
+        _body(frozenset())
+        with service._target_operator_lock:
+            package = service.package(package_id)
+            dependencies = service.target_cleanup_dependencies(package.target.id)
+            if any(value for key, value in dependencies.items()
+                   if (key.startswith("active_") and key != "active_capture_bindings")
+                   or key == "continuous_enabled"):
+                return jsonify(error="active_target_work", dependencies=dependencies), 409
+            page = service.browser.list_sessions_for_target(package.target.id, limit=20)
+            if page.next_cursor:
+                return jsonify(error="too_many_sessions", reason_code="DELETE_SESSIONS_IN_BATCHES"), 409
+            if dependencies["active_capture_bindings"] > 20:
+                return jsonify(error="too_many_bindings", reason_code="MANUAL_REVIEW_REQUIRED"), 409
+            removed = []
+            for session in page.items:
+                service.delete_browser_session(package, session)
+                removed.append(session.id)
+            with service.store._connection() as db:
+                bindings = db.execute("""SELECT browser_session_id FROM burp_listener_bindings
+                    WHERE target_id=? AND state='ACTIVE' LIMIT 21""", (package.target.id,)).fetchall()
+            released = []
+            for binding in bindings:
+                service.burp.release(binding["browser_session_id"])
+                released.append(binding["browser_session_id"])
+            if released and service._burp_bridge_target == package.target.id:
+                with service.store._connection() as db:
+                    active = db.execute("""SELECT count(*) FROM burp_listener_bindings
+                        WHERE state='ACTIVE'""").fetchone()[0]
+                if active == 0:
+                    service.close_burp_bridge()
+        return jsonify(removed_sessions=removed, released_bindings=released,
+                       evidence_preserved=True,
+                       network_requests_sent=0,
+                       dependencies=service.target_cleanup_dependencies(package.target.id))
+
+    @app.delete("/v1/targets/<package_id>")
+    def target_delete(package_id: str):
+        data = _body(frozenset({"confirm_package_id"}))
+        if data.get("confirm_package_id") != package_id:
+            raise TargetSetupError("confirmation_required", "confirm_package_id")
+        with service._target_operator_lock:
+            package = service.package(package_id)
+            dependencies = service.target_cleanup_dependencies(package.target.id)
+            if any(dependencies.values()):
+                return jsonify(error="target_has_dependencies", dependencies=dependencies), 409
+            with service.store._connection() as db:
+                identities = db.execute("""SELECT identity_id,status FROM registry_identities
+                    WHERE target_id=? LIMIT 101""", (package.target.id,)).fetchall()
+            if len(identities) > 100:
+                return jsonify(error="too_many_identities", reason_code="MANUAL_REVIEW_REQUIRED"), 409
+            for identity in identities:
+                if identity["status"] == "ACTIVE":
+                    service.registry.disable_identity(identity["identity_id"])
+            service.registry.register_target(package)
+            service.target_operator.delete(package_id)
+            service.audit("target_deleted", target_id=package.target.id)
+        return jsonify(deleted=True, package_id=package_id,
+                       historical_records_preserved=True, network_requests_sent=0)
 
     def target_account_view(package: TargetPackage) -> dict[str, object]:
         rows = []
@@ -1573,14 +1720,52 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                                                             registered_aliases=registered)
         return jsonify({**target_account_view(updated), "network_requests_sent": 0})
 
+    @app.delete("/v1/targets/<package_id>/accounts/<alias>")
+    def target_account_remove(package_id: str, alias: str):
+        with service._target_operator_lock:
+            package = service.package(package_id)
+            account = next((item for item in package.accounts if item.alias == alias), None)
+            if account is None:
+                raise LookupError("account not found")
+            identity = service.registry.get_identity(package.target.id, alias)
+            if identity is not None:
+                with service.store._connection() as connection:
+                    sessions = connection.execute("""SELECT count(*) FROM browser_sessions AS s
+                        WHERE s.target_id=? AND s.identity_id=? AND NOT EXISTS (
+                            SELECT 1 FROM browser_session_events AS e WHERE e.session_id=s.session_id
+                            AND e.event_type='browser_deleted')""",
+                        (package.target.id, identity.id)).fetchone()[0]
+                if sessions:
+                    return jsonify(error="account_has_sessions", reason_code="DELETE_SESSIONS_FIRST",
+                                   session_count=sessions), 409
+            rows = [{"alias": item.alias, "tenant": item.tenant_hint or "",
+                     "role": item.role_hint or ""} for item in package.accounts if item.alias != alias]
+            registered = {item.alias for item in package.accounts if item.alias != alias
+                          and service.registry.get_identity(package.target.id, item.alias) is not None}
+            if identity is not None:
+                service.registry.disable_identity(identity.id)
+            updated = service.target_operator.save_accounts(package_id, {"accounts": rows},
+                                                            registered_aliases=registered)
+            service.audit("account_removed", target_id=package.target.id,
+                          identity_id=identity.id if identity is not None else None)
+        return jsonify({**target_account_view(updated), "removed": alias,
+                        "historical_identity_preserved": True, "network_requests_sent": 0})
+
     @app.get("/v1/targets/<package_id>/bootstrap")
     def bootstrap_status(package_id: str):
         package = service.package(package_id)
         _, recon_status = service.bootstrap.recon_provider.lookup(package)
+        recon_resolution = None
+        if recon_status == "RECON_BACKED":
+            try:
+                recon_resolution = service.bootstrap.recon_provider.select_hosts(package).to_dict()
+            except (ReconQueryError, ValueError):
+                recon_status = "RECON_UNAVAILABLE"
         state = service.bootstrap_store.discovery_state(package.target.id)
         runs = service.bootstrap_store.list_runs(package.target.id, limit=10)
         return jsonify({"target_id": package.target.id,
                         "recon_availability": recon_status,
+                        "recon_resolution": recon_resolution,
                         "transport": service.bootstrap_readiness(package),
                         "discovery_state": state["state"] if state else (
                             "RECON_BACKED" if recon_status == "RECON_BACKED" else "COLD_START"),
@@ -2431,8 +2616,12 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         page = PageRequest.parse(maximum=50)
         package_id = request.args.get("target")
         target_id = service.package(package_id).target.id if package_id else None
+        archived = request.args.get("archived", "0")
+        if archived not in {"0", "1"}:
+            raise ValueError("invalid archive filter")
         campaigns = service.campaign.store.list(target_id=target_id,
-                                                limit=page.limit, before=page.cursor)
+                                                limit=page.limit, before=page.cursor,
+                                                include_archived=archived == "1")
         counts = service.campaign.store.finding_counts(tuple(item.id for item in campaigns))
         return jsonify({"items": [{**item.to_dict(), "finding_count": counts.get(item.id, 0)}
                                   for item in campaigns]})
@@ -2583,6 +2772,17 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         with service._campaign_lock:
             result = service.campaign.cancel(package, campaign_id)
         return jsonify(result.to_dict())
+
+    @app.post("/v1/campaigns/<campaign_id>/archive")
+    def campaign_archive(campaign_id: str):
+        _body(frozenset())
+        package = campaign_package(campaign_id)
+        try:
+            archived = service.campaign.store.archive(campaign_id, package.target.id)
+        except ValueError:
+            return jsonify(error="campaign_not_terminal", reason_code="CANCEL_OR_FINISH_FIRST"), 409
+        return jsonify(archived=archived, campaign_id=campaign_id,
+                       history_preserved=True)
 
     @app.get("/v1/planner/<package_id>/runs")
     def planner_runs(package_id: str):
@@ -2966,9 +3166,24 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def hypotheses():
         package = service.package(request.args.get("target", ""))
         page = PageRequest.parse()
+        archived = request.args.get("archived", "0")
+        if archived not in {"0", "1"}:
+            raise ValueError("invalid archive filter")
         return jsonify(service.hypotheses.list(package.target.id, limit=page.limit,
                       cursor=page.cursor, status=request.args.get("status"),
-                      category=request.args.get("category")))
+                      category=request.args.get("category"), include_archived=archived == "1"))
+
+    @app.post("/v1/hypotheses/<hypothesis_id>/archive")
+    def hypothesis_archive(hypothesis_id: str):
+        data = _body(frozenset({"target"}))
+        package = service.package(data.get("target", ""))
+        validate_entity_id(hypothesis_id, "HYP")
+        try:
+            archived = service.hypotheses.archive(package.target.id, hypothesis_id)
+        except ValueError:
+            return jsonify(error="active_hypothesis_work", reason_code="FINISH_RUN_FIRST"), 409
+        return jsonify(archived=archived, hypothesis_id=hypothesis_id,
+                       evidence_preserved=True)
 
     @app.get("/v1/hypotheses/<hypothesis_id>")
     def hypothesis_detail(hypothesis_id: str):
@@ -3099,8 +3314,23 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
     def list_plan_runs():
         package = service.package(request.args.get("target", ""))
         page = PageRequest.parse()
+        archived = request.args.get("archived", "0")
+        if archived not in {"0", "1"}:
+            raise ValueError("invalid archive filter")
         return jsonify(service.run_store.list(package.target.id, limit=page.limit,
-                                             cursor=page.cursor))
+                                             cursor=page.cursor,
+                                             include_archived=archived == "1"))
+
+    @app.post("/v1/runs/<run_id>/archive")
+    def archive_plan_run(run_id: str):
+        body = _body(frozenset({"target"}))
+        package = service.package(body.get("target", ""))
+        validate_entity_id(run_id, "RUN")
+        try:
+            archived = service.run_store.archive(run_id, package.target.id)
+        except ValueError:
+            return jsonify(error="run_not_terminal", reason_code="FINISH_OR_CANCEL_FIRST"), 409
+        return jsonify(archived=archived, run_id=run_id, evidence_preserved=True)
 
     @app.get("/v1/runs/<run_id>")
     def show_plan_run(run_id: str):
@@ -3447,14 +3677,15 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             ).fetchone()[0]
         service.resources.admit(WorkKind.BROWSER, active=active_sessions)
         capture_provider = body.get("capture_provider", "DIRECT")
+        if capture_provider not in {"BURP", "DIRECT"}:
+            raise ValueError("invalid capture provider")
+        service.registry.register_target(package)
         if capture_provider == "BURP":
             service.ensure_burp_bridge(package)
             session, _ = service.burp.provision_session(
                 package, None if anonymous else identity_id)
-        elif capture_provider == "DIRECT":
-            session = service.browser.create(package.target.id, None if anonymous else identity_id)
         else:
-            raise ValueError("invalid capture provider")
+            session = service.browser.create(package.target.id, None if anonymous else identity_id)
         service.audit("browser_created", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(session)), 201
@@ -3527,6 +3758,14 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         _body(frozenset())
         package, session = scoped_session(session_id)
         updated = service.browser.stop(session.id)
+        if service.burp.binding_for_session(session.id) is not None:
+            service.burp.release(session.id)
+            with service.store._connection() as connection:
+                active_bindings = connection.execute(
+                    "SELECT count(*) FROM burp_listener_bindings WHERE state='ACTIVE'"
+                ).fetchone()[0]
+            if active_bindings == 0 and service._burp_bridge_target == package.target.id:
+                service.close_burp_bridge()
         service.audit("browser_stopped", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(updated))
@@ -3539,6 +3778,13 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         service.audit("browser_reconciled", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(updated))
+
+    @app.delete("/v1/browser/sessions/<session_id>")
+    def delete_session(session_id: str):
+        package, session = scoped_session(session_id)
+        service.delete_browser_session(package, session)
+        return jsonify(deleted=True, session_id=session.id,
+                       evidence_preserved=True, capacity_released=True)
 
     @app.get("/v1/traffic")
     def traffic():

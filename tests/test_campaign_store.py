@@ -96,6 +96,22 @@ class CampaignStoreTests(unittest.TestCase):
         with self.assertRaises(LookupError):
             self.ledger.suppress("other-target", campaign.id, root, state, "CONFIRMED")
 
+    def test_terminal_archive_hides_default_list_without_deleting_history(self):
+        campaign = self.start()
+        with self.assertRaises(ValueError):
+            self.ledger.archive(campaign.id, campaign.target_id)
+        self.ledger.transition(campaign.target_id, campaign.id, CampaignStatus.CANCELLED,
+                               "OPERATOR_CANCEL", package=self.package,
+                               policy_hash=self.policy_hash)
+        self.assertTrue(self.ledger.archive(campaign.id, campaign.target_id))
+        self.assertFalse(self.ledger.archive(campaign.id, campaign.target_id))
+        self.assertNotIn(campaign.id, [item.id for item in self.ledger.list(target_id=campaign.target_id)])
+        self.assertIn(campaign.id, [item.id for item in self.ledger.list(
+            target_id=campaign.target_id, include_archived=True)])
+        self.assertIsNotNone(self.ledger.get(campaign.target_id, campaign.id))
+        self.assertTrue(any(item["event_type"] == "operator_archived" for item in
+                            self.ledger.events(campaign.target_id, campaign.id)))
+
     def test_cycle_cap_and_policy_change_fail_closed(self):
         campaign = self.start(CampaignLimits(1, 600, 20, 8, 1, 2000, 1, 4))
         with self.assertRaises(ValueError):

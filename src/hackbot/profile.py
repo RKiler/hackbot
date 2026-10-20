@@ -13,6 +13,7 @@ from .evidence import FactStatus, Sensitivity
 from .identity import IdentityStatus
 from .recon import ReconRepository, ReconHost
 from .target_package import TargetPackage
+from .target_recon import ReconDomainResolver
 from .target_scope import ScopeResult
 from .traffic import TrafficStore
 from .identity_registry import IdentityRegistry
@@ -414,7 +415,8 @@ class AttackSurfaceProfiler:
         if self.recon is None:
             gaps.add("RECON_NOT_CONFIGURED")
             return None
-        target = self.recon.resolve_target(package.primary_domain)
+        resolver = ReconDomainResolver(self.recon)
+        target = resolver.resolve(package).target
         if target is None:
             gaps.add("RECON_ROOT_NOT_FOUND")
             return None
@@ -458,11 +460,11 @@ class AttackSurfaceProfiler:
             host = self.recon.resolve_host(domain_id, origin)
             if host and host.host_id not in known_hosts and len(hosts) < self.limits.hosts:
                 hosts.append(host); known_hosts.add(host.host_id)
-        page = self.recon.list_hosts(domain_id, limit=self.limits.hosts)
-        if page.next_cursor:
+        selection = resolver.select_hosts(package)
+        if selection.truncated or selection.live_matches > selection.candidates_sampled:
             coverage["sampled_recon"] = True
             gaps.add("HOSTS_SAMPLED")
-        for host in page.items:
+        for host in selection.hosts:
             if host.host_id not in known_hosts and len(hosts) < self.limits.hosts:
                 hosts.append(host); known_hosts.add(host.host_id)
         analyses = 0

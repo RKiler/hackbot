@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import secrets
+import shutil
+import stat
 from tempfile import TemporaryDirectory
 
 import yaml
@@ -199,6 +201,30 @@ class TargetPackageOperator:
         if package is None:
             raise LookupError("target package not found")
         return package.accounts
+
+    def delete(self, package_id: str) -> None:
+        """Remove only a validated file-backed package; registries remain historical."""
+        try:
+            slug = validate_package_id(package_id)
+        except ValueError:
+            raise TargetSetupError("invalid_field", "id") from None
+        root = self.repository.root
+        path = root / slug
+        if (root.is_symlink() or not root.is_dir() or path.is_symlink()
+                or not path.is_dir()):
+            raise TargetSetupError("unsafe_target_path")
+        if self.repository.get_target_package(slug) is None:
+            raise LookupError("target package not found")
+        entries = list(path.iterdir())
+        if len(entries) > 32 or any(not stat.S_ISREG(item.lstat().st_mode) for item in entries):
+            raise TargetSetupError("unsafe_target_path")
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise TargetSetupError("unsafe_target_path")
+        hidden = root / (".deleted-target-" + secrets.token_hex(16))
+        os.replace(path, hidden)
+        _sync_dir(root)
+        shutil.rmtree(hidden)
+        _sync_dir(root)
 
     def save_accounts(self, package_id: str, value: object, *, registered_aliases: set[str]) -> TargetPackage:
         package = self.repository.get_target_package(package_id)

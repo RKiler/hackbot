@@ -20,6 +20,7 @@ from .recon_postgres import ReconQueryError
 from .research import ResearchStore
 from .test_objects import ObjectRegistry, ObjectState
 from .target_package import TargetPackage
+from .target_recon import resolve_recon_target
 from .traffic import TrafficStore
 from .validation_store import ValidationStore
 
@@ -132,7 +133,7 @@ class PlannerContextBuilder:
         latest_snapshot_id = None
         if self.recon is not None:
             try:
-                recon_target = self.recon.resolve_target(package.primary_domain)
+                recon_target = resolve_recon_target(package, self.recon)
                 if recon_target is not None:
                     recon_domain_id = recon_target.domain_id
                     snapshots = self.recon.list_scan_snapshots(recon_target.domain_id, limit=2)

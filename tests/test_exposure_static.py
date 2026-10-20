@@ -18,6 +18,7 @@ from hackbot.exposure_static import ExposureStaticAnalyzer, MAX_MAP_SCAN_BYTES
 from hackbot.exposure_store import ExposureStore
 from hackbot.identity import IdentityStatus
 from hackbot.identity_registry import IdentityRegistry
+from hackbot.recon import Page, Provenance, ReconHost
 from hackbot.secrets import RoutedSecretProvider
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
@@ -165,15 +166,25 @@ class ExposureStaticTests(unittest.TestCase):
 
         class LocalRecon:
             def resolve_target(self, domain):
-                return SimpleNamespace(domain_id=7)
+                return SimpleNamespace(domain_id=7, root_domain="example.test")
 
             def list_scan_snapshots(self, domain_id, *, limit):
                 return SimpleNamespace(items=())
 
             def list_hosts(self, domain_id, *, limit):
                 return SimpleNamespace(items=(
-                    SimpleNamespace(host_id=4, url="https://app.example.test/"),
-                    SimpleNamespace(host_id=5, url="https://other.invalid/")))
+                    ReconHost(4, 7, "app.example.test", "https://app.example.test/", 200,
+                              Provenance("live_hosts", 4, NOW, "fixture")),
+                    ReconHost(5, 7, "other.invalid", "https://other.invalid/", 200,
+                              Provenance("live_hosts", 5, NOW, "fixture"))))
+
+            def resolve_host(self, domain_id, exact_url):
+                return next((item for item in self.list_hosts(domain_id, limit=2).items
+                             if item.url.rstrip("/") == exact_url.rstrip("/")), None)
+
+            def list_wildcard_hosts(self, domain_id, suffix, *, limit, cursor=None):
+                return Page(tuple(item for item in self.list_hosts(domain_id, limit=2).items
+                                  if item.hostname.endswith("." + suffix)), None)
 
             def list_endpoints(self, domain_id, host_id, *, limit):
                 calls.append(host_id)

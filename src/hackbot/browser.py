@@ -338,7 +338,18 @@ class BrowserSessionManager:
     def get(self, session_id: str) -> BrowserSession | None:
         validate_entity_id(session_id, "BSESSION")
         with self.registry.store._connection() as connection:
-            row = connection.execute("SELECT * FROM browser_sessions WHERE session_id=?", (session_id,)).fetchone()
+            row = connection.execute("""SELECT * FROM browser_sessions AS s WHERE session_id=?
+                AND NOT EXISTS (SELECT 1 FROM browser_session_events AS e
+                    WHERE e.session_id=s.session_id AND e.event_type='browser_deleted')""",
+                (session_id,)).fetchone()
+        return _row(row) if row else None
+
+    def get_for_retention(self, session_id: str) -> BrowserSession | None:
+        """Include operator-retired sessions for reviewed profile retention."""
+        validate_entity_id(session_id, "BSESSION")
+        with self.registry.store._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM browser_sessions WHERE session_id=?", (session_id,)).fetchone()
         return _row(row) if row else None
 
     def _required(self, session_id: str) -> BrowserSession:
@@ -628,6 +639,27 @@ class BrowserSessionManager:
             connection.execute("DELETE FROM browser_session_events WHERE session_id=?", (session_id,))
             connection.execute("DELETE FROM browser_sessions WHERE session_id=?", (session_id,))
 
+    def retire(self, session_id: str) -> None:
+        """Teardown an operator session while retaining its referenced history."""
+        with self.profile_lifecycle_lock:
+            session = self._required(session_id)
+            if session.status is not BrowserStatus.STOPPED:
+                if not self.driver.is_running(session_id) and session.status in {
+                    BrowserStatus.STARTING, BrowserStatus.RUNNING, BrowserStatus.WAITING_LOGIN,
+                    BrowserStatus.VERIFYING_IDENTITY, BrowserStatus.NEEDS_MANUAL_REVIEW,
+                    BrowserStatus.VALID,
+                }:
+                    self.reconcile_stale(session_id)
+                self.stop(session_id)
+            elif self.driver.is_running(session_id):
+                self.driver.stop(session_id)
+            with self.registry.store._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute("""SELECT 1 FROM browser_session_events
+                    WHERE session_id=? AND event_type='browser_deleted'""", (session_id,)).fetchone():
+                    raise BrowserError("Browser session already deleted")
+                self._event(connection, session_id, "browser_deleted", datetime.now(timezone.utc))
+
     def reconcile_stale(self, session_id: str) -> BrowserSession:
         """Fail closed after an unobserved browser exit or manager process restart."""
         session = self._required(session_id)
@@ -657,12 +689,16 @@ class BrowserSessionManager:
                     WHERE target_id=? AND session_id=?""", (target_id, cursor)).fetchone()
                 if marker is None:
                     raise BrowserError("Invalid browser cursor")
-                rows = connection.execute("""SELECT * FROM browser_sessions WHERE target_id=?
+                rows = connection.execute("""SELECT * FROM browser_sessions AS s WHERE target_id=?
+                    AND NOT EXISTS (SELECT 1 FROM browser_session_events AS e
+                        WHERE e.session_id=s.session_id AND e.event_type='browser_deleted')
                     AND (created_at < ? OR (created_at = ? AND session_id < ?))
                     ORDER BY created_at DESC,session_id DESC LIMIT ?""",
                     (target_id, marker["created_at"], marker["created_at"], cursor, limit + 1)).fetchall()
             else:
-                rows = connection.execute("""SELECT * FROM browser_sessions WHERE target_id=?
+                rows = connection.execute("""SELECT * FROM browser_sessions AS s WHERE target_id=?
+                    AND NOT EXISTS (SELECT 1 FROM browser_session_events AS e
+                        WHERE e.session_id=s.session_id AND e.event_type='browser_deleted')
                     ORDER BY created_at DESC,session_id DESC LIMIT ?""", (target_id, limit + 1)).fetchall()
         return Page(tuple(_row(row) for row in rows[:limit]), rows[limit - 1]["session_id"] if len(rows) > limit else None)
 
@@ -670,7 +706,9 @@ class BrowserSessionManager:
         validate_entity_id(target_id, "TARGET")
         validate_entity_id(identity_id, "IDENTITY")
         with self.registry.store._connection() as connection:
-            row = connection.execute("""SELECT * FROM browser_sessions WHERE target_id=? AND identity_id=?
+            row = connection.execute("""SELECT * FROM browser_sessions AS s WHERE target_id=? AND identity_id=?
+                AND NOT EXISTS (SELECT 1 FROM browser_session_events AS e
+                    WHERE e.session_id=s.session_id AND e.event_type='browser_deleted')
                 ORDER BY created_at DESC,session_id DESC LIMIT 1""", (target_id, identity_id)).fetchone()
         return _row(row) if row else None
 

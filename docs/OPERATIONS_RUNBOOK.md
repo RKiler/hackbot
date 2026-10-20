@@ -4,6 +4,11 @@ BugHunter is a private, standalone service. Do not use these commands on the
 production recon PostgreSQL database, and do not infer target-testing authority
 from a successful health check. Run commands from `/root/bughunter-agent`.
 
+For dashboard session, account, target, and archive controls, see
+[`OPERATOR_CLEANUP.md`](OPERATOR_CLEANUP.md). These controls retain immutable
+Evidence/TrafficStore and do not clean target-side objects; use ObjectFactory
+for that separate workflow.
+
 ## Routine checks
 
 1. Check `systemctl status bughunter-agent.service bughunter-burp.service`.

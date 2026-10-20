@@ -19,7 +19,9 @@ import uuid
 from unittest.mock import Mock, patch
 
 from hackbot.browser import IdentityObservation
+from hackbot.auth import AuthMechanism
 from hackbot.api_registry import APICandidate, APIOperationType
+from hackbot.campaign_models import CampaignLimits
 from hackbot.config import (BrowserSettings, BurpSettings, SecretBindingConfig,
                             SecretSettings, TargetSettings, ResourceSettings, load_config)
 from hackbot.burp_storage import BurpStorageStatus
@@ -29,6 +31,7 @@ from hackbot.postmessage_static import PostMessageStaticAnalyzer
 from hackbot.resources import ResourceError
 from hackbot.research import GapType, KnowledgeGap, ResearchBudget, ResearchStatus
 from hackbot.service import BugHunterRuntime, create_app
+from hackbot.target_operator import TargetSetupError
 from hackbot.store import EvidenceFactStore, StoreSchemaError
 from hackbot.planner_models import PlannerLimits, PlannerMode, PlannerStatus
 from hackbot.process_health import OwnedProcessStatus
@@ -686,6 +689,165 @@ class ServiceTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_anonymous_session_registers_tracked_package_without_accounts(self):
+        self.assertIsNone(self.runtime.registry.target_id_for_package("example"))
+        invalid = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "UNKNOWN"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIsNone(self.runtime.registry.target_id_for_package("example"))
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        self.assertEqual(self.runtime.registry.target_id_for_package("example"), self.target)
+        self.assertEqual(self.client.post(
+            f"/v1/browser/sessions/{created.get_json()['id']}/stop?target=example",
+            json={}).status_code, 200)
+
+    def test_delete_session_retains_history_and_releases_capacity(self):
+        self.config = replace(self.config, resources=replace(
+            self.config.resources, max_browser_sessions=1))
+        self.runtime = BugHunterRuntime(self.config, driver=self.driver, vnc_ready=lambda: True)
+        self.app = create_app(runtime=self.runtime)
+        self.client = self.app.test_client()
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        self.assertEqual(created.status_code, 201)
+        full = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        self.assertEqual(full.status_code, 503)
+        self.assertEqual(full.get_json()["reason_code"], "CONCURRENCY_LIMIT")
+        session_id = created.get_json()["id"]
+        profile = self.runtime.browser.profiles.path(self.runtime.browser.get(session_id))
+        self.assertTrue(profile.exists())
+        self.assertEqual(self.client.delete(f"/v1/browser/sessions/{session_id}?target=wrong").status_code, 404)
+        self.assertEqual(self.client.post(
+            f"/v1/browser/sessions/{session_id}/start?target=example", json={}).status_code, 200)
+        self.assertTrue(self.driver.is_running(session_id))
+        now = datetime.now(timezone.utc)
+        exchange = self.runtime.traffic.store_exchange(
+            self.runtime.package("example"), CapturePacket(
+                CapturedRequest("GET", "https://app.example.test/synthetic", (), None, now),
+                CapturedResponse(200, (("Content-Type", "text/plain"),), b"fixture", now),
+                browser_session_id=session_id),
+            source=TrafficSource.BROWSER, capture_provider="LOCAL_FIXTURE",
+            browser_manager=self.runtime.browser)
+        deleted = self.client.delete(f"/v1/browser/sessions/{session_id}?target=example")
+        self.assertEqual(deleted.status_code, 200, deleted.get_data(as_text=True))
+        self.assertFalse(self.driver.is_running(session_id))
+        self.assertTrue(profile.exists())
+        self.assertIsNone(self.runtime.browser.get(session_id))
+        self.assertEqual(self.get(f"/v1/traffic/{exchange.id}?target=example")["attribution"]["browser_session_id"],
+                         session_id)
+        self.assertNotIn(session_id, [item["id"] for item in self.get(
+            "/v1/browser/sessions?target=example")["items"]])
+        self.assertEqual(self.runtime.target_cleanup_dependencies(self.target)["browser_sessions"], 0)
+        self.assertEqual(self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"}).status_code, 201)
+        self.assertEqual(self.client.delete(f"/v1/browser/sessions/{session_id}?target=example").status_code, 404)
+        with self.runtime.store._connection() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT status FROM browser_sessions WHERE session_id=?", (session_id,)).fetchone()[0], "STOPPED")
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM browser_session_events WHERE session_id=? AND event_type='browser_deleted'",
+                (session_id,)).fetchone())
+
+    def test_delete_reauth_required_stale_session(self):
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        session_id = created.get_json()["id"]
+        self.assertEqual(self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example",
+                                          json={}).status_code, 200)
+        self.driver.running.remove(session_id)
+        reconciled = self.client.post(f"/v1/browser/sessions/{session_id}/reconcile?target=example",
+                                      json={})
+        self.assertEqual(reconciled.get_json()["status"], "REAUTH_REQUIRED")
+        self.assertEqual(self.client.delete(f"/v1/browser/sessions/{session_id}?target=example").status_code, 200)
+        with self.runtime.store._connection() as db:
+            self.assertEqual(db.execute("SELECT status FROM browser_sessions WHERE session_id=?",
+                                        (session_id,)).fetchone()[0], "STOPPED")
+
+    def test_target_runtime_cleanup_then_typed_delete_keeps_history(self):
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        self.assertEqual(created.status_code, 201)
+        session_id = created.get_json()["id"]
+        preview = self.get("/v1/targets/example/delete-preview")
+        self.assertEqual(preview["dependencies"]["browser_sessions"], 1)
+        self.assertFalse(preview["can_delete"])
+        self.assertEqual(self.client.delete("/v1/targets/example",
+                                            json={"confirm_package_id": "wrong"}).status_code, 400)
+        self.assertEqual(self.client.delete("/v1/targets/example",
+                                            json={"confirm_package_id": "example"}).status_code, 409)
+        with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target traffic")):
+            cleaned = self.client.post("/v1/targets/example/clean-runtime", json={})
+            self.assertEqual(cleaned.status_code, 200, cleaned.get_data(as_text=True))
+            self.assertEqual(cleaned.get_json()["removed_sessions"], [session_id])
+            self.assertEqual(self.get("/v1/targets/example/delete-preview")["can_delete"], True)
+            deleted = self.client.delete("/v1/targets/example",
+                                         json={"confirm_package_id": "example"})
+        self.assertEqual(deleted.status_code, 200, deleted.get_data(as_text=True))
+        self.assertFalse((self.config.targets.root / "example").exists())
+        self.assertEqual(self.client.get("/v1/targets/example").status_code, 404)
+        self.assertEqual(self.runtime.registry.target_id_for_package("example"), self.target)
+        self.assertEqual(self.get("/v1/target-tombstones")["items"][0]["label"], "example (deleted)")
+        self.assertEqual(self.client.post("/v1/targets", json={"id": "example"}).status_code, 409)
+        with self.runtime.store._connection() as db:
+            self.assertIsNotNone(db.execute("SELECT 1 FROM browser_sessions WHERE session_id=?",
+                                            (session_id,)).fetchone())
+            self.assertIsNotNone(db.execute("SELECT 1 FROM service_events WHERE event_type='target_deleted' "
+                                            "AND target_id=?", (self.target,)).fetchone())
+
+    def test_target_delete_rejects_paths_and_symlinks(self):
+        with self.assertRaises(TargetSetupError):
+            self.runtime.target_operator.delete("../example")
+        with self.assertRaises(TargetSetupError):
+            self.runtime.target_operator.delete("/tmp/example")
+        external = Path(self.temp.name) / "external"
+        external.mkdir()
+        (self.config.targets.root / "linked").symlink_to(external, target_is_directory=True)
+        with self.assertRaises(TargetSetupError):
+            self.runtime.target_operator.delete("linked")
+        (self.config.targets.root / "example" / "linked-file").symlink_to(external)
+        with self.assertRaises(TargetSetupError):
+            self.runtime.target_operator.delete("example")
+        self.assertTrue((self.config.targets.root / "example" / "target.yaml").is_file())
+
+    def test_active_campaign_blocks_session_cleanup_and_target_delete(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "anonymous": True, "capture_provider": "DIRECT"})
+        session_id = created.get_json()["id"]
+        campaign = self.runtime.campaign.store.create(
+            package, PlannerMode.PLAN_ONLY, CampaignLimits(), policy_version(package), "operator")
+        self.assertEqual(self.get("/v1/targets/example/delete-preview")["dependencies"][
+            "active_campaigns"], 1)
+        self.assertEqual(self.client.delete(f"/v1/browser/sessions/{session_id}?target=example").status_code, 409)
+        self.assertEqual(self.client.post("/v1/targets/example/clean-runtime", json={}).status_code, 409)
+        self.assertEqual(self.client.delete("/v1/targets/example",
+                                            json={"confirm_package_id": "example"}).status_code, 409)
+        self.assertTrue((self.config.targets.root / "example" / "target.yaml").is_file())
+
+    def test_account_remove_blocks_session_and_preserves_identity(self):
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        self.client.post("/v1/targets/example/import-identities", json={})
+        accounts = self.get("/v1/targets/example/accounts")["items"]
+        alias = accounts[0]["alias"]
+        identity = self.runtime.registry.get_identity(self.target, alias)
+        self.runtime.auth.prepare(self.target, identity.id, mechanism=AuthMechanism.MANUAL_LOGIN)
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity.id, "capture_provider": "DIRECT"})
+        self.assertEqual(created.status_code, 201)
+        route = f"/v1/targets/example/accounts/{alias}"
+        self.assertEqual(self.client.delete(route).status_code, 409)
+        self.assertEqual(self.client.delete(
+            f"/v1/browser/sessions/{created.get_json()['id']}?target=example").status_code, 200)
+        removed = self.client.delete(route)
+        self.assertEqual(removed.status_code, 200, removed.get_data(as_text=True))
+        self.assertNotIn(alias, [item["alias"] for item in self.get(
+            "/v1/targets/example/accounts")["items"]])
+        self.assertEqual(self.runtime.registry.get_identity(self.target, alias).status.value, "DISABLED")
+
     def test_burp_session_requires_bridge_and_listener_before_browser_start(self):
         root = Path(self.temp.name)
         jar = root / "burpsuite_desktop_v2026.9.2.jar"
@@ -705,11 +867,13 @@ class ServiceTests(unittest.TestCase):
         with patch.dict(os.environ, {"HACKBOT_SECRET_BURP_BRIDGE": token}):
             runtime = BugHunterRuntime(config, driver=FakeDriver(), vnc_ready=lambda: True)
             self.addCleanup(runtime.close_burp_bridge)
-            runtime.registry.register_target(runtime.package("example"))
+            self.assertIsNone(runtime.registry.target_id_for_package("example"))
             client = create_app(runtime=runtime).test_client()
             response = client.post("/v1/browser/sessions", json={
                 "target": "example", "anonymous": True, "capture_provider": "BURP"})
             self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+            self.assertEqual(runtime.registry.target_id_for_package("example"),
+                             runtime.package("example").target.id)
             session = response.get_json()
             self.assertEqual(session["capture_provider"], "BURP")
             self.assertEqual(session["capture_listener"], f"127.0.0.1:{listener_port}")
@@ -728,8 +892,43 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(started.status_code, 200, started.get_data(as_text=True))
             self.assertTrue(runtime.driver.is_running(session["id"]))
             self.assertEqual(started.get_json()["capture_provider"], "BURP")
-            runtime.browser.stop(session["id"])
-            runtime.close_burp_bridge()
+            stopped = client.post(f"/v1/browser/sessions/{session['id']}/stop?target=example", json={})
+            self.assertEqual(stopped.status_code, 200, stopped.get_data(as_text=True))
+            self.assertEqual(stopped.get_json()["status"], "STOPPED")
+            self.assertEqual(runtime.burp.binding_for_session(session["id"]).state, "RELEASED")
+            self.assertFalse(runtime.burp.bridge_connected(runtime.package("example").target.id))
+            another = client.post("/v1/browser/sessions", json={
+                "target": "example", "anonymous": True, "capture_provider": "BURP"})
+            self.assertEqual(another.status_code, 201, another.get_data(as_text=True))
+            self.assertEqual(another.get_json()["capture_listener"], f"127.0.0.1:{listener_port}")
+            self.assertEqual(client.get("/v1/targets/example/delete-preview").get_json()[
+                "dependencies"]["active_capture_bindings"], 1)
+            self.assertEqual(client.delete(
+                f"/v1/browser/sessions/{another.get_json()['id']}?target=example", json={}
+            ).status_code, 200)
+            self.assertEqual(runtime.burp.binding_for_session(another.get_json()["id"]).state,
+                             "RELEASED")
+            self.assertEqual(client.get("/v1/targets/example/delete-preview").get_json()[
+                "dependencies"]["active_capture_bindings"], 0)
+            self.assertIsNone(runtime.browser.get(another.get_json()["id"]))
+            self.assertEqual(client.delete(
+                f"/v1/browser/sessions/{session['id']}?target=example", json={}
+            ).status_code, 200)
+            orphan = client.post("/v1/browser/sessions", json={
+                "target": "example", "anonymous": True, "capture_provider": "BURP"})
+            self.assertEqual(orphan.status_code, 201)
+            orphan_id = orphan.get_json()["id"]
+            runtime.browser.retire(orphan_id)
+            preview = client.get("/v1/targets/example/delete-preview").get_json()
+            self.assertEqual(preview["dependencies"]["browser_sessions"], 0)
+            self.assertEqual(preview["dependencies"]["active_capture_bindings"], 1)
+            self.assertFalse(preview["can_delete"])
+            self.assertEqual(client.delete("/v1/targets/example",
+                                           json={"confirm_package_id": "example"}).status_code, 409)
+            cleanup = client.post("/v1/targets/example/clean-runtime", json={})
+            self.assertEqual(cleanup.status_code, 200, cleanup.get_data(as_text=True))
+            self.assertEqual(cleanup.get_json()["released_bindings"], [orphan_id])
+            self.assertEqual(runtime.burp.binding_for_session(orphan_id).state, "RELEASED")
             restarted = BugHunterRuntime(config, driver=FakeDriver(), vnc_ready=lambda: True)
             self.addCleanup(restarted.close_burp_bridge)
             self.assertEqual(restarted.burp.binding_for_session(session["id"]).state, "RELEASED")
@@ -1200,6 +1399,10 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(first.get_json()["run"]["status"], "READY")
             second = self.client.post(f"/v1/runs/{run_id}/advance", json={"target": "example"})
             self.assertEqual(second.get_json()["run"]["status"], "WAITING_HUMAN")
+            self.assertEqual(self.client.post(f"/v1/runs/{run_id}/archive",
+                                              json={"target": "example"}).status_code, 409)
+            self.assertEqual(self.client.post(f"/v1/hypotheses/{hypothesis.id}/archive",
+                                              json={"target": "example"}).status_code, 409)
             self.assertEqual(second.get_json()["run"]["requests_consumed"], 0)
             self.assertEqual(self.client.post(f"/v1/runs/{run_id}/pause",
                                               json={"target": "example"}).status_code, 400)
@@ -1207,6 +1410,15 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(self.client.get(f"/v1/plans/{plan_id}/runs?target=unknown").status_code, 404)
             cancelled = self.client.post(f"/v1/runs/{run_id}/cancel", json={"target": "example"})
             self.assertEqual(cancelled.get_json()["run"]["status"], "CANCELLED")
+            self.assertEqual(self.client.post(f"/v1/runs/{run_id}/archive",
+                                              json={"target": "example"}).status_code, 200)
+            self.assertEqual(self.get("/v1/runs?target=example")["items"], [])
+            self.assertEqual(self.get("/v1/runs?target=example&archived=1")["items"][0]["id"], run_id)
+            self.assertEqual(self.client.post(f"/v1/hypotheses/{hypothesis.id}/archive",
+                                              json={"target": "example"}).status_code, 200)
+            self.assertEqual(self.get("/v1/hypotheses?target=example")["items"], [])
+            self.assertEqual(self.get("/v1/hypotheses?target=example&archived=1")["items"][0]["id"],
+                             hypothesis.id)
 
     def test_manual_login_never_self_verifies_and_is_target_scoped(self):
         imported = self.client.post("/v1/targets/example/import-identities", json={})

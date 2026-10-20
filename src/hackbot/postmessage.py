@@ -16,6 +16,7 @@ from .postmessage_static import MessageCandidateStatus, PostMessageStaticAnalyze
 from .postmessage_store import PostMessageStore
 from .skill_plans import SkillContextBuilder, SkillPlanner, SkillRouter
 from .target_loader import TargetPackageRepository
+from .target_recon import resolve_recon_target
 from .target_scope import ScopeResult
 from .traffic import ExchangeState, TrafficStore
 
@@ -43,7 +44,7 @@ class PostMessageSpecialist:
 
     def inventory(self, package_id: str) -> tuple[DOMAssetLead, ...]:
         package = self._package(package_id)
-        recon = self.dom.recon.resolve_target(package.target.root_domain)
+        recon = resolve_recon_target(package, self.dom.recon)
         if recon is None:
             return ()
         leads: list[DOMAssetLead] = []
@@ -71,7 +72,7 @@ class PostMessageSpecialist:
                                include_source_map: bool = True):
         """Refresh one pinned recon asset through Phase 21 policy-gated acquisition."""
         package = self._package(package_id)
-        recon_target = self.dom.recon.resolve_target(package.target.root_domain)
+        recon_target = resolve_recon_target(package, self.dom.recon)
         if recon_target is None:
             raise ValueError("Recon target is unavailable")
         asset = self.dom.recon.get_js_asset(recon_target.domain_id, recon_asset_id)

@@ -85,6 +85,20 @@ class ProfileRetentionTests(unittest.TestCase):
         self.assertIsNotNone(self.browser.get(session.id))
         self.assertEqual(self.collector.plan().session_ids, ())
 
+    def test_retired_session_profile_waits_for_reviewed_retention(self):
+        session, path = self.terminal_anonymous()
+        self.browser.retire(session.id)
+        self.assertIsNone(self.browser.get(session.id))
+        self.assertTrue(path.exists())
+        plan = self.collector.plan()
+        self.assertEqual(plan.session_ids, (session.id,))
+        with self.assertRaises(ProfileRetentionError):
+            self.collector.run(confirmed=False, approved_plan=plan)
+        self.assertTrue(path.exists())
+        self.assertEqual(self.collector.run(confirmed=True, approved_plan=plan)["removed"], 1)
+        self.assertFalse(path.exists())
+        self.assertIsNotNone(self.browser.get_for_retention(session.id))
+
     def test_process_uncertainty_or_running_session_prevents_cleanup(self):
         session, path = self.terminal_anonymous()
         self.safe = False

@@ -63,6 +63,10 @@ class FixtureRecon:
         self.calls.append(("list_hosts", limit))
         return Page(tuple(self.hosts[:limit]), None)
 
+    def list_wildcard_hosts(self, domain_id, suffix, *, limit, cursor=None):
+        self.calls.append(("list_wildcard_hosts", suffix, limit))
+        return Page(tuple(item for item in self.hosts if item.hostname.endswith("." + suffix))[:limit], None)
+
     def list_endpoints(self, domain_id, host_id, *, limit, cursor=None):
         self.calls.append(("list_endpoints", host_id, limit))
         return Page(tuple(self.endpoints.get(host_id, [])[:limit]), None)
@@ -207,7 +211,7 @@ class Phase12Tests(unittest.TestCase):
         self.assertFalse(any("/internal/config" in s.display for s in profile.signals))
         self.assertLessEqual(profile.coverage["endpoints_examined"], 36)
         self.assertLessEqual(profile.coverage["js_analyses_examined"], 12)
-        self.assertTrue(all(call[0] in {"resolve_target", "resolve_host", "list_hosts", "list_endpoints",
+        self.assertTrue(all(call[0] in {"resolve_target", "resolve_host", "list_hosts", "list_wildcard_hosts", "list_endpoints",
                   "list_parameters", "list_endpoint_js_references", "list_js_assets", "get_js_analysis", "list_api_surfaces",
                   "list_scan_snapshots", "list_asset_events"} for call in self.recon.calls))
 

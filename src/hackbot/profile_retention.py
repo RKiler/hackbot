@@ -143,7 +143,7 @@ class BrowserProfileCollector:
         for row in rows[:self.policy.max_scan_profiles]:
             if self._target_busy(db, row["target_id"]):
                 continue
-            session = self.manager.get(row["session_id"])
+            session = self.manager.get_for_retention(row["session_id"])
             if (session is None or not session.anonymous or
                     session.updated_at > now - timedelta(hours=self.policy.anonymous_grace_hours) or
                     self.manager.driver.is_running(session.id)):
@@ -201,7 +201,7 @@ class BrowserProfileCollector:
         selected: list[str] = []
         size = 0
         for row in rows[:self.policy.max_scan_profiles]:
-            session = self.manager.get(row["session_id"])
+            session = self.manager.get_for_retention(row["session_id"])
             if (session is None or session.target_id != target_id or
                     session.identity_id != identity_id or
                     session.status.value not in {"STOPPED", "FAILED", "EXPIRED"} or
@@ -248,7 +248,7 @@ class BrowserProfileCollector:
         empty = NamedProfileRetentionPlan(target_id, identity_id, (), 0)
         if self._target_busy(db, target_id):
             return empty
-        session = self.manager.get(session_id)
+        session = self.manager.get_for_retention(session_id)
         cutoff = now - timedelta(hours=self.policy.active_identity_grace_hours)
         if (session is None or session.target_id != target_id or
                 session.identity_id != identity_id or
@@ -308,7 +308,7 @@ class BrowserProfileCollector:
             self._audit(operation_id, "STARTED", 0, 0,
                         retention_class="TERMINAL_ACTIVE_IDENTITY_BROWSER_PROFILE",
                         target_id=target_id, identity_id=identity_id)
-            session = self.manager.get(session_id)
+            session = self.manager.get_for_retention(session_id)
             if session is None or self.manager.driver.is_running(session_id):
                 raise ProfileRetentionError("Browser session changed during cleanup")
             reclaimed = self._profile_bytes(self.manager.profiles.path(session))
@@ -346,7 +346,7 @@ class BrowserProfileCollector:
             removed = 0
             reclaimed = 0
             for session_id in plan.session_ids:
-                session = self.manager.get(session_id)
+                session = self.manager.get_for_retention(session_id)
                 if session is None or not session.anonymous or self.manager.driver.is_running(session_id):
                     raise ProfileRetentionError("Browser session changed during cleanup")
                 reclaimed += self._profile_bytes(self.manager.profiles.path(session))
@@ -386,7 +386,7 @@ class BrowserProfileCollector:
             removed = 0
             reclaimed = 0
             for session_id in selected:
-                session = self.manager.get(session_id)
+                session = self.manager.get_for_retention(session_id)
                 if (session is None or session.target_id != target_id or
                         session.identity_id != identity_id or
                         session.status.value not in {"STOPPED", "FAILED", "EXPIRED"} or

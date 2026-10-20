@@ -14,8 +14,9 @@ from urllib.parse import urlsplit
 from .config import AppConfig, ConfigError, ReconSettings
 from .recon import (
     Page, Provenance, ReconApiSurface, ReconAssetEvent, ReconEndpoint,
-    ReconEndpointJsReference, ReconHost, ReconJsAnalysis, ReconJsAsset,
-    ReconParameter, ReconScanSnapshot, ReconTarget,
+    ReconEndpointJsReference, ReconHost, ReconHostMembership, ReconHostSignals,
+    ReconJsAnalysis, ReconJsAsset, ReconParameter, ReconScanSnapshot, ReconTarget,
+    ReconWildcardCounts,
 )
 
 
@@ -237,6 +238,89 @@ class PostgresReconRepository:
         """, (exact_url, domain_id))
         return self._host(rows[0]) if rows else None
 
+    def resolve_host_membership(self, hostname: str) -> ReconHostMembership | None:
+        """Resolve an exact subdomain through its authoritative recon foreign key."""
+        name = _root_name(hostname)
+        rows = self._read("""
+            SELECT s.id AS subdomain_id,s.subdomain,lh.id AS host_id,
+                   d.id AS domain_id,d.domain,d.active,d.include_subdomains,d.created_at
+            FROM subdomains s JOIN domains d ON d.id=s.domain_id
+            LEFT JOIN LATERAL (
+                SELECT id FROM live_hosts WHERE subdomain_id=s.id
+                ORDER BY last_seen DESC,id DESC LIMIT 1
+            ) lh ON true
+            WHERE s.subdomain=%s
+            ORDER BY length(d.domain) DESC,s.last_seen DESC,s.id DESC LIMIT 1
+        """, (name,))
+        if not rows:
+            return None
+        row = rows[0]
+        target = ReconTarget(row["domain_id"], row["domain"], row["active"],
+                             row["include_subdomains"],
+                             Provenance("domains", row["domain_id"], row["created_at"],
+                                        "recon_inventory"))
+        return ReconHostMembership(target, name, row["subdomain_id"], row["host_id"])
+
+    def list_wildcard_hosts(
+        self, domain_id: int, suffix: str, *, limit: int = 20, cursor: str | None = None,
+    ) -> Page[ReconHost]:
+        """Recent recon origins below one already-authorized wildcard suffix."""
+        _id(domain_id)
+        name = _root_name(suffix)
+        fetch_limit = self._limit(limit)
+        scope = (domain_id, name)
+        position = _cursor_decode(cursor, "wildcard_hosts", scope)
+        condition = "AND (lh.last_seen,lh.id)<(%s,%s)" if position else ""
+        params: tuple[object, ...] = ((domain_id, "%." + name, *position, fetch_limit)
+                                      if position else (domain_id, "%." + name, fetch_limit))
+        rows = self._read(f"""
+            SELECT lh.id,lh.url,lh.status_code,lh.last_seen,s.subdomain,s.domain_id
+            FROM subdomains s JOIN live_hosts lh ON lh.subdomain_id=s.id
+            WHERE s.domain_id=%s AND s.subdomain LIKE %s {condition}
+            ORDER BY lh.last_seen DESC,lh.id DESC LIMIT %s
+        """, params)
+        return self._page(rows, limit, "wildcard_hosts", scope, self._host)
+
+    def wildcard_counts(self, domain_id: int, suffix: str) -> ReconWildcardCounts:
+        _id(domain_id)
+        name = _root_name(suffix)
+        rows = self._read("""
+            WITH latest AS (
+                SELECT scan_started_at FROM scan_snapshots
+                WHERE domain_id=%s AND scan_finished_at IS NOT NULL
+                ORDER BY scan_finished_at DESC,id DESC LIMIT 1
+            )
+            SELECT count(DISTINCT s.id) AS known,
+                   count(DISTINCT s.id) FILTER (WHERE lh.id IS NOT NULL) AS live,
+                   count(DISTINCT s.id) FILTER (
+                       WHERE latest.scan_started_at IS NOT NULL
+                         AND s.last_seen>=latest.scan_started_at) AS latest_scan
+            FROM subdomains s LEFT JOIN live_hosts lh ON lh.subdomain_id=s.id
+            LEFT JOIN latest ON true
+            WHERE s.domain_id=%s AND s.subdomain LIKE %s
+        """, (domain_id, domain_id, "%." + name))
+        row = rows[0]
+        return ReconWildcardCounts(int(row["known"]), int(row["live"]), int(row["latest_scan"]))
+
+    def host_signals(self, domain_id: int, host_ids: tuple[int, ...]) -> dict[int, ReconHostSignals]:
+        _id(domain_id)
+        if not isinstance(host_ids, tuple) or len(host_ids) > 32:
+            raise ValueError("Host signal shortlist must contain at most 32 IDs")
+        if not host_ids:
+            return {}
+        ids = tuple(_id(item) for item in host_ids)
+        rows = self._read("""
+            SELECT lh.id,
+                   (SELECT count(*) FROM endpoints e WHERE e.live_host_id=lh.id) AS endpoint_count,
+                   (SELECT count(*) FROM js_assets a WHERE a.live_host_id=lh.id) AS js_count,
+                   (SELECT count(*) FROM api_surfaces p WHERE p.live_host_id=lh.id) AS api_count
+            FROM live_hosts lh JOIN subdomains s ON s.id=lh.subdomain_id
+            WHERE s.domain_id=%s AND lh.id=ANY(%s)
+        """, (domain_id, list(ids)))
+        return {row["id"]: ReconHostSignals(int(row["endpoint_count"]),
+                                             int(row["js_count"]), int(row["api_count"]))
+                for row in rows}
+
     @staticmethod
     def _host(row: Mapping[str, Any]) -> ReconHost:
         return ReconHost(
@@ -360,18 +444,22 @@ class PostgresReconRepository:
             _prov("endpoint_js_references", r, "last_seen", "latest_recon_row"),
         ))
 
-    def list_api_surfaces(self, domain_id: int, surface_type: str, *, limit: int = 20, cursor: str | None = None) -> Page[ReconApiSurface]:
+    def list_api_surfaces(self, domain_id: int, surface_type: str, *, host_id: int | None = None, limit: int = 20, cursor: str | None = None) -> Page[ReconApiSurface]:
         _id(domain_id)
+        if host_id is not None:
+            _id(host_id)
         if not isinstance(surface_type, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", surface_type):
             raise ValueError("An exact API surface type is required")
         fetch_limit = self._limit(limit)
-        scope = (domain_id, surface_type)
+        scope = (domain_id, surface_type) if host_id is None else (domain_id, surface_type, host_id)
         position = _cursor_decode(cursor, "api_surfaces", scope)
         condition = "AND (last_seen,id)<(%s,%s)" if position else ""
-        params = (domain_id, surface_type, *position, fetch_limit) if position else (domain_id, surface_type, fetch_limit)
+        host_condition = "AND live_host_id=%s" if host_id is not None else ""
+        params = (domain_id, surface_type, *((host_id,) if host_id is not None else ()),
+                  *(position or ()), fetch_limit)
         rows = self._read(f"""
             SELECT id,domain_id,live_host_id,surface_type,location,status_code,operations_count,last_seen
-            FROM api_surfaces WHERE domain_id=%s AND surface_type=%s {condition}
+            FROM api_surfaces WHERE domain_id=%s AND surface_type=%s {host_condition} {condition}
             ORDER BY last_seen DESC,id DESC LIMIT %s
         """, params)
         return self._page(rows, limit, "api_surfaces", scope, lambda r: ReconApiSurface(
