@@ -24,7 +24,7 @@ MAX_DOCUMENT_BYTES = 16384
 MAX_FIELDS = 80
 MAX_OPERATIONS = 8
 MAX_JS_BYTES = 1_048_576
-_JS_API_PATH = re.compile(r"/api/[A-Za-z0-9_./:-]{1,500}\Z")
+_JS_API_PATH = re.compile(r"/api/[A-Za-z0-9_./:{}-]{1,500}\Z")
 
 
 class GraphQLResult(StrEnum):
@@ -482,6 +482,8 @@ def extract_js_api_page(body: bytes, *, offset: int = 0) -> JSAPIPage:
             elif item.get("kind") == "REST":
                 path, method = item.get("path"), item.get("method")
                 if (not isinstance(path, str) or not _JS_API_PATH.fullmatch(path) or
+                        ("{" in path and not re.fullmatch(
+                            r"/api/[A-Za-z0-9_./:-]+/\{id\}(?:/[A-Za-z0-9_-]{1,64})?", path)) or
                         ".." in path or "//" in path or
                         method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}):
                     raise ValueError
@@ -519,6 +521,9 @@ def extract_js_api_artifacts(body: bytes) -> tuple[tuple[tuple[str, int], ...],
                    for item in result.get("routes", ())[:24]
                    if isinstance(item, dict) and isinstance(item.get("path"), str)
                    and _JS_API_PATH.fullmatch(item["path"])
+                   and ("{" not in item["path"] or re.fullmatch(
+                       r"/api/[A-Za-z0-9_./:-]+/\{id\}(?:/[A-Za-z0-9_-]{1,64})?",
+                       item["path"]))
                    and ".." not in item["path"] and "//" not in item["path"]
                    and item.get("method") in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}
                    and type(item.get("line")) is int and item["line"] >= 0)

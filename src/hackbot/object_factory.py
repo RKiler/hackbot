@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import time
 from typing import Any
 import uuid
 
@@ -83,6 +84,13 @@ class ObjectFactory:
             raise ValueError("external object identifier evidence mismatch")
         return external_id(value)
 
+    def verified_external_id(self, object_id: str, target_id: str) -> str:
+        item = self.objects.get(object_id, target_id)
+        if (item is None or item.state is not ObjectState.READY or
+                not item.disposable or item.verified_at is None):
+            raise ValueError("Verified disposable object required")
+        return self._external_id(item)
+
     def _parent_external_id(self, item: TestObject) -> str | None:
         if item.parent_id is None:
             return None
@@ -132,6 +140,19 @@ class ObjectFactory:
         package = self.targets.get_target_package(item.package_id)
         if package is None or package.target.id != item.target_id:
             return "TARGET_UNAVAILABLE", None
+        if self.policy.rate is not None:
+            deadline = time.monotonic() + 61.0
+            while True:
+                delay = self.policy.rate.retry_after_seconds(
+                    item.target_id, package.rate)
+                if delay is None:
+                    return "RATE_CAPACITY_UNAVAILABLE", None
+                if delay <= 0:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "RATE_WAIT_EXCEEDED", None
+                time.sleep(min(max(0.01, delay + 0.01), remaining))
         decision = self.policy.evaluate(package, action, record=True)
         if decision.result is PolicyDecision.REQUIRE_APPROVAL:
             self.objects.transition(item.id, item.target_id, frozenset({item.state}), item.state,
@@ -187,6 +208,22 @@ class ObjectFactory:
                 session_id: str, purpose: str, parent_id: str | None = None,
                 plan_id: str | None = None, run_id: str | None = None,
                 hypothesis_id: str | None = None) -> ObjectFactoryResult:
+        planned = self.plan_disposable(
+            package_id=package_id, recipe_id=recipe_id, identity_id=identity_id,
+            tenant_id=tenant_id, session_id=session_id, purpose=purpose,
+            parent_id=parent_id, plan_id=plan_id, run_id=run_id,
+            hypothesis_id=hypothesis_id)
+        if planned.outcome != "PLANNED" or planned.item is None:
+            return planned
+        return replace(self.create(planned.item.id, planned.item.target_id,
+                                   session_id=session_id), created_new=True)
+
+    def plan_disposable(self, *, package_id: str, recipe_id: str, identity_id: str,
+                        tenant_id: str, session_id: str, purpose: str,
+                        parent_id: str | None = None, plan_id: str | None = None,
+                        run_id: str | None = None, hypothesis_id: str | None = None,
+                        reuse_ready: bool = True) -> ObjectFactoryResult:
+        """Persist a safe creation intent without sending target traffic."""
         recipe = self.recipes.get(package_id, recipe_id)
         if recipe is None:
             return ObjectFactoryResult("MISSING_CREATION_RECIPE", None, "No known operation")
@@ -204,10 +241,13 @@ class ObjectFactory:
                 parent = self.objects.get(parent.parent_id, recipe.target_id)
                 if parent is None or depth >= self.settings.max_creation_depth:
                     return ObjectFactoryResult("BLOCKED_MISSING_PARENT", None, "Creation depth exceeded")
-        reusable = self.objects.find_reusable(recipe.target_id, recipe.object_type, tenant_id,
-                                              identity_id, parent_id=parent_id, recipe_id=recipe.id)
-        if reusable:
-            return ObjectFactoryResult("READY", reusable, "Existing verified disposable object")
+        if reuse_ready:
+            reusable = self.objects.find_reusable(
+                recipe.target_id, recipe.object_type, tenant_id, identity_id,
+                parent_id=parent_id, recipe_id=recipe.id)
+            if reusable:
+                return ObjectFactoryResult("READY", reusable,
+                                           "Existing verified disposable object")
         if not isinstance(purpose, str) or not purpose or len(purpose) > 120:
             raise ValueError("invalid object purpose")
         name = self.settings.name_prefix + uuid.uuid4().hex[:12]
@@ -218,8 +258,8 @@ class ObjectFactory:
             parent_id=parent_id, plan_id=plan_id, run_id=run_id, hypothesis_id=hypothesis_id,
             max_objects_per_plan=self.settings.max_objects_per_plan,
             max_objects_per_target_hour=self.settings.max_objects_per_target_hour)
-        return replace(self.create(item.id, recipe.target_id, session_id=session_id),
-                       created_new=True)
+        return ObjectFactoryResult("PLANNED", item, "Creation intent persisted",
+                                   created_new=True)
 
     def create(self, object_id: str, target_id: str, *, session_id: str) -> ObjectFactoryResult:
         item = self.objects.get(object_id, target_id)
@@ -304,6 +344,52 @@ class ObjectFactory:
                                            evidence_ids=links, source="OBJECT_FACTORY",
                                            target_ref=target_id)
         return ObjectFactoryResult("READY", item, "Creation and ownership verified")
+
+    def reverify_for_reuse(self, object_id: str, target_id: str, *, session_id: str,
+                           action_id: str) -> ObjectFactoryResult:
+        item = self.objects.get(object_id, target_id)
+        if (item is None or item.state is not ObjectState.CLEANUP_PENDING or
+                not item.disposable or not item.verified_at or
+                self.objects.active_reservation(object_id)):
+            raise ValueError("Released disposable object required")
+        recipe = self._recipe(item)
+        if not self._identity_binding(recipe, item.creator_identity_id,
+                                      item.tenant_id, session_id):
+            return ObjectFactoryResult("IDENTITY_UNVERIFIED", item,
+                                       "Verified creator and tenant required")
+        state, response = self._send(item, recipe.verify, kind="VERIFY",
+                                     category=ActionCategory.SAFE_READ,
+                                     session_id=session_id, object_id=self._external_id(item),
+                                     action_id=action_id)
+        item = self.objects.get(object_id, target_id)
+        assert item is not None
+        if state != "RESPONSE":
+            return ObjectFactoryResult(state, item, "Owner read-back not verified",
+                                       response if state == "APPROVAL_REQUIRED" else None)
+        result = response
+        body, evidence = self._response(result)
+        try:
+            matched = (result.status_code == 200 and not result.truncated and
+                       json_pointer(body, recipe.verify_id_pointer) == self._external_id(item) and
+                       json_pointer(body, recipe.verify_name_pointer) == item.test_name and
+                       json_pointer(body, recipe.verify_owner_pointer) == recipe.expected_owner and
+                       json_pointer(body, recipe.verify_tenant_pointer) == recipe.expected_tenant)
+        except (ValueError, KeyError, TypeError, IndexError):
+            matched = False
+        if not matched:
+            item = self.objects.transition(item.id, target_id,
+                                           frozenset({ObjectState.VERIFYING}),
+                                           ObjectState.CLEANUP_PENDING,
+                                           "REUSE_OWNER_READBACK_MISMATCH",
+                                           evidence_ids=evidence[:16])
+            return ObjectFactoryResult("NEEDS_MANUAL_REVIEW", item,
+                                       "Owner read-back mismatch")
+        item = self.objects.transition(item.id, target_id,
+                                       frozenset({ObjectState.VERIFYING}),
+                                       ObjectState.READY, "REUSE_OWNERSHIP_VERIFIED",
+                                       evidence_ids=evidence[:16],
+                                       owner_principal_id=item.creator_identity_id)
+        return ObjectFactoryResult("READY", item, "Ownership reverified for read-only reuse")
 
     def update_name(self, object_id: str, target_id: str, *, session_id: str) -> ObjectFactoryResult:
         item = self.objects.get(object_id, target_id)

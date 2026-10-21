@@ -350,7 +350,7 @@ class AuthManagerTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=2")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             names = {row[1] for row in connection.execute("PRAGMA table_info(auth_contexts)")}
         self.assertIn("secret_ref", names)
         self.assertEqual(self.registry.get_identity(self.target_id, identity.id), identity)

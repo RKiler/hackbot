@@ -31,7 +31,8 @@ class BenchmarkLocalRunnerTests(unittest.TestCase):
                 self.assertEqual({row["status"] for row in cases.values()}, {"COMPLETED"})
                 positive = cases[vulnerable_id]["evaluation"]
                 negative = cases[guarded_id]["evaluation"]
-                self.assertEqual(positive["detected_vulnerabilities"], 1)
+                self.assertEqual(positive["detected_vulnerabilities"], 1,
+                                 (suite, cases[vulnerable_id]["trace"]))
                 self.assertEqual(positive["false_confirmed_findings"], 0)
                 self.assertEqual(positive["top_k"]["1"], 1)
                 self.assertTrue(positive["audit_quality_pass"])

@@ -71,7 +71,7 @@ _TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_METADATA_BYTES = 8192
 _MAX_FACT_EVIDENCE = 16
-_SCHEMA_VERSION = 48
+_SCHEMA_VERSION = 51
 
 
 def _now() -> datetime:
@@ -268,7 +268,12 @@ class EvidenceFactStore:
                 (46, "046_dom_retirement_guards.sql"),
                 (47, "047_campaign_coordination.sql"),
                 (48, "048_continuous_delta_hunting.sql"),
+                (49, "049_reusable_target_package_ids.sql"),
+                (50, "050_hunt_supervisor.sql"),
+                (51, "051_hunt_disposable_fixtures.sql"),
             ):
+                if target_version > _SCHEMA_VERSION:
+                    break
                 if version >= target_version:
                     continue
                 migration = files("hackbot").joinpath("migrations", filename).read_text()
@@ -301,14 +306,34 @@ class EvidenceFactStore:
                         base_migration, table_prefix="delta_")
                     migration += "\n" + dom_guard_extension_sql(
                         base_migration, table_prefix="continuous_")
+                if target_version == 49:
+                    from .dom_guard_schema import dom_guard_rebuilt_table_sql
+                    migration += "\n" + dom_guard_rebuilt_table_sql(
+                        "registry_targets", ("target_id", "package_id", "registered_at", "deleted_at"))
+                if target_version in {50, 51}:
+                    from .dom_guard_schema import dom_guard_extension_sql
+                    migration += "\n" + dom_guard_extension_sql(
+                        migration, table_prefix="hunt_")
                 try:
-                    connection.executescript(
-                        "BEGIN IMMEDIATE;\n" + migration
-                        + f"\nPRAGMA user_version={target_version};\nCOMMIT;"
-                    )
-                except sqlite3.Error:
+                    if target_version == 49:
+                        # Rebuild the referenced registry table without cascading into history.
+                        connection.execute("PRAGMA foreign_keys=OFF")
+                        connection.executescript("BEGIN IMMEDIATE;\n" + migration)
+                        if connection.execute("PRAGMA foreign_key_check").fetchone():
+                            raise StoreSchemaError("Local store migration violates foreign keys")
+                        connection.execute(f"PRAGMA user_version={target_version}")
+                        connection.commit()
+                    else:
+                        connection.executescript(
+                            "BEGIN IMMEDIATE;\n" + migration
+                            + f"\nPRAGMA user_version={target_version};\nCOMMIT;"
+                        )
+                except (sqlite3.Error, StoreSchemaError):
                     connection.rollback()
                     raise StoreSchemaError("Local store migration failed") from None
+                finally:
+                    if target_version == 49:
+                        connection.execute("PRAGMA foreign_keys=ON")
                 version = target_version
             expected = {"evidence", "evidence_policy_events", "facts", "fact_evidence", "fact_status_events"}
             expected.update({"registry_targets", "registry_principals", "registry_tenants", "registry_roles",
@@ -369,6 +394,10 @@ class EvidenceFactStore:
             expected.update({"campaigns", "campaign_cycles", "campaign_work",
                              "campaign_task_claims", "campaign_events",
                              "campaign_suppressions", "campaign_objects"})
+            if _SCHEMA_VERSION >= 50:
+                expected.update({"hunt_runs", "hunt_events"})
+            if _SCHEMA_VERSION >= 51:
+                expected.add("hunt_fixtures")
             expected.update({"continuous_targets", "continuous_target_specialists",
                              "continuous_target_events", "delta_watch_runs",
                              "delta_observations", "delta_candidates",

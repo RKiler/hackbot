@@ -106,6 +106,18 @@ class GraphQLParsingTests(unittest.TestCase):
                          [("POST", "/api/v1/admin/export"),
                           ("GET", "/api/v1/projects")])
 
+    def test_one_encoded_object_id_yields_static_route_template_only(self):
+        source = (b"fetch('/api/documents/' + encodeURIComponent(id));"
+                  b"fetch('/api/documents/' + encodeURIComponent(id) + '/preview');"
+                  b"fetch('/api/documents/' + encodeURIComponent(id), {method:'DELETE'});"
+                  b"fetch('/api/documents/' + arbitrary(id), {method:'DELETE'});"
+                  b"fetch('/api/documents/' + encodeURIComponent(secretToken));")
+        _, routes = extract_js_api_artifacts(source)
+        self.assertEqual([(item.method, item.path) for item in routes], [
+            ("GET", "/api/documents/{id}"),
+            ("GET", "/api/documents/{id}/preview"),
+            ("DELETE", "/api/documents/{id}")])
+
     def test_js_api_pages_reach_operations_after_legacy_first_page(self):
         body = b"".join(
             (f"const q{index}=gql`query Dense{index}($id:ID!)"

@@ -113,6 +113,33 @@ class RateLimiter:
                                  budget, mutation=mutation, creation=creation, retry=retry)
             return RateOutcome(reason == "WITHIN_RATE_POLICY", reason)
 
+    def retry_after_seconds(self, target_id: str, policy: RatePolicy, *,
+                            experiment_id: str | None = None,
+                            budget: ExperimentBudget = ExperimentBudget()) -> float | None:
+        """Return the next rate-policy slot, or None for a non-temporary denial.
+
+        This is advisory only. Callers must still reserve immediately before work.
+        """
+        with self._lock:
+            now = self._clock()
+            state = self._state(target_id, policy, now)
+            if state is None:
+                return None
+            if len(state.active) >= policy.max_concurrency:
+                return 0.1
+            counters = state.experiments.get(experiment_id) if experiment_id else None
+            if (experiment_id and counters is None
+                    and len(state.experiments) >= self._max_experiments):
+                return None
+            if counters is not None and counters.requests >= budget.max_requests:
+                return None
+            per_second = max(0.0, (1.0 - state.tokens) / policy.requests_per_second)
+            per_minute = 0.0
+            if (policy.requests_per_minute is not None
+                    and len(state.minute) >= policy.requests_per_minute):
+                per_minute = max(0.0, state.minute[0] + 60.0 - now)
+            return max(per_second, per_minute)
+
     def reserve(self, target_id: str, policy: RatePolicy, *, experiment_id: str | None = None,
                 budget: ExperimentBudget = ExperimentBudget(), mutation: bool = False,
                 creation: bool = False, retry: bool = False) -> RateOutcome:

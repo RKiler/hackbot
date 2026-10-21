@@ -27,6 +27,7 @@ from .domxss_store import DOMXSSStore
 from .hypotheses import Hypothesis, HypothesisSource, HypothesisStatus
 from .object_recipes import ObjectRecipe
 from .plan_runs import RunStatus
+from .api_binding import api_reference_fingerprint
 from .skill_plans import APIReadPlanBinding, TypedMutationPlanBinding
 from .evidence import FactStatus, RedactionStatus
 from .recon import Page, ReconRepository
@@ -1340,6 +1341,59 @@ class APISpecialist:
             run_id=prior.run_id, validation_id=prior.validation_id,
             authorization_candidate_id=prior.id)
 
+    def _retain_rest_read_controls(self, package: TargetPackage,
+                                   operation: APIOperation, plan_id: str) -> bool:
+        auth = self.authorization
+        if (auth is None or auth.planner is None or
+                operation.type is not APIOperationType.REST or
+                operation.method not in {"GET", "HEAD"}):
+            return False
+        plan = auth.planner.store.get(plan_id, package.target.id)
+        if (plan is None or plan.get("api_binding", {}).get("operation_id") != operation.id or
+                plan["api_binding"].get("version_hash") != operation.version_hash):
+            return False
+        shapes = plan.get("request_templates")
+        if not isinstance(shapes, list) or len(shapes) != 5:
+            return False
+        controls = []
+        for shape in shapes[:2]:
+            if (not isinstance(shape, dict) or shape.get("binding") != "API_OBSERVED_READ_V1" or
+                    shape.get("fingerprint") != api_reference_fingerprint(shape) or
+                    shape.get("operation_id") != operation.id or
+                    shape.get("method") != operation.method or
+                    shape.get("variant") != "OWNER"):
+                return False
+            item = auth.objects.get(shape["test_object_id"], package.target.id)
+            exchange = self.traffic.get_exchange(shape["source_exchange_id"])
+            if (item is None or item.package_id != package.id or
+                    item.state is not ObjectState.READY or exchange is None or
+                    exchange.package_id != package.id):
+                return False
+            try:
+                external = auth._external_id(item)
+                token = "{p:" + hashlib.sha256(external.encode()).hexdigest()[:12] + "}"
+                endpoint = (exchange.request.origin +
+                            exchange.request.display_path.replace(token, "{object_id}"))
+                owned = AuthorizationObject(
+                    item.id, item.object_type, item.creator_identity_id,
+                    item.owner_principal_id, item.tenant_id, item.parent_id,
+                    item.external_id_hash, item.verification_evidence_ids[:8], ())
+                source = auth.observed_operation(package, owned, exchange.id)
+            except (LookupError, ValueError, UnicodeError, PermissionError):
+                return False
+            if (endpoint != operation.endpoint or source is None or
+                    not source.semantic_owner_success or source.method != operation.method or
+                    source.owner_identity_id != item.creator_identity_id):
+                return False
+            controls.append((source, item))
+        if (controls[0][0].key != controls[1][0].key or
+                controls[0][1].tenant_id == controls[1][1].tenant_id):
+            return False
+        self.registry.retain_control_exchanges(
+            package.target.id, operation.id,
+            tuple(source.exchange_id for source, _ in controls))
+        return True
+
     def prepare_candidate(self, package: TargetPackage, candidate_id: str) -> APICandidate:
         """Create an immutable API read plan; no target request is sent here."""
         auth = self.authorization
@@ -1405,7 +1459,9 @@ class APISpecialist:
                              item.exchange_id in operation.exchange_ids and
                              item.object_id == candidate.test_object_id and
                              item.semantic_owner_success and item.method == operation.method), None)
-        if owner_source is None and owned is not None and candidate.owner_exchange_id in operation.exchange_ids:
+        if (owner_source is None and owned is not None and candidate.owner_exchange_id and
+                (candidate.category == "OBJECT_AUTH" or
+                 candidate.owner_exchange_id in operation.exchange_ids)):
             owner_source = auth.observed_operation(package, owned, candidate.owner_exchange_id)
             if owner_source is not None and (not owner_source.semantic_owner_success or
                                              owner_source.method != operation.method):
@@ -1431,6 +1487,27 @@ class APISpecialist:
                                      matched.method == operation.method), None)
                 if actor_source is not None:
                     break
+            if (actor_source is None and owner_source is not None and actor_objects and
+                    candidate.category == "OBJECT_AUTH" and
+                    operation.type is APIOperationType.REST and
+                    operation.method in {"GET", "HEAD"}):
+                cursor = None
+                for _ in range(4):
+                    page = self.traffic.find_recent(package.target.id, limit=50,
+                                                    cursor=cursor)
+                    for exchange in page.items:
+                        if exchange.attribution.verified_identity_id != boundary.identity_id:
+                            continue
+                        actor_source = next((matched for item in actor_objects
+                                             if (matched := auth.observed_operation(
+                                                 package, item, exchange.id)) is not None and
+                                             matched.semantic_owner_success and
+                                             matched.key == owner_source.key), None)
+                        if actor_source is not None:
+                            break
+                    if actor_source is not None or page.next_cursor is None:
+                        break
+                    cursor = page.next_cursor
         field_control = (self._field_actor_control(
             package, operation, owner_source, boundary, objects, surface,
             candidate.field_path) if candidate.category == "FIELD_AUTH" and
@@ -1485,7 +1562,8 @@ class APISpecialist:
                                      *actor_object.evidence_ids)))[:16],
             tuple(dict.fromkeys((*owned.facts, *actor_object.facts)))[:8], now, now))
         context = auth.context.build(hypothesis, auth.hypotheses.latest_profile(package.target.id),
-                                     package)
+                                     package, traffic_exchange_ids=(owner_source.exchange_id,
+                                                                    actor_source.exchange_id))
         def bind(item, source, actor, role: str, variant: str,
                  selected_operation: APIOperation = operation) -> APIReadPlanBinding:
             return APIReadPlanBinding(
@@ -1515,6 +1593,10 @@ class APISpecialist:
                     identity_id=record.creator_identity_id, tenant_id=record.tenant_id,
                     parent_id=record.parent_id, test_object_id=record.id)
         except ValueError:
+            return self.registry.link_candidate(package.target.id, candidate.id,
+                                                status="REVIEW", hypothesis_id=hypothesis.id)
+        if operation.type is APIOperationType.REST and candidate.category == "OBJECT_AUTH" and \
+                not self._retain_rest_read_controls(package, operation, str(plan["id"])):
             return self.registry.link_candidate(package.target.id, candidate.id,
                                                 status="REVIEW", hypothesis_id=hypothesis.id)
         return self.registry.link_candidate(package.target.id, candidate.id, status="PLANNED",
@@ -1750,6 +1832,9 @@ class APISpecialist:
         if (candidate is None or candidate.status != "PLANNED" or
                 not candidate.plan_id or candidate.run_id):
             raise ValueError("API candidate has no ready plan")
+        if (operation.type is APIOperationType.REST and candidate.category == "OBJECT_AUTH" and
+                not self._retain_rest_read_controls(package, operation, candidate.plan_id)):
+            raise ValueError("Observed API controls are unavailable")
         if candidate.authorization_candidate_id:
             detail = auth.start_candidate(candidate.authorization_candidate_id, package)
             self._sync_authorization_candidate(package, candidate)

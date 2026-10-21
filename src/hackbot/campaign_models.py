@@ -39,6 +39,7 @@ TERMINAL_CAMPAIGN_STATUSES = frozenset({
 class CampaignPreset(StrEnum):
     SMALL = "SMALL"
     STANDARD = "STANDARD"
+    HUNT = "HUNT"
     CUSTOM = "CUSTOM"
 
 
@@ -75,6 +76,8 @@ class CampaignLimits:
             return cls()
         if value is CampaignPreset.STANDARD:
             return cls(3, 1200, 48, 24, 2, 8000, 2, 6)
+        if value is CampaignPreset.HUNT:
+            return cls(8, 7200, 160, 64, 4, 24000, 4, 12)
         raise ValueError("CUSTOM requires explicit limits")
 
     def to_dict(self) -> dict[str, int]:

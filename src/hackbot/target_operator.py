@@ -16,7 +16,8 @@ from .domain import new_entity_id, normalize_hostname
 from .target_loader import (TargetPackageRepository, _load_yaml, _read_bytes,
                             load_target_package)
 from .target_package import AccountReference, TargetPackage
-from .target_policy import AutonomyPolicy, PolicyDecision, RatePolicy
+from .target_policy import (AUTONOMY_ACTION_FIELDS, AUTONOMY_RISK_FIELDS,
+                            PolicyDecision, RatePolicy)
 from .target_scope import HostRule, ScopeSourceKind, validate_package_id
 
 
@@ -134,11 +135,11 @@ class TargetPackageOperator:
         if not isinstance(forbidden, list) or len(forbidden) > 50:
             raise TargetSetupError("invalid_field", "rules.forbidden_actions")
         forbidden = [_text(item, "rules.forbidden_actions", 128) for item in forbidden]
-        policy = _object(data.get("autonomy"), set(AutonomyPolicy.__dataclass_fields__), "autonomy")
-        risk_fields = ("passive", "safe_read", "bounded_active", "state_changing", "destructive")
-        if set(policy) != set(risk_fields):
+        policy = _object(data.get("autonomy"),
+                         set(AUTONOMY_RISK_FIELDS + AUTONOMY_ACTION_FIELDS), "autonomy")
+        if not set(AUTONOMY_RISK_FIELDS).issubset(policy):
             raise TargetSetupError("invalid_field", "autonomy")
-        for field in risk_fields:
+        for field in policy:
             if not isinstance(policy[field], str) or policy[field] not in {item.value for item in PolicyDecision}:
                 raise TargetSetupError("invalid_field", f"autonomy.{field}")
         rate = _object(data.get("rate"), set(RatePolicy.__dataclass_fields__), "rate")
@@ -239,6 +240,9 @@ class TargetPackageOperator:
             row = _object(raw, {"alias", "tenant", "role"}, "accounts")
             try:
                 alias = validate_package_id(row.get("alias"))
+            except ValueError:
+                raise TargetSetupError("invalid_field", "accounts.alias") from None
+            try:
                 tenant = _text(row["tenant"], "accounts.tenant", 128) if row.get("tenant") else None
                 role = _text(row["role"], "accounts.role", 128) if row.get("role") else None
                 AccountReference(alias, role_hint=role, tenant_hint=tenant)

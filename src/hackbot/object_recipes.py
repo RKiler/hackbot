@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+import uuid
 
 from .config import ObjectSettings
 from .authorization_binding import single_rename_operation
@@ -18,6 +21,8 @@ from .executor import RequestTemplate
 from .logging import SecretRedactor, is_sensitive_key
 from .policy import _strict_url_reason
 from .policy_models import SideEffect
+from .target_package import TargetPackage
+from .target_scope import ScopeResult
 from .test_objects import CleanupStrategy
 from .typed_mutations import MutationType
 
@@ -95,6 +100,7 @@ class RecipeOperation:
     operation: str
     body: object | None = None
     side_effect: SideEffect | None = None
+    content_type: str = "application/json"
 
     def __post_init__(self) -> None:
         if self.method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
@@ -103,6 +109,8 @@ class RecipeOperation:
             raise ValueError("invalid recipe operation")
         if self.side_effect is not None and not isinstance(self.side_effect, SideEffect):
             raise ValueError("invalid recipe side effect")
+        if self.content_type not in {"application/json", "application/x-www-form-urlencoded"}:
+            raise ValueError("unsupported recipe content type")
         candidate = self.url.replace("{object_id}", "fixture123").replace("{parent_id}", "fixture123")
         if (_strict_url_reason(candidate) is not None or self.url.count("{object_id}") > 1
                 or self.url.count("{parent_id}") > 1 or
@@ -111,6 +119,10 @@ class RecipeOperation:
         if urlsplit(candidate).query:
             raise ValueError("recipe URLs must not contain query strings")
         _validate_body(self.body)
+        if self.content_type == "application/x-www-form-urlencoded" and (
+                self.method != "POST" or not isinstance(self.body, dict) or
+                len(self.body) != 1 or self.body != {"name": "$test_name"}):
+            raise ValueError("form recipe requires one disposable name field")
         if self.body is not None and self.method in {"GET", "HEAD"}:
             raise ValueError("read operation cannot have a body")
 
@@ -138,11 +150,15 @@ class RecipeOperation:
                 return [render(item) for item in value]
             return value
 
-        body = json.dumps(render(self.body), separators=(",", ":")).encode() if self.body is not None else None
+        rendered = render(self.body) if self.body is not None else None
+        body = (urlencode(rendered).encode()
+                if self.content_type == "application/x-www-form-urlencoded" else
+                json.dumps(rendered, separators=(",", ":")).encode()
+                if rendered is not None else None)
         if body is not None and len(body) > 16384:
             raise ValueError("rendered recipe body exceeds limit")
         return RequestTemplate(self.method, url,
-                               (("Content-Type", "application/json"),) if body else (), body)
+                               (("Content-Type", self.content_type),) if body else (), body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +291,8 @@ class ObjectRecipe:
             raw = obj.get(key)
             if raw is None:
                 return None
-            value = _mapping(raw, {"method", "url", "operation", "body", "side_effect"},
+            value = _mapping(raw, {"method", "url", "operation", "body", "side_effect",
+                                   "content_type"},
                              {"method", "url", "operation"})
             if "side_effect" in value:
                 value = {**value, "side_effect": SideEffect(value["side_effect"])}
@@ -306,7 +323,8 @@ class ObjectRecipe:
                     "type", "field", "readback_pointer", "side_effect", "identity_requirement")):
                 raise ValueError("invalid mutation recipe metadata")
             def embedded(key: str) -> RecipeOperation:
-                spec = _mapping(entry[key], {"method", "url", "operation", "body", "side_effect"},
+                spec = _mapping(entry[key], {"method", "url", "operation", "body", "side_effect",
+                                             "content_type"},
                                 {"method", "url", "operation"})
                 if "side_effect" in spec:
                     spec = {**spec, "side_effect": SideEffect(spec["side_effect"])}
@@ -381,3 +399,70 @@ class RecipeCatalog:
                 items.append({"id": recipe.id, "object_type": recipe.object_type,
                               "protocol": recipe.protocol, "cleanup_strategy": recipe.cleanup_strategy.value})
         return tuple(items)
+
+    def add_learned(self, package: TargetPackage, payload: dict[str, object]) -> ObjectRecipe:
+        """Create one validated data-only recipe without replacing existing files."""
+        recipe = ObjectRecipe.from_json(payload)
+        if (recipe.source != "learned_form_js" or recipe.package_id != package.id or
+                recipe.target_id != package.target.id):
+            raise ValueError("learned recipe target mismatch")
+        for operation in (recipe.create, recipe.verify, recipe.cleanup, recipe.update):
+            if operation is None:
+                continue
+            candidate = operation.url.replace("{object_id}", "fixture123").replace(
+                "{parent_id}", "fixture123")
+            if package.scope.evaluate_url(candidate).result is not ScopeResult.IN_SCOPE:
+                raise ValueError("learned recipe operation outside target scope")
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        if len(body) > 65536:
+            raise ValueError("learned recipe exceeds size limit")
+        root = self.settings.recipe_root.resolve()
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root_fd = os.open(root, flags)
+        try:
+            try:
+                os.mkdir(package.id, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            folder_fd = os.open(package.id, flags, dir_fd=root_fd)
+            try:
+                info = os.fstat(folder_fd)
+                if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+                    raise ValueError("recipe folder is not privately owned")
+                filename = recipe.id + ".json"
+                try:
+                    existing_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW,
+                                          dir_fd=folder_fd)
+                except FileNotFoundError:
+                    existing_fd = None
+                if existing_fd is not None:
+                    try:
+                        existing = os.read(existing_fd, 65537)
+                    finally:
+                        os.close(existing_fd)
+                    if existing != body:
+                        raise ValueError("learned recipe conflicts with existing file")
+                    return recipe
+                temporary = "." + recipe.id + "." + uuid.uuid4().hex + ".tmp"
+                temporary_fd = os.open(temporary,
+                                       os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                       0o600, dir_fd=folder_fd)
+                try:
+                    with os.fdopen(temporary_fd, "wb", closefd=True) as stream:
+                        stream.write(body)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    try:
+                        os.link(temporary, filename, src_dir_fd=folder_fd,
+                                dst_dir_fd=folder_fd, follow_symlinks=False)
+                    except FileExistsError as exc:
+                        raise ValueError("learned recipe was created concurrently") from exc
+                    os.fsync(folder_fd)
+                finally:
+                    os.unlink(temporary, dir_fd=folder_fd)
+                return recipe
+            finally:
+                os.close(folder_fd)
+        finally:
+            os.close(root_fd)

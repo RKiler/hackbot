@@ -64,7 +64,7 @@ class StoreTests(unittest.TestCase):
             schema = connection.execute(
                 "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
-        self.assertEqual(version, 48)
+        self.assertEqual(version, 51)
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
         self.store.initialize()
         reopened = EvidenceFactStore(self.db_path, ArtifactStore(self.blobs), self.store.settings)
@@ -75,12 +75,43 @@ class StoreTests(unittest.TestCase):
             ).fetchall())
         self.assertEqual(reopened.list_evidence().items, ())
 
+    def test_schema_48_migration_preserves_history_and_frees_deleted_package_id(self):
+        with patch("hackbot.store._SCHEMA_VERSION", 48):
+            self.store.initialize()
+        old_id = "TARGET-" + "a" * 32
+        new_id = "TARGET-" + "b" * 32
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+                               (old_id, "reusable", NOW.isoformat()))
+            connection.execute("""INSERT INTO registry_roles
+                (role_id,target_id,name,observation_state,evidence_ids_json,
+                 source_provider,source_entity,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""", (
+                    "ROLE-" + "c" * 32, old_id, "historical", "CONFIGURED", "[]",
+                    None, None, NOW.isoformat()))
+            connection.execute("INSERT INTO service_events(occurred_at,event_type,target_id) VALUES (?,?,?)",
+                               (NOW.isoformat(), "target_deleted", old_id))
+        self.store.initialize(allow_existing_migration=True)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
+            self.assertIsNotNone(connection.execute(
+                "SELECT deleted_at FROM registry_targets WHERE target_id=?", (old_id,)).fetchone()[0])
+            connection.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
+                               (new_id, "reusable", NOW.isoformat()))
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
+                                   ("TARGET-" + "d" * 32, "reusable", NOW.isoformat()))
+            self.assertEqual(connection.execute("SELECT target_id FROM registry_roles").fetchone()[0], old_id)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_idle_connection_is_reused_but_nested_and_other_threads_are_isolated(self):
         self.store.initialize()
         with self.store._connection() as first:
             with self.store._connection() as nested:
                 self.assertIsNot(first, nested)
-                self.assertEqual(nested.execute("PRAGMA user_version").fetchone()[0], 48)
+                self.assertEqual(nested.execute("PRAGMA user_version").fetchone()[0], 51)
         self.assertFalse(first.in_transaction)
         with self.store._connection() as reused:
             self.assertIs(first, reused)
@@ -135,20 +166,20 @@ class StoreTests(unittest.TestCase):
             with self.store._connection():
                 pass
         with sqlite3.connect(self.db_path) as connection:
-            connection.execute("PRAGMA user_version=48")
+            connection.execute("PRAGMA user_version=51")
         with self.store._connection() as restored:
             self.assertIsNot(fresh, restored)
 
     def test_replaced_database_file_invalidates_cached_connection(self):
         self.store.initialize()
         with self.store._connection() as original:
-            self.assertEqual(original.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(original.execute("PRAGMA user_version").fetchone()[0], 51)
         replacement = self.db_path.with_name("replacement.sqlite3")
         shutil.copy2(self.db_path, replacement)
         os.replace(replacement, self.db_path)
         with self.store._connection() as reopened:
             self.assertIsNot(original, reopened)
-            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 51)
 
     def test_future_schema_is_rejected_without_mutation(self):
         self.store.initialize()
@@ -222,7 +253,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=38")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM evidence WHERE evidence_id=?",
                 (original.evidence_id,)).fetchone()[0], 1)
@@ -245,7 +276,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=33")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertIsNotNone(connection.execute("SELECT 1 FROM sqlite_master WHERE "
                 "type='table' AND name='research_briefs'").fetchone())
             self.assertEqual(connection.execute("SELECT count(*) FROM evidence WHERE evidence_id=?",
@@ -261,7 +292,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=29")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' "
                 "AND name='api_js_artifacts_target_hash_state'").fetchone())
@@ -279,7 +310,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=30")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='api_inventory_progress'").fetchone())
@@ -320,7 +351,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=14")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             names = {row[1] for row in connection.execute(
                 "PRAGMA table_info(plan_object_requirements)")}
             self.assertIn("test_object_id", names)
@@ -339,7 +370,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=31")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             schema = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
                 "AND name='authorization_mutation_results'").fetchone()[0]
@@ -355,7 +386,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=32")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             names = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'")}
             self.assertIn("authorization_mutations_delete_exchange", names)

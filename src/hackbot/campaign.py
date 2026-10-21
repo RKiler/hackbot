@@ -5,10 +5,16 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
+from statistics import median
 from typing import TYPE_CHECKING
 
+from .adaptive_hunt import (AdaptiveDecision, AdaptiveSignals,
+                            TARGET_THROTTLE_COOLDOWN_SECONDS,
+                            choose_cycle_budget)
+from .api_registry import APIOperationType
 from .behaviour import LearningLimits, LearningStatus
 from .bootstrap_store import BootstrapIdentityPolicy, BootstrapLimits, BootstrapStatus
+from .burp import BurpError
 from .campaign_models import (
     Campaign, CampaignLimits, CampaignStatus, CampaignWorkKind,
     CampaignWorkStatus, TERMINAL_CAMPAIGN_STATUSES,
@@ -216,6 +222,78 @@ class CampaignCoordinator:
                 "ORDER BY p.finding_id LIMIT 100", (campaign_id, target_id)).fetchall()
         return tuple(dict(row) for row in rows)
 
+    def overview(self, package: TargetPackage, campaign_id: str) -> dict[str, object]:
+        campaign = self.store.get(package.target.id, campaign_id)
+        if campaign is None or campaign.package_id != package.id:
+            raise LookupError("Campaign not found")
+        planners = []
+        for work in self.store.works(campaign.target_id, campaign.id):
+            if work.kind is CampaignWorkKind.PLANNER and work.child_id:
+                planner = self.runtime.planner_store.get(campaign.target_id,
+                                                         work.child_id)
+                if planner is not None:
+                    planners.append(planner)
+        with self.runtime.store._connection() as db:
+            rejected = db.execute(
+                "SELECT count(*) FROM planner_candidates AS c "
+                "JOIN campaign_work AS w ON w.child_id=c.run_id "
+                "WHERE w.campaign_id=? AND w.kind='PLANNER' AND "
+                "c.status='REJECTED' AND c.validation_id IS NOT NULL",
+                (campaign.id,)).fetchone()[0]
+        objects = self.store.objects(campaign.target_id, campaign.id)
+        findings = self.finding_links(campaign.target_id, campaign.id)
+        try:
+            resource = self.runtime.resources.snapshot()
+        except ResourceError as exc:
+            resource = None
+            resource_view = {"state": "UNAVAILABLE", "warnings": [exc.reason_code]}
+        else:
+            resource_view = {"state": resource.state,
+                             "warnings": list(resource.warnings),
+                             "load_per_cpu": resource.load_per_cpu,
+                             "memory_available_bytes": resource.memory_available_bytes,
+                             "swap_used_percent": resource.swap_used_percent,
+                             "disk_used_percent": resource.disk_used_percent}
+        adaptive = None
+        if campaign.mode is PlannerMode.BOUNDED_AUTONOMOUS and resource is not None:
+            try:
+                signals = self._adaptive_signals(campaign)
+                remaining = self._remaining(campaign)
+                decision = choose_cycle_budget(
+                    signals, requests=min(remaining["requests"], 20),
+                    browser_actions=min(remaining["browser_actions"], 12),
+                    candidates=8)
+                adaptive = {**decision.to_dict(),
+                            "browsers_active": signals.browsers_active,
+                            "browser_limit": signals.browser_limit,
+                            "burp_listeners_active": signals.burp_listeners_active,
+                            "burp_listener_capacity": signals.burp_listener_capacity,
+                            "burp_dropped_events": signals.burp_dropped_events,
+                            "median_latency_ms": signals.median_latency_ms,
+                            "duplicate_candidates": signals.duplicate_candidates,
+                            "candidates_considered": signals.candidates_considered}
+            except (ResourceError, BurpError) as exc:
+                adaptive = {"pause_reason": getattr(exc, "reason_code",
+                                                    "BURP_CAPTURE_UNAVAILABLE")}
+        return {
+            "status": campaign.status.value,
+            "reason": campaign.stop_reason or campaign.readiness_code,
+            "cycle": campaign.current_cycle,
+            "max_cycles": campaign.limits.max_cycles,
+            "requests_used": campaign.usage.requests + campaign.usage.cleanup_requests,
+            "requests_limit": campaign.limits.requests,
+            "candidates": sum(run.candidate_count for run in planners),
+            "selected": sum(run.selected_count for run in planners),
+            "experiments": sum(run.plans_executed for run in planners),
+            "validations": sum(run.validations for run in planners),
+            "rejected_validations": rejected,
+            "findings": len(findings),
+            "report_drafts": sum(item["report_id"] is not None for item in findings),
+            "cleanup_pending": sum(item["cleanup_status"] != "CLEANED" for item in objects),
+            "resource": resource_view,
+            "adaptive": adaptive,
+        }
+
     def _resource(self, kind: WorkKind) -> str | None:
         active_sets = {
             WorkKind.PLANNER: self.runtime._planner_threads,
@@ -229,6 +307,58 @@ class CampaignCoordinator:
         except ResourceError as exc:
             return exc.reason_code
         return None
+
+    def _adaptive_signals(self, campaign: Campaign) -> AdaptiveSignals:
+        resource = self.runtime.resources.snapshot()
+        with self.runtime.store._connection() as db:
+            browsers = db.execute(
+                "SELECT count(*) FROM browser_sessions AS s WHERE status NOT IN "
+                "('STOPPED','FAILED','EXPIRED') AND NOT EXISTS "
+                "(SELECT 1 FROM browser_session_events AS e WHERE "
+                "e.session_id=s.session_id AND e.event_type='browser_deleted')"
+            ).fetchone()[0]
+            rows = db.execute(
+                "SELECT r.status_code,r.elapsed_ms,r.observed_at FROM "
+                "traffic_exchanges AS e JOIN traffic_responses AS r "
+                "ON r.request_id=e.request_id WHERE e.target_id=? "
+                "AND e.observed_at>=? AND e.scope_result='IN_SCOPE' "
+                "AND e.source IN ('HACKBOT','BROWSER','BURP') "
+                "ORDER BY e.observed_at DESC,e.exchange_id DESC LIMIT 32",
+                (campaign.target_id, campaign.started_at or campaign.created_at)
+            ).fetchall()
+        burp = self.runtime.burp.status()
+        latencies = [row["elapsed_ms"] for row in rows
+                     if row["elapsed_ms"] is not None]
+        latest_429_age = None
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            if row["status_code"] != 429:
+                continue
+            try:
+                observed = datetime.fromisoformat(row["observed_at"])
+                if observed.tzinfo is None:
+                    continue
+                latest_429_age = max(0, int((now - observed).total_seconds()))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            break
+        candidates = ()
+        for work in reversed(self.store.works(campaign.target_id, campaign.id)):
+            if work.kind is CampaignWorkKind.PLANNER and work.child_id:
+                candidates = self.runtime.planner_store.candidates(
+                    campaign.target_id, work.child_id, limit=200)
+                break
+        return AdaptiveSignals(
+            resource=resource, browsers_active=browsers,
+            browser_limit=self.runtime.resources.settings.max_browser_sessions,
+            burp_listeners_active=int(burp.get("configured_listeners") or 0),
+            burp_listener_capacity=int(burp.get("proxy_listener_capacity") or 0),
+            burp_dropped_events=int(burp.get("dropped_events") or 0),
+            median_latency_ms=int(median(latencies)) if latencies else None,
+            latest_429_age_seconds=latest_429_age,
+            duplicate_candidates=sum(item.status is CandidateStatus.DUPLICATE
+                                     for item in candidates),
+            candidates_considered=len(candidates))
 
     def _pause_for_resource(self, campaign: Campaign, reason: str) -> Campaign:
         return self.store.transition(campaign.target_id, campaign.id,
@@ -262,6 +392,100 @@ class CampaignCoordinator:
             if candidate.state_hash:
                 self.store.suppress(campaign.target_id, campaign.id,
                                     candidate.root_cause_key, candidate.state_hash, kind)
+
+    def _reverify_rejected_read_branch(self, package: TargetPackage, campaign: Campaign,
+                                       work_id: str, planner_run_id: str) -> str | None:
+        hunts = getattr(self.runtime, "hunts", None)
+        if hunts is None:
+            return None
+        hunt = hunts.for_campaign(campaign.target_id, campaign.id)
+        if hunt is None or campaign.mode is not PlannerMode.BOUNDED_AUTONOMOUS:
+            return None
+        fixtures = {row["test_object_id"] for row in
+                    self.runtime.hunts.fixtures(campaign.target_id, hunt.id)}
+        candidates = self.runtime.planner_store.candidates(
+            campaign.target_id, planner_run_id, limit=200)
+        deferred_objects = {
+            source.test_object_id for candidate in candidates
+            if candidate.source_kind == "API_GRAPHQL" and
+            candidate.status is CandidateStatus.DEFERRED and
+            "OWNED_OBJECT_RESERVED_FOR_BRANCH" in candidate.reason_codes
+            if (source := self.runtime.api_operations.get_candidate(
+                campaign.target_id, candidate.source_id)) is not None
+        }
+        for candidate in candidates:
+            if (candidate.source_kind != "API_GRAPHQL" or
+                    candidate.status is not CandidateStatus.REJECTED or
+                    not candidate.plan_id or not candidate.plan_run_id):
+                continue
+            source = self.runtime.api_operations.get_candidate(
+                campaign.target_id, candidate.source_id)
+            if source is None or source.test_object_id not in deferred_objects:
+                continue
+            operation = self.runtime.api_operations.get_operation(
+                campaign.target_id, source.operation_id)
+            child = self.runtime.run_store.get(candidate.plan_run_id, campaign.target_id)
+            if (source.category != "OBJECT_AUTH" or operation is None or
+                    operation.type is not APIOperationType.REST or
+                    operation.method not in {"GET", "HEAD"} or
+                    child is None or child.status.value != "COMPLETED"):
+                continue
+            requirements = self.runtime.objects.requirements(candidate.plan_id,
+                                                            campaign.target_id)
+            required_ids = tuple(dict.fromkeys(row["test_object_id"] for row in requirements
+                                               if row["test_object_id"] is not None))
+            if not required_ids or any(object_id not in fixtures for object_id in required_ids):
+                continue
+            for object_id in required_ids:
+                item = self.runtime.objects.get(object_id, campaign.target_id)
+                if item is None:
+                    return "OBJECT_RECHECK_MISSING"
+                if item.state is ObjectState.READY:
+                    continue
+                if (item.state is not ObjectState.CLEANUP_PENDING or
+                        self.runtime.objects.active_reservation(object_id)):
+                    return "OBJECT_RECHECK_STATE_CHANGED"
+                session = self.runtime.browser.get_active_session(
+                    campaign.target_id, item.creator_identity_id)
+                if session is None or not self.runtime.burp.ready(session.id):
+                    return "OBJECT_RECHECK_LOGIN_REQUIRED"
+                if not self.store.reserve_object_recheck(campaign.target_id,
+                                                         campaign.id, work_id, object_id):
+                    return "OBJECT_RECHECK_BUDGET_OR_REPLAY"
+                action_id = "ACTION-" + hashlib.sha256(
+                    (campaign.id + ":" + planner_run_id + ":" + object_id).encode()
+                ).hexdigest()[:32]
+                try:
+                    result = self.runtime.object_factory.reverify_for_reuse(
+                        object_id, campaign.target_id, session_id=session.id,
+                        action_id=action_id)
+                except (LookupError, ValueError):
+                    return "OBJECT_RECHECK_UNAVAILABLE"
+                if result.outcome != "READY":
+                    return "OBJECT_RECHECK_REVIEW_REQUIRED"
+        return None
+
+    def _has_viable_deferred_branch(self, campaign: Campaign,
+                                    planner_run_id: str) -> bool:
+        remaining = self._remaining(campaign)
+        request_cap = min(remaining["requests"], 20)
+        browser_cap = min(remaining["browser_actions"], 12)
+        token_cap = min(remaining["tokens"], 2000)
+        blocked = {"API_PROOF_PREREQUISITES_MISSING", "BOUND_OBJECT_NOT_READY",
+                   "CAMPAIGN_SOURCE_ALREADY_ATTEMPTED"}
+        for candidate in self.runtime.planner_store.candidates(
+                campaign.target_id, planner_run_id, limit=200):
+            if (candidate.status is not CandidateStatus.DEFERRED or
+                    candidate.priority < 50 or candidate.freshness != "CURRENT" or
+                    blocked.intersection(candidate.reason_codes) or
+                    candidate.estimated_requests > request_cap or
+                    candidate.estimated_browser > browser_cap or
+                    candidate.estimated_tokens > token_cap):
+                continue
+            if ("OWNED_OBJECT_RESERVED_FOR_BRANCH" in candidate.reason_codes or
+                    not candidate.gaps):
+                return True
+        return False
 
     def _cleanup(self, package: TargetPackage, campaign: Campaign,
                  desired: CampaignStatus, reason: str) -> Campaign:
@@ -417,8 +641,23 @@ class CampaignCoordinator:
         if reason:
             return self._pause_for_resource(campaign, reason)
         active = campaign.mode is PlannerMode.BOUNDED_AUTONOMOUS
-        request_cap = min(remaining["requests"], 20)
-        browser_cap = min(remaining["browser_actions"], 12)
+        if active:
+            try:
+                decision = choose_cycle_budget(
+                    self._adaptive_signals(campaign),
+                    requests=min(remaining["requests"], 20),
+                    browser_actions=min(remaining["browser_actions"], 12),
+                    candidates=8)
+            except ResourceError as exc:
+                return self._pause_for_resource(campaign, exc.reason_code)
+            if decision.pause_reason:
+                return self._pause_for_resource(campaign, decision.pause_reason)
+        else:
+            decision = AdaptiveDecision(min(remaining["requests"], 20),
+                                        min(remaining["browser_actions"], 12),
+                                        8, None, ())
+        request_cap = decision.requests
+        browser_cap = decision.browser_actions
         token_cap = min(remaining["tokens"], 2000)
         research_cap = min(remaining["research_requests"], 1) if active else 0
         setup_cap = min(remaining["setup_objects"], 1) if active else 0
@@ -430,12 +669,21 @@ class CampaignCoordinator:
             setup_objects=setup_cap)
         limits = PlannerLimits(
             requests=request_cap, browser_actions=browser_cap, tokens=token_cap,
-            seconds=max(1, min(remaining["seconds"], 300)), candidates=8,
-            per_specialist=3, cleanup_reserve=0)
+            seconds=max(1, min(remaining["seconds"], 300)),
+            candidates=decision.candidates,
+            per_specialist=min(3, decision.candidates), cleanup_reserve=0)
         focus = self.store.delta_focus(campaign.target_id, campaign.id)
+        attempted_sources = frozenset(
+            (candidate.source_kind, candidate.source_id)
+            for previous in self.store.works(campaign.target_id, campaign.id)
+            if previous.kind is CampaignWorkKind.PLANNER and previous.child_id
+            for candidate in self.runtime.planner_store.candidates(
+                campaign.target_id, previous.child_id, limit=200)
+            if candidate.plan_run_id or candidate.validation_id)
         with self.runtime._planner_lock:
             run = self.runtime.planner.start(package, mode=campaign.mode,
                                              limits=limits, campaign_work_id=work.id,
+                                             suppressed_sources=attempted_sources,
                                              focused_hypothesis_ids=(
                                                  frozenset(focus["hypothesis_ids"])
                                                  if focus else None),
@@ -544,8 +792,14 @@ class CampaignCoordinator:
                                                  "PLANNER_" + child.status.value)
                 if child.status not in TERMINAL_STATUSES:
                     return self.store.get(campaign.target_id, campaign.id) or campaign
+                recheck = self._reverify_rejected_read_branch(package, campaign,
+                                                              active.id, child.id)
+                if recheck:
+                    return self.store.transition(campaign.target_id, campaign.id,
+                                                 CampaignStatus.WAITING_HUMAN, recheck)
                 self.store.finish_work(campaign.target_id, campaign.id, active.id,
                                        reason="PLANNER_SETTLED")
+                campaign = self.store.get(campaign.target_id, campaign.id) or campaign
                 if campaign.mode is PlannerMode.ANALYZE_ONLY or child.selected_count == 0:
                     return self._cleanup(package, campaign, CampaignStatus.COMPLETED,
                                          "NO_READY_WORK")
@@ -553,17 +807,28 @@ class CampaignCoordinator:
                     return self._cleanup(package, campaign, CampaignStatus.COMPLETED,
                                          "CYCLE_CAP_REACHED")
                 context, _ = self._readiness(package, campaign)
-                if context.snapshot_hash == child.context_hash:
+                if (context.snapshot_hash == child.context_hash and
+                        not self._has_viable_deferred_branch(campaign, child.id)):
                     return self._cleanup(package, campaign, CampaignStatus.COMPLETED,
                                          "KNOWLEDGE_STABLE")
                 return self.store.transition(campaign.target_id, campaign.id,
                                              CampaignStatus.ASSESSING_READINESS,
+                                             "DEFERRED_BRANCH_READY" if
+                                             context.snapshot_hash == child.context_hash else
                                              "KNOWLEDGE_CHANGED")
             return self._settle_prerequisite(campaign, active)
         if campaign.status is CampaignStatus.ASSESSING_READINESS:
             reason = self._resource(WorkKind.CAMPAIGN)
             if reason:
                 return self._pause_for_resource(campaign, reason)
+            if campaign.mode is PlannerMode.BOUNDED_AUTONOMOUS:
+                try:
+                    latest_429_age = self._adaptive_signals(campaign).latest_429_age_seconds
+                except ResourceError as exc:
+                    return self._pause_for_resource(campaign, exc.reason_code)
+                if (latest_429_age is not None and
+                        latest_429_age < TARGET_THROTTLE_COOLDOWN_SECONDS):
+                    return self._pause_for_resource(campaign, "TARGET_THROTTLED")
             if campaign.current_cycle >= campaign.limits.max_cycles:
                 return self._cleanup(package, campaign, CampaignStatus.COMPLETED,
                                      "CYCLE_CAP_REACHED")

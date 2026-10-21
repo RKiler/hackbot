@@ -83,6 +83,75 @@ class APIReadPlanningTests(unittest.TestCase):
                          ["OWNER", "OWNER", "INVALID_OBJECT", "FOREIGN", "FOREIGN"])
         self.assertEqual(len(self.case.fx.server.received), before)
 
+    def test_rest_object_plan_recovers_bounded_captured_controls_after_profile_drift(self):
+        fx = self.case.fx
+        fx.package = replace(fx.package, autonomy=replace(
+            fx.package.autonomy, bounded_active=PolicyDecision.ALLOW,
+            cross_identity_testing=PolicyDecision.ALLOW))
+        fx.targets.package = fx.package
+        exchanges = []
+        for identity, session, item in ((self.owner, self.owner_session, self.owned),
+                                        (self.foreign, self.foreign_session,
+                                         self.foreign_object)):
+            external = self.case.specialist._external_id(item)
+            exchange = self.case.fx.traffic.store_request(
+                self.case.fx.package,
+                CapturedRequest("GET", self.case.fx.base + "/fixture/projects/" + external),
+                source=TrafficSource.FIXTURE, capture_provider="FIXTURE",
+                browser_manager=self.case.fx.browser, browser_session_id=session.id,
+                auth_material_observed=True)
+            body = json.dumps(self.case.fx.server.fixture_objects[external]).encode()
+            self.case.fx.traffic.store_response(
+                exchange.id, CapturedResponse(200, (("Content-Type", "application/json"),),
+                                              body))
+            exchanges.append(exchange.id)
+        candidates = self.api.generate(self.case.fx.package)
+        candidate = next(item for item in candidates
+                         if item.category == "OBJECT_AUTH" and
+                         item.owner_exchange_id == exchanges[0] and item.status == "READY")
+        with self.case.fx.store._connection() as db:
+            db.execute("UPDATE api_operations SET exchange_ids_json=? WHERE operation_id=?",
+                       (json.dumps([exchanges[0]]), candidate.operation_id))
+        for number in range(60):
+            exchange = self.case.fx.traffic.store_request(
+                self.case.fx.package,
+                CapturedRequest("GET", self.case.fx.base + f"/fixture/noise/{number}"),
+                source=TrafficSource.FIXTURE, capture_provider="FIXTURE",
+                browser_manager=self.case.fx.browser,
+                browser_session_id=self.owner_session.id, auth_material_observed=True)
+            self.case.fx.traffic.store_response(
+                exchange.id, CapturedResponse(404, (), b""))
+        prepared = self.api.prepare_candidate(self.case.fx.package, candidate.id)
+        surface = self.case.specialist.profile(self.case.fx.package)
+        owner_object = next(item for item in surface.objects if item.id == self.owned.id)
+        actor_object = next(item for item in surface.objects
+                            if item.id == self.foreign_object.id)
+        owner_source = self.case.specialist.observed_operation(
+            self.case.fx.package, owner_object, exchanges[0])
+        actor_source = self.case.specialist.observed_operation(
+            self.case.fx.package, actor_object, exchanges[1])
+        self.assertEqual(prepared.status, "PLANNED", (
+            owner_source.key if owner_source else None,
+            actor_source.key if actor_source else None,
+            len(surface.operations),
+            [(actor.identity_id, actor.session_id, actor.observed_tenants)
+             for actor in surface.actors],
+            [(item.id, item.tenant_id, item.owner_identity_id)
+             for item in surface.objects],
+            self.registry.get_operation(self.case.target,
+                                        candidate.operation_id).exchange_ids,
+            candidate.to_dict(), prepared.to_dict()))
+        runs = PlanRunStore(fx.store)
+        self.case.specialist.orchestrator = PlanOrchestrator(
+            runs=runs, targets=fx.targets, hypotheses=self.case.hypotheses,
+            context=self.case.specialist.context,
+            checker=self.case.specialist.planner.checker,
+            registry=self.case.specialist.planner.registry,
+            policy=fx.policy, approvals=PolicyStore(fx.store), executor=fx.executor,
+            traffic=fx.traffic, evidence=fx.store, objects=fx.objects)
+        detail = self.api.start_candidate(fx.package, candidate.id)
+        self.assertIn(detail["run"]["status"], {"CREATED", "READY"})
+
     def test_prior_confirmed_phase19_object_boundary_needs_no_new_api_requests(self):
         fx = self.case.fx
         fx.package = replace(fx.package, autonomy=replace(

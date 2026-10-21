@@ -29,7 +29,10 @@ from .api_registry import APIOperationRegistry
 from .api_specialist import APIAnalysisLimits, APISpecialist
 from .browser import (BrowserError, BrowserSession, BrowserSessionManager,
                       BrowserStatus, IdentityVerificationRule)
-from .browser_playwright import PlaywrightBrowserDriver
+from .browser_actor import PlaywrightBrowserActor
+from .browser_navigation import BrowserActionExecutor
+from .application_mapper import ApplicationMapper
+from .captured_js import CapturedJSCollector
 from .bootstrap import TargetBootstrapper
 from .bootstrap_store import (BootstrapIdentityPolicy, BootstrapLimits, BootstrapStatus,
                               BootstrapStore)
@@ -37,8 +40,10 @@ from .behaviour import BehaviourStore, LearningLimits, LearningStatus, NormalBeh
 from .burp import BurpError, BurpExecutionProxyAdapter, BurpProxyProvider
 from .burp_storage import inspect_burp_storage
 from .burp_bridge import BurpBridgeServer, BurpCaptureProvider
+from .adaptive_hunt import TARGET_THROTTLE_COOLDOWN_SECONDS
 from .campaign import CampaignCoordinator
 from .campaign_models import (CampaignLimits, CampaignPreset, CampaignStatus,
+                              CampaignWorkStatus,
                               TERMINAL_CAMPAIGN_STATUSES)
 from .delta_coordinator import DeltaCoordinator
 from .delta_models import ContinuousSettings, DeltaCadence, DeltaStatus
@@ -49,6 +54,7 @@ from .config import (AppConfig, ConfigError, ExecutorSettings, NotificationSetti
 from .domxss import DOMXSSSpecialist
 from .domxss_browser import DOMBrowserExperimentExecutor
 from .domxss_store import DOMXSSStore
+from .domxss_static import DOMStaticAnalyzer
 from .exposure import ExposureSpecialist
 from .exposure_models import ExposureCategory, ExposureStatus
 from .exposure_store import ExposureStore
@@ -59,13 +65,15 @@ from .process_health import inspect_owned_processes
 from .profile_retention import BrowserProfileCollector, ProfileRetentionPolicy
 from .executor import TrafficExecutor
 from .hypotheses import ContextPacketBuilder, HypothesisGenerator, HypothesisStore
+from .hunt_store import HuntMode, HuntRun, HuntState, HuntStore
+from .hunt_supervisor import HuntSupervisor
 from .identity_registry import IdentityRegistry
 from .finding_workflow import FindingWorkflow
 from .logging import SecretRedactor, create_logger
 from .maintenance import MaintenanceCoordinator, MaintenanceError
 from .notification_store import NotificationPriority, NotificationStore, NotificationType
 from .notifications import ConsoleNotifier, DiscordNotifier, NotificationManager, SMTPNotifier
-from .policy import PolicyEngine, policy_version
+from .policy import PolicyEngine, policy_version, supervised_hunt_policy
 from .policy_models import ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect
 from .policy_store import PolicyStore
 from .permit_store import PolicyPermitStore
@@ -89,7 +97,9 @@ from .research import ResearchBudget, ResearchCoordinator, ResearchStatus, Resea
 from .research_sources import BraveWebResearchProvider, FindingKnowledgeProvider, SkillKnowledgeProvider
 from .retention import ArtifactGarbageCollector, OrphanPolicy
 from .reports import ReportGenerator, ReportStore
-from .resources import ResourceBudgetManager, ResourceError, ResourceSnapshot, WorkKind
+from .resources import (RECOVERABLE_CAMPAIGN_PAUSE_REASONS,
+                        ResourceBudgetManager,
+                        ResourceError, ResourceSnapshot, WorkKind)
 from .recon_postgres import PostgresReconRepository, ReconQueryError
 from .secrets import RoutedSecretProvider
 from .skills import SkillRegistry
@@ -100,8 +110,9 @@ from .artifacts import ArtifactStore
 from .target_loader import TargetPackageRepository
 from .target_operator import TargetPackageOperator, TargetSetupError
 from .target_package import PackageStatus, TargetPackage
-from .target_policy import PolicyDecision, RatePolicy, RiskLevel
-from .target_scope import ScopeSourceKind
+from .target_policy import (AUTONOMY_ACTION_FIELDS, AUTONOMY_RISK_FIELDS,
+                            AutonomyPolicy, PolicyDecision, RatePolicy, RiskLevel)
+from .target_scope import ScopeSourceKind, validate_package_id
 from .traffic import TrafficRetentionPolicy, TrafficStore
 from .validation_store import FindingStatus, ValidationStatus, ValidationStore
 from .validator import DeterministicValidatorEngine, ValidatorRegistry
@@ -163,7 +174,7 @@ class BugHunterRuntime:
         self.store.artifacts.prepare()
         self.registry = IdentityRegistry(self.store)
         self.auth = AuthContextManager(self.registry, RoutedSecretProvider(config.secrets))
-        self.driver = driver or PlaywrightBrowserDriver(config.browser.chromium_executable)
+        self.driver = driver or PlaywrightBrowserActor(config.browser.chromium_executable)
         self.browser = BrowserSessionManager(self.registry, self.auth, self.driver, config.browser)
         self.maintenance = MaintenanceCoordinator(
             config.paths.state / "maintenance.json", BackupManager.from_config(config),
@@ -249,6 +260,16 @@ class BugHunterRuntime:
             proxy=BurpExecutionProxyAdapter(self.burp), browser=self.browser,
             retention=config.retention,
         )
+        self.browser_navigation = BrowserActionExecutor(
+            browser=self.browser, driver=self.driver, burp=self.burp,
+            policy=self.policy, permits=self.permits, rate=self.rate,
+            traffic=self.traffic)
+        self.application_mapper = ApplicationMapper(
+            browser=self.browser, driver=self.driver,
+            navigation=self.browser_navigation, evidence=self.store)
+        self.captured_js = CapturedJSCollector(
+            browser=self.browser, traffic=self.traffic,
+            js=self.domxss_store, analyzer=DOMStaticAnalyzer())
         self.recon = None
         self._recon_probe_lock = Lock()
         self._recon_probe_until = 0.0
@@ -361,6 +382,11 @@ class BugHunterRuntime:
         self._planner_lock = Lock()
         self._planner_threads: dict[str, Thread] = {}
         self.campaign = CampaignCoordinator(self)
+        self.hunts = HuntStore(self.store)
+        self.hunt_supervisor = HuntSupervisor(self)
+        self._hunt_lock = Lock()
+        self._hunt_threads: dict[str, Thread] = {}
+        self._hunt_pending: set[str] = set()
         self._campaign_lock = Lock()
         self._campaign_threads: dict[str, Thread] = {}
         self.delta = DeltaCoordinator(self)
@@ -426,6 +452,7 @@ class BugHunterRuntime:
             if len(recoverable) < 50:
                 break
         self.campaign.store.reconcile_interrupted()
+        self.hunt_supervisor.reconcile_interrupted()
         if providers:
             self._notification_thread = Thread(target=self._notification_work, daemon=True,
                                                name="bughunter-notifications")
@@ -449,6 +476,18 @@ class BugHunterRuntime:
             return
         reason = task.get("reason_code") if isinstance(task, dict) else result.get("reason")
         try:
+            if (isinstance(task, dict) and task.get("task_type") == "VALIDATE_RUN" and
+                    task.get("status") == "COMPLETED" and
+                    isinstance(task.get("candidate_id"), str)):
+                candidate = self.planner_store.candidate(
+                    target_id, run_id, task["candidate_id"])
+                if candidate and candidate.finding_id:
+                    self._notification_wakeup.set()
+                    try:
+                        if self.report_store.latest(candidate.finding_id, target_id) is None:
+                            self.report_generator.generate(candidate.finding_id, target_id)
+                    except Exception:
+                        self.logger.error("planner_report_draft_failed")
             if run.get("status") == "WAITING_LOGIN" and reason == "LOGIN_REQUIRED":
                 self.notification_store.enqueue(
                     target_id=target_id, event_type=NotificationType.AUTH_REQUIRES_LOGIN,
@@ -509,6 +548,229 @@ class BugHunterRuntime:
             with self._planner_lock:
                 self._planner_threads.pop(run_id, None)
 
+    def launch_hunt_preparation(self, package_id: str, hunt_id: str) -> None:
+        """Run bounded local preparation away from the short dashboard request path."""
+        with self._hunt_lock:
+            previous = self._hunt_threads.get(hunt_id)
+            if previous is not None and previous.is_alive():
+                self._hunt_pending.add(hunt_id)
+                return
+            self.resources.admit(WorkKind.CAMPAIGN,
+                                 active=sum(thread.is_alive()
+                                            for thread in self._hunt_threads.values()))
+            worker = Thread(target=self._hunt_prepare_work, args=(package_id, hunt_id),
+                            daemon=True, name="hunt-prepare-" + hunt_id[-8:])
+            self._hunt_threads[hunt_id] = worker
+            try:
+                worker.start()
+            except RuntimeError:
+                self._hunt_threads.pop(hunt_id, None)
+                raise
+
+    def resume_reconciled_hunts(self) -> int:
+        """Resume only runs that startup reconciliation marked safe to reprepare."""
+        started = 0
+        cursor = None
+        while True:
+            page = self.hunts.active(after_hunt_id=cursor)
+            for run in page:
+                cursor = run.id
+                if (run.state is not HuntState.PREPARING or
+                        run.reason_code != "PROCESS_RESTART_REPREPARE"):
+                    continue
+                try:
+                    package = self.package(run.package_id)
+                    if package.target.id != run.target_id:
+                        raise ValueError("Target identity changed")
+                    self.launch_hunt_preparation(package.id, run.id)
+                    started += 1
+                except ResourceError:
+                    self.hunts.transition(run.target_id, run.id,
+                                          HuntState.PAUSED_RESOURCE_PRESSURE,
+                                          "HUNT_CAPACITY_UNAVAILABLE")
+                except (LookupError, ValueError, RuntimeError):
+                    self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                          "RESTART_RECONCILIATION_REQUIRED")
+            if len(page) < 100:
+                break
+        return started
+
+    def retry_resource_paused_hunts(self, *, limit: int = 8) -> int:
+        """Retry transient capacity without replaying ambiguous child work."""
+        recoverable = frozenset({"PREPARATION_CAPACITY_UNAVAILABLE",
+                                 "BROWSER_CAPACITY_UNAVAILABLE",
+                                 "HUNT_CAPACITY_UNAVAILABLE",
+                                 "CAMPAIGN_RESOURCE_PRESSURE"})
+        started = 0
+        cursor = None
+        while started < limit:
+            page = self.hunts.active(after_hunt_id=cursor)
+            if not page:
+                break
+            for run in page:
+                cursor = run.id
+                if (run.state is not HuntState.PAUSED_RESOURCE_PRESSURE or
+                        run.reason_code not in recoverable):
+                    continue
+                try:
+                    package = self.package(run.package_id)
+                    if package.target.id != run.target_id:
+                        raise ValueError("Target identity changed")
+                    if run.reason_code == "CAMPAIGN_RESOURCE_PRESSURE":
+                        started += int(self._retry_resource_paused_campaign(package, run))
+                    else:
+                        self.launch_hunt_preparation(package.id, run.id)
+                        started += 1
+                except ResourceError:
+                    pass
+                except (LookupError, ValueError, RuntimeError):
+                    self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                          "RESOURCE_RETRY_REVIEW_REQUIRED")
+                if started >= limit:
+                    break
+            if len(page) < 100:
+                break
+        return started
+
+    def _retry_resource_paused_campaign(self, package: TargetPackage,
+                                        run: HuntRun) -> bool:
+        if (run.campaign_id is None or package.version != run.package_version or
+                policy_version(package) != run.policy_hash):
+            self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                  "CAMPAIGN_RECONCILIATION_REQUIRED")
+            return False
+        campaign = self.campaign.store.get(run.target_id, run.campaign_id)
+        if (campaign is None or campaign.package_id != package.id or
+                campaign.status is not CampaignStatus.PAUSED or
+                campaign.readiness_code not in RECOVERABLE_CAMPAIGN_PAUSE_REASONS or
+                any(work.status in {CampaignWorkStatus.INTENT,
+                                    CampaignWorkStatus.LINKED,
+                                    CampaignWorkStatus.AMBIGUOUS}
+                    for work in self.campaign.store.works(run.target_id,
+                                                         run.campaign_id))):
+            self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                  "CAMPAIGN_RECONCILIATION_REQUIRED")
+            return False
+        if campaign.readiness_code == "TARGET_THROTTLED":
+            try:
+                elapsed = (datetime.now(timezone.utc) -
+                           datetime.fromisoformat(campaign.updated_at)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                      "CAMPAIGN_RECONCILIATION_REQUIRED")
+                return False
+            if elapsed < TARGET_THROTTLE_COOLDOWN_SECONDS:
+                return False
+        with self._campaign_lock:
+            current = self._campaign_threads.get(run.campaign_id)
+            if current is not None and current.is_alive():
+                return False
+        try:
+            resumed = self.campaign.resume(package, run.campaign_id)
+            if resumed.status not in {CampaignStatus.ASSESSING_READINESS,
+                                      CampaignStatus.RUNNING}:
+                raise ValueError("Campaign did not resume")
+            self.hunts.transition(run.target_id, run.id, HuntState.HUNTING,
+                                  "CAMPAIGN_RESOURCE_RECOVERED")
+            self.launch_campaign(package.id, run.campaign_id)
+        except ResourceError as exc:
+            current = self.campaign.store.get(run.target_id, run.campaign_id)
+            if current and current.status in {CampaignStatus.ASSESSING_READINESS,
+                                              CampaignStatus.RUNNING}:
+                self.campaign.store.transition(run.target_id, run.campaign_id,
+                                               CampaignStatus.PAUSED, exc.reason_code)
+            latest = self.hunts.get(run.target_id, run.id)
+            if latest and latest.state is HuntState.HUNTING:
+                self.hunts.transition(run.target_id, run.id,
+                                      HuntState.PAUSED_RESOURCE_PRESSURE,
+                                      "CAMPAIGN_RESOURCE_PRESSURE")
+            return False
+        except (ValueError, LookupError, RuntimeError):
+            current = self.campaign.store.get(run.target_id, run.campaign_id)
+            if current and current.status in {CampaignStatus.ASSESSING_READINESS,
+                                              CampaignStatus.RUNNING}:
+                self.campaign.store.transition(run.target_id, run.campaign_id,
+                                               CampaignStatus.PAUSED, "WORKER_ERROR")
+            latest = self.hunts.get(run.target_id, run.id)
+            if latest and latest.state in {HuntState.HUNTING,
+                                           HuntState.PAUSED_RESOURCE_PRESSURE}:
+                self.hunts.transition(run.target_id, run.id,
+                                      HuntState.WAITING_HUMAN,
+                                      "CAMPAIGN_RECONCILIATION_REQUIRED")
+            return False
+        return True
+
+    def _hunt_prepare_work(self, package_id: str, hunt_id: str) -> None:
+        retried_mapping_session = False
+        while True:
+            try:
+                package = self.package(package_id)
+                run = self.hunts.get(package.target.id, hunt_id)
+                if run and run.package_id == package_id and run.state in {
+                        HuntState.PREPARING, HuntState.LOGIN_REQUIRED,
+                        HuntState.PAUSED_RESOURCE_PRESSURE}:
+                    run = self.hunt_supervisor.advance(package, hunt_id)
+                if run and run.package_id == package_id and run.state in {
+                        HuntState.READY, HuntState.MAPPING}:
+                    mapped = self.hunt_supervisor.map_ready(package, hunt_id)
+                    if (mapped.state is HuntState.PREPARING and
+                            mapped.reason_code == "MAPPING_SESSION_REPREPARE" and
+                            not retried_mapping_session):
+                        retried_mapping_session = True
+                        continue
+                    if (mapped.state is HuntState.PREPARING and
+                            mapped.reason_code == "MAPPING_SESSION_REPREPARE"):
+                        self.hunts.transition(mapped.target_id, mapped.id,
+                                              HuntState.WAITING_HUMAN,
+                                              "SESSION_RECONCILIATION_REQUIRED")
+                    elif mapped.state is HuntState.READY:
+                        prepared = self.hunt_supervisor.prepare_fixtures(package, hunt_id)
+                        if (prepared.state is HuntState.PREPARING and
+                                prepared.reason_code == "FIXTURE_SESSION_REPREPARE" and
+                                not retried_mapping_session):
+                            retried_mapping_session = True
+                            continue
+                        if prepared.state is HuntState.PREPARING:
+                            self.hunts.transition(prepared.target_id, prepared.id,
+                                                  HuntState.WAITING_HUMAN,
+                                                  "SESSION_RECONCILIATION_REQUIRED")
+                            continue
+                        if prepared.state is not HuntState.READY:
+                            continue
+                        handed = self.hunt_supervisor.handoff_ready(package, hunt_id)
+                        if handed.state is HuntState.HUNTING and handed.campaign_id:
+                            try:
+                                self.launch_campaign(package.id, handed.campaign_id)
+                            except ResourceError:
+                                self.campaign.store.transition(
+                                    handed.target_id, handed.campaign_id,
+                                    CampaignStatus.PAUSED, "CAMPAIGN_CAPACITY_UNAVAILABLE")
+                                self.hunts.transition(
+                                    handed.target_id, handed.id,
+                                    HuntState.PAUSED_RESOURCE_PRESSURE,
+                                    "CAMPAIGN_CAPACITY_UNAVAILABLE")
+            except Exception:
+                self.logger.error("hunt_preparation_failed")
+                try:
+                    package = self.package(package_id)
+                    run = self.hunts.get(package.target.id, hunt_id)
+                    if run and run.state in {HuntState.PREPARING, HuntState.LOGIN_REQUIRED,
+                                             HuntState.PAUSED_RESOURCE_PRESSURE,
+                                             HuntState.READY, HuntState.MAPPING,
+                                             HuntState.HUNTING}:
+                        self.hunts.transition(run.target_id, run.id, HuntState.WAITING_HUMAN,
+                                              "CAMPAIGN_DISPATCH_REVIEW_REQUIRED" if
+                                              run.state is HuntState.HUNTING else
+                                              "PREPARATION_REVIEW_REQUIRED")
+                except (LookupError, ValueError):
+                    pass
+            with self._hunt_lock:
+                if hunt_id in self._hunt_pending:
+                    self._hunt_pending.remove(hunt_id)
+                    continue
+                self._hunt_threads.pop(hunt_id, None)
+                return
+
     def launch_campaign(self, package_id: str, campaign_id: str) -> None:
         with self._campaign_lock:
             existing = self._campaign_threads.get(campaign_id)
@@ -529,7 +791,12 @@ class BugHunterRuntime:
             for _ in range(MAX_RUN_TASKS * 8):
                 with self._campaign_lock:
                     package = self.package(package_id)
-                    campaign = self.campaign.advance(package, campaign_id)
+                    hunt = self.hunts.for_campaign(package.target.id, campaign_id)
+                    if hunt is not None and hunt.mode is HuntMode.SUPERVISED:
+                        with supervised_hunt_policy(package):
+                            campaign = self.campaign.advance(package, campaign_id)
+                    else:
+                        campaign = self.campaign.advance(package, campaign_id)
                 if campaign.status not in {CampaignStatus.CREATED,
                                            CampaignStatus.ASSESSING_READINESS,
                                            CampaignStatus.RUNNING}:
@@ -554,6 +821,10 @@ class BugHunterRuntime:
                 except Exception:
                     self.logger.error("campaign_pause_failed")
         finally:
+            try:
+                self.hunt_supervisor.sync_campaign(self.package(package_id), campaign_id)
+            except Exception:
+                self.logger.error("hunt_campaign_sync_failed")
             with self._campaign_lock:
                 self._campaign_threads.pop(campaign_id, None)
 
@@ -1106,11 +1377,13 @@ class BugHunterRuntime:
 
     def session_summary(self, session: BrowserSession) -> dict[str, object]:
         result = session.to_dict()
+        result["verification_method"] = self.browser.verification_method(session.id)
         binding = self.burp.binding_for_session(session.id)
         result["capture_provider"] = "BURP" if binding is not None else "DIRECT"
         result["capture_listener"] = binding.listener_key if binding is not None else None
         result["browser_running"] = self.driver.is_running(session.id)
-        result["vnc_available"] = bool(session.status is BrowserStatus.WAITING_LOGIN and self._vnc_ready())
+        result["vnc_available"] = bool(result["browser_running"] and session.status in {
+            BrowserStatus.WAITING_LOGIN, BrowserStatus.NEEDS_MANUAL_REVIEW} and self._vnc_ready())
         result["vnc_url"] = (self.config.browser.vnc_url if result["vnc_available"] else None)
         return result
 
@@ -1125,6 +1398,8 @@ class BugHunterRuntime:
                 "active_campaigns": """SELECT count(*) FROM campaigns WHERE target_id=? AND status NOT IN
                     ('COMPLETED','BLOCKED','FAILED','CANCELLED','BUDGET_EXHAUSTED',
                      'TIME_EXHAUSTED','CLEANUP_REQUIRED')""",
+                "active_hunts": """SELECT count(*) FROM hunt_runs WHERE target_id=? AND state NOT IN
+                    ('COMPLETE','FAILED')""",
                 "active_planner_runs": """SELECT count(*) FROM planner_runs WHERE target_id=? AND status NOT IN
                     ('COMPLETED','BLOCKED','FAILED','CANCELLED','BUDGET_EXHAUSTED')""",
                 "active_plan_runs": """SELECT count(*) FROM plan_runs WHERE target_id=? AND status NOT IN
@@ -1148,7 +1423,8 @@ class BugHunterRuntime:
             raise LookupError("session not found")
         dependencies = self.target_cleanup_dependencies(package.target.id)
         if any(value for key, value in dependencies.items()
-               if key.startswith("active_") and key != "active_capture_bindings"):
+               if key.startswith("active_") and key not in {
+                   "active_capture_bindings", "active_hunts"}):
             raise TargetSetupError("active_target_work")
         if session.status is not BrowserStatus.STOPPED:
             if not self.browser.driver.is_running(session.id) and session.status in {
@@ -1577,14 +1853,14 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
 
     @app.get("/v1/targets/setup-options")
     def target_setup_options():
+        default_autonomy = AutonomyPolicy(safe_read=PolicyDecision.ALLOW).to_dict()
         return jsonify({"source_kinds": [item.value for item in ScopeSourceKind],
                         "decisions": [item.value for item in PolicyDecision],
-                        "risk_fields": ["passive", "safe_read", "bounded_active",
-                                        "state_changing", "destructive"],
+                        "risk_fields": AUTONOMY_RISK_FIELDS,
+                        "action_fields": AUTONOMY_ACTION_FIELDS,
                         "defaults": {"scope": {"schemes": ["https"], "ports": [443]},
-                                     "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW",
-                                                  "bounded_active": "DENY", "state_changing": "DENY",
-                                                  "destructive": "DENY"},
+                                     "autonomy": {field: default_autonomy[field] for field in
+                                                  AUTONOMY_RISK_FIELDS + AUTONOMY_ACTION_FIELDS},
                                      "rate": RatePolicy(1, 30, 1, 1).to_dict()}})
 
     @app.post("/v1/targets")
@@ -1674,7 +1950,12 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                 if identity["status"] == "ACTIVE":
                     service.registry.disable_identity(identity["identity_id"])
             service.registry.register_target(package)
-            service.target_operator.delete(package_id)
+            service.registry.mark_target_deleted(package.target.id)
+            try:
+                service.target_operator.delete(package_id)
+            except BaseException:
+                service.registry.restore_target(package.target.id)
+                raise
             service.audit("target_deleted", target_id=package.target.id)
         return jsonify(deleted=True, package_id=package_id,
                        historical_records_preserved=True, network_requests_sent=0)
@@ -1712,12 +1993,25 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             rows = data.get("accounts")
             aliases = {item.alias for item in package.accounts}
             if isinstance(rows, list):
-                aliases.update(row.get("alias") for row in rows if isinstance(row, dict)
-                               and isinstance(row.get("alias"), str))
+                for row in rows:
+                    if isinstance(row, dict) and "alias" in row:
+                        try:
+                            aliases.add(validate_package_id(row["alias"]))
+                        except ValueError:
+                            raise TargetSetupError("invalid_field", "accounts.alias") from None
             registered = {alias for alias in aliases if service.registry.get_identity(
                 package.target.id, alias) is not None}
+            previous_accounts = {"accounts": [
+                {"alias": item.alias, "tenant": item.tenant_hint or "",
+                 "role": item.role_hint or ""} for item in package.accounts]}
             updated = service.target_operator.save_accounts(package_id, data,
                                                             registered_aliases=registered)
+            try:
+                service.registry.import_package_accounts(updated)
+            except ValueError:
+                service.target_operator.save_accounts(package_id, previous_accounts,
+                                                      registered_aliases=registered)
+                raise
         return jsonify({**target_account_view(updated), "network_requests_sent": 0})
 
     @app.delete("/v1/targets/<package_id>/accounts/<alias>")
@@ -1750,6 +2044,88 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
                           identity_id=identity.id if identity is not None else None)
         return jsonify({**target_account_view(updated), "removed": alias,
                         "historical_identity_preserved": True, "network_requests_sent": 0})
+
+    @app.get("/v1/targets/<package_id>/hunt")
+    def hunt_status(package_id: str):
+        package = service.package(package_id)
+        run = service.hunts.current(package.target.id)
+        if run is None or run.package_id != package.id:
+            return jsonify({"hunt": None, "needs_you": [], "mapping": [], "events": []})
+        api_counts = service.api_operations.counts(run.target_id)
+        operation_types = service.api_operations.operation_type_counts(run.target_id)
+        with service.store._connection() as connection:
+            js_count = connection.execute(
+                "SELECT count(*) FROM dom_js_artifacts WHERE target_id=? AND state='CURRENT'",
+                (run.target_id,)).fetchone()[0]
+        try:
+            investigation = (service.campaign.overview(package, run.campaign_id)
+                             if run.campaign_id else None)
+        except LookupError:
+            investigation = {"status": "UNAVAILABLE",
+                             "reason": "CAMPAIGN_LINK_UNAVAILABLE"}
+        findings = []
+        if run.campaign_id:
+            for link in service.campaign.finding_links(run.target_id, run.campaign_id)[:10]:
+                finding = service.validations.get_finding(link["finding_id"], run.target_id)
+                if finding is not None:
+                    findings.append({"id": finding.id, "title": finding.title,
+                                     "status": finding.status.value,
+                                     "severity": finding.preliminary_severity,
+                                     "report_id": link["report_id"]})
+        return jsonify({"hunt": run.to_dict(),
+                        "investigation": investigation,
+                        "findings": findings,
+                        "needs_you": service.hunt_supervisor.needs_you(package, run.id),
+                        "mapping": service.hunts.mapping_sessions(run.target_id, run.id),
+                        "inventory": {
+                            "js_assets_current": js_count,
+                            "api_operations_current": api_counts["operations_current"],
+                            "api_operations_observed": api_counts["operations_observed"],
+                            "api_candidates": api_counts["candidates"],
+                            "api_candidates_ready": api_counts["candidates_ready"],
+                            "graphql_operations_current": sum(
+                                count for kind, count in operation_types.items()
+                                if kind.startswith("GRAPHQL_")),
+                        },
+                        "events": service.hunts.events(run.target_id, run.id, limit=25)})
+
+    @app.post("/v1/targets/<package_id>/hunt")
+    def hunt_start(package_id: str):
+        data = _body(frozenset({"mode"}))
+        try:
+            mode = HuntMode(data.get("mode", HuntMode.SUPERVISED.value))
+        except ValueError:
+            return jsonify(error="invalid_hunt_mode"), 400
+        package = service.package(package_id)
+        current = service.hunts.current(package.target.id)
+        if current is not None and current.state not in {HuntState.COMPLETE,
+                                                          HuntState.FAILED}:
+            return jsonify(error="active_hunt_exists", hunt=current.to_dict()), 409
+        if package.status is not PackageStatus.TRACKED:
+            return jsonify(error="hunt_not_allowed", reason_code="TARGET_NOT_TRACKED"), 409
+        if mode is not HuntMode.PLAN_ONLY and not package.rules.automated_testing_allowed:
+            return jsonify(error="hunt_not_allowed",
+                           reason_code="PROGRAM_AUTOMATION_DISABLED"), 409
+        try:
+            run = service.hunt_supervisor.create(package, mode=mode)
+        except ValueError:
+            current = service.hunts.current(package.target.id)
+            if current is not None and current.state not in {HuntState.COMPLETE,
+                                                              HuntState.FAILED}:
+                return jsonify(error="active_hunt_exists", hunt=current.to_dict()), 409
+            raise
+        try:
+            service.launch_hunt_preparation(package.id, run.id)
+        except ResourceError:
+            run = service.hunts.transition(run.target_id, run.id,
+                                           HuntState.PAUSED_RESOURCE_PRESSURE,
+                                           "PREPARATION_CAPACITY_UNAVAILABLE")
+        except RuntimeError:
+            run = service.hunts.transition(run.target_id, run.id,
+                                           HuntState.WAITING_HUMAN,
+                                           "PREPARATION_DISPATCH_REVIEW_REQUIRED")
+        return jsonify({"hunt": run.to_dict(),
+                        "needs_you": service.hunt_supervisor.needs_you(package, run.id)}), 202
 
     @app.get("/v1/targets/<package_id>/bootstrap")
     def bootstrap_status(package_id: str):
@@ -3697,6 +4073,23 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             raise LookupError("session not found")
         return package, session
 
+    def wake_hunt_after_identity(package: TargetPackage, session: BrowserSession) -> None:
+        if session.status not in {BrowserStatus.VALID, BrowserStatus.NEEDS_MANUAL_REVIEW}:
+            return
+        run = service.hunt_supervisor.identity_updated(
+            package, verified=session.status is BrowserStatus.VALID)
+        if run is None or session.status is not BrowserStatus.VALID or run.state not in {
+                HuntState.PREPARING, HuntState.LOGIN_REQUIRED,
+                HuntState.PAUSED_RESOURCE_PRESSURE}:
+            return
+        try:
+            service.launch_hunt_preparation(package.id, run.id)
+        except ResourceError:
+            if run.state is not HuntState.PAUSED_RESOURCE_PRESSURE:
+                service.hunts.transition(run.target_id, run.id,
+                                         HuntState.PAUSED_RESOURCE_PRESSURE,
+                                         "PREPARATION_CAPACITY_UNAVAILABLE")
+
     @app.get("/v1/browser/sessions/<session_id>")
     def session_detail(session_id: str):
         _, session = scoped_session(session_id)
@@ -3732,13 +4125,25 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
 
     @app.post("/v1/browser/sessions/<session_id>/login-complete")
     def login_complete(session_id: str):
-        _body(frozenset())
+        body = _body(frozenset({"confirm_alias"}))
         package, session = scoped_session(session_id)
+        confirm_alias = body.get("confirm_alias")
+        if "confirm_alias" in body:
+            identity = (service.registry.get_identity(package.target.id, session.identity_id)
+                        if session.identity_id else None)
+            if not isinstance(confirm_alias, str) or identity is None or (
+                    confirm_alias != identity.alias):
+                raise ValueError("confirmation alias does not match this session")
         updated = service.browser.login_complete(session.id)
         service.audit("manual_login_completed", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         rule = service.verification_rule(package, session.identity_id)
         verified = service.browser.verify(updated.id, rule)
+        if (verified.status is BrowserStatus.NEEDS_MANUAL_REVIEW and
+                confirm_alias is not None):
+            verified = service.browser.confirm_operator_identity(
+                verified.id, alias=confirm_alias)
+        wake_hunt_after_identity(package, verified)
         service.audit("identity_verification_finished", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(verified))
@@ -3749,9 +4154,23 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
         package, session = scoped_session(session_id)
         rule = service.verification_rule(package, session.identity_id)
         verified = service.browser.verify(session.id, rule)
+        wake_hunt_after_identity(package, verified)
         service.audit("identity_verification_finished", target_id=package.target.id,
                       identity_id=session.identity_id, session_id=session.id)
         return jsonify(service.session_summary(verified))
+
+    @app.post("/v1/browser/sessions/<session_id>/confirm-identity")
+    def confirm_session_identity(session_id: str):
+        body = _body(frozenset({"confirm_alias"}))
+        package, session = scoped_session(session_id)
+        if not isinstance(body.get("confirm_alias"), str):
+            raise ValueError("invalid confirmation alias")
+        confirmed = service.browser.confirm_operator_identity(
+            session.id, alias=body["confirm_alias"])
+        wake_hunt_after_identity(package, confirmed)
+        service.audit("identity_verification_finished", target_id=package.target.id,
+                      identity_id=session.identity_id, session_id=session.id)
+        return jsonify(service.session_summary(confirmed))
 
     @app.post("/v1/browser/sessions/<session_id>/stop")
     def stop_session(session_id: str):
@@ -3824,4 +4243,6 @@ def create_app(config: AppConfig | None = None, *, runtime: BugHunterRuntime | N
             raise LookupError("evidence not found")
         return jsonify(item.to_reference())
 
+    if runtime is None:
+        service.resume_reconciled_hunts()
     return app

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import time
 import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,20 +12,34 @@ from hackbot.config import ObjectSettings
 from hackbot.domain import Tenant
 from hackbot.identity import MembershipStatus
 from hackbot.object_factory import ObjectFactory
-from hackbot.object_recipes import ObjectRecipe, RecipeCatalog
+from hackbot.object_recipes import ObjectRecipe, RecipeCatalog, RecipeOperation
 from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction, SideEffect
 from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLimits,
                                     PlannerMode, PlannerStatus, PlannerTaskType, Specialist)
 from hackbot.planner_runner import PlannerRunner
 from hackbot.planner_store import PlannerStore
 from hackbot.policy import policy_version
-from hackbot.target_policy import PolicyDecision
+from hackbot.target_policy import PolicyDecision, RatePolicy
 from hackbot.test_objects import CleanupStrategy, ObjectRegistry, ObjectState
 
 from .test_executor import ExecutorFixture
 
 
 class ObjectFactoryTests(ExecutorFixture):
+    def test_observed_single_name_form_recipe_encodes_without_values_in_metadata(self):
+        operation = RecipeOperation(
+            "POST", "https://example.test/api/documents", "createDocument",
+            {"name": "$test_name"},
+            content_type="application/x-www-form-urlencoded")
+        template = operation.template(test_name="hackbot-test-a&b")
+        self.assertEqual(template.headers,
+                         (("Content-Type", "application/x-www-form-urlencoded"),))
+        self.assertEqual(template.body, b"name=hackbot-test-a%26b")
+        with self.assertRaises(ValueError):
+            RecipeOperation("POST", "https://example.test/api/documents", "createDocument",
+                            {"name": "$test_name", "role": "admin"},
+                            content_type="application/x-www-form-urlencoded")
+
     def setUp(self):
         super().setUp()
         self.executor.settings = replace(self.executor.settings, connect_timeout_seconds=15,
@@ -138,6 +153,55 @@ class ObjectFactoryTests(ExecutorFixture):
         self.assertEqual(self.objects.stats(item.target_id)["cleanup_pending"], 0)
         self.assertEqual(self.factory.cleanup(item.id, item.target_id,
                                                session_id=session.id).outcome, "NOT_CLEANABLE")
+
+    def test_released_read_only_object_needs_fresh_owner_readback_before_reuse(self):
+        identity, session, tenant = self.account("tenant_a_admin", "tenant-a")
+        self.recipe()
+        created = self.factory.resolve(package_id=self.package.id, recipe_id="project",
+                                       identity_id=identity.id, tenant_id=tenant.id,
+                                       session_id=session.id, purpose="Local read-only control")
+        self.assertEqual(created.outcome, "READY")
+        item = created.item
+        self.objects.transition(item.id, item.target_id, frozenset({ObjectState.READY}),
+                                ObjectState.CLEANUP_PENDING, "READ_PLAN_RELEASED")
+        checked = self.factory.reverify_for_reuse(
+            item.id, item.target_id, session_id=session.id,
+            action_id="ACTION-" + uuid.uuid4().hex)
+        self.assertEqual(checked.outcome, "READY")
+        self.assertEqual(checked.item.state, ObjectState.READY)
+        with self.assertRaises(ValueError):
+            self.factory.reverify_for_reuse(item.id, item.target_id,
+                                            session_id=session.id,
+                                            action_id="ACTION-" + uuid.uuid4().hex)
+        self.objects.transition(item.id, item.target_id, frozenset({ObjectState.READY}),
+                                ObjectState.CLEANUP_PENDING, "READ_PLAN_RELEASED")
+        self.server.fixture_objects["fixture1"]["name"] = "unexpected-owner-state"
+        mismatch = self.factory.reverify_for_reuse(
+            item.id, item.target_id, session_id=session.id,
+            action_id="ACTION-" + uuid.uuid4().hex)
+        self.assertEqual(mismatch.outcome, "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(mismatch.item.state, ObjectState.CLEANUP_PENDING)
+
+    def test_planning_sends_no_traffic_and_verification_waits_for_rate_slot(self):
+        identity, session, tenant = self.account("tenant_a_admin", "tenant-a")
+        self.recipe()
+        self.package = replace(self.package, rate=RatePolicy(1, 30, 1, 1))
+        self.targets.package = self.package
+        planned = self.factory.plan_disposable(
+            package_id=self.package.id, recipe_id="project",
+            identity_id=identity.id, tenant_id=tenant.id,
+            session_id=session.id, purpose="Local rate-limited fixture",
+            reuse_ready=False)
+        self.assertEqual(planned.outcome, "PLANNED")
+        self.assertEqual(self.server.fixture_objects, {})
+        started = time.monotonic()
+        created = self.factory.create(planned.item.id, planned.item.target_id,
+                                      session_id=session.id)
+        self.assertEqual(created.outcome, "READY")
+        self.assertGreaterEqual(time.monotonic() - started, 0.8)
+        self.assertEqual(len(self.server.fixture_objects), 1)
+        self.assertEqual(self.factory.cleanup(created.item.id, created.item.target_id,
+                                              session_id=session.id).outcome, "CLEANED")
 
     def test_planner_object_prerequisite_uses_real_factory_and_readback(self):
         identity, session, tenant = self.account("tenant_a_admin", "tenant-a")

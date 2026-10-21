@@ -339,7 +339,9 @@ class CrossSpecialistPlanner:
                      or item.source_id not in linked_hypotheses)
 
     def _rank(self, run: PlannerRun, context: PlannerContext,
-              signals: tuple[_Signal, ...]) -> tuple[PlannerCandidate, ...]:
+              signals: tuple[_Signal, ...],
+              suppressed_sources: frozenset[tuple[str, str]] = frozenset()
+              ) -> tuple[PlannerCandidate, ...]:
         profile = self.hypotheses.latest_profile(run.target_id)
         research = self.context.research.list(run.target_id, limit=50).get("items", [])
         fresh_research = {item["gap_ref"]: item for item in research
@@ -524,9 +526,43 @@ class CrossSpecialistPlanner:
         exploration_ids = {item.id for item in exploratory[:exploration_slots]}
         order.extend(exploratory[:exploration_slots])
         order.extend(item for item in unique if item not in order)
+        object_by_candidate = {
+            "PLCAND-" + _digest(run.id, signal.source_kind, signal.source_id)[:32]:
+                signal.object_id for signal in signals if signal.object_id
+        }
+        selected_objects: set[str] = set()
         for item in order:
             reason = list(item.reason_codes)
             status = item.status
+            if ((item.source_kind, item.source_id) in suppressed_sources):
+                chosen[item.id] = replace(
+                    item, status=CandidateStatus.SKIPPED,
+                    reason_codes=tuple((*reason[:11], "CAMPAIGN_SOURCE_ALREADY_ATTEMPTED")))
+                continue
+            if (run.mode is PlannerMode.BOUNDED_AUTONOMOUS and
+                    item.source_kind == "API_GRAPHQL" and
+                    status is not CandidateStatus.SKIPPED and
+                    ((source := self.api.get_candidate(run.target_id, item.source_id)) is None or
+                     source.status != "READY")):
+                chosen[item.id] = replace(
+                    item, status=CandidateStatus.DEFERRED,
+                    reason_codes=tuple((*reason[:11], "API_PROOF_PREREQUISITES_MISSING")))
+                continue
+            object_id = object_by_candidate.get(item.id)
+            if (run.mode is PlannerMode.BOUNDED_AUTONOMOUS and
+                    status is not CandidateStatus.SKIPPED and object_id is not None and
+                    object_id not in context.ready_object_ids):
+                chosen[item.id] = replace(
+                    item, status=CandidateStatus.DEFERRED,
+                    reason_codes=tuple((*reason[:11], "BOUND_OBJECT_NOT_READY")))
+                continue
+            if (run.mode is PlannerMode.BOUNDED_AUTONOMOUS and
+                    status is not CandidateStatus.SKIPPED and object_id is not None and
+                    object_id in selected_objects):
+                chosen[item.id] = replace(
+                    item, status=CandidateStatus.DEFERRED,
+                    reason_codes=tuple((*reason[:11], "OWNED_OBJECT_RESERVED_FOR_BRANCH")))
+                continue
             if status is not CandidateStatus.SKIPPED:
                 budget_ok = (spent_requests + item.estimated_requests <=
                              run.limits.requests - run.limits.cleanup_reserve
@@ -543,6 +579,8 @@ class CrossSpecialistPlanner:
                     spent_browser += item.estimated_browser
                     spent_tokens += item.estimated_tokens
                     by_specialist[item.specialist] = by_specialist.get(item.specialist, 0) + 1
+                    if object_id is not None:
+                        selected_objects.add(object_id)
                     reason.append("RANKED_WITHIN_BUDGET")
                     if item.id in exploration_ids:
                         reason.append("EXPLORATION_SLOT")
@@ -555,6 +593,7 @@ class CrossSpecialistPlanner:
               limits: PlannerLimits = PlannerLimits(),
               campaign_work_id: str | None = None,
               suppressed_roots: frozenset[tuple[str, str]] = frozenset(),
+              suppressed_sources: frozenset[tuple[str, str]] = frozenset(),
               focused_hypothesis_ids: frozenset[str] | None = None,
               focused_specialists: frozenset[str] | None = None) -> PlannerRun:
         if not isinstance(package, TargetPackage):
@@ -604,7 +643,8 @@ class CrossSpecialistPlanner:
                     BROWSER_TRIAL_CAPS.get(specialist, 0), 0,
                     tuple(dict.fromkeys(_gap(part) for part in hypothesis.missing)),
                     tuple(hypothesis.evidence_ids[:6]), hypothesis.id),)
-        ranked = self._rank(run, context, signals)[:limits.portfolio]
+        ranked = self._rank(run, context, signals,
+                            suppressed_sources=suppressed_sources)[:limits.portfolio]
         if suppressed_roots:
             ranked = tuple(replace(item, status=CandidateStatus.SKIPPED,
                                    reason_codes=(*item.reason_codes[:11], "CAMPAIGN_SUPPRESSED"))

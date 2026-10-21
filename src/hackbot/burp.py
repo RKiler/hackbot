@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -283,6 +283,10 @@ class BurpProxyProvider:
         if binding is None or binding.state != "ACTIVE":
             raise BurpError("Burp listener is unavailable")
         proxy = self.proxy_config(binding.proxy_port)
+        if package is not None:
+            if package.target.id != binding.target_id:
+                raise BurpError("TargetPackage does not match Burp session")
+            proxy = replace(proxy, guard_scope=package.scope)
         return self.browser.start(session_id, proxy=proxy, package=package,
                                   proxy_health_check=lambda _: self.ready(session_id))
 

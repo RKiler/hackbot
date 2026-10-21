@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
+import time
 import uuid
 from urllib.parse import urlsplit
 from typing import Any
@@ -24,7 +25,7 @@ from .domxss_browser import (DOMBrowserExperimentExecutor, DOMExperimentBinding,
 from .exposure import ExposureSpecialist
 from .postmessage_browser import (PostMessageBrowserExperimentExecutor,
                                   MessageExperimentBinding)
-from .browser import BrowserError
+from .browser import BrowserError, BrowserStatus, VerificationStatus
 from .evidence import EvidenceProvenance, EvidenceType, Sensitivity
 from .executor import ExecutionError, ExecutionResult, RequestTemplate, TrafficExecutor
 from .hypotheses import HypothesisStore
@@ -192,10 +193,31 @@ class PlanOrchestrator:
         if hypothesis is None:
             raise PlanRunError("hypothesis unavailable")
         profile = self.hypotheses.latest_profile(run.target_id)
-        context = self.context.build(hypothesis, profile, package)
+        context = self._context_for_plan(hypothesis, profile, package, snapshot.data)
         required, category = self._requirements(snapshot, self.registry)
         prereq = self.checker.check_requirements(required, category, context)
         return package, context, prereq
+
+    @staticmethod
+    def _api_context_refs(plan: dict[str, Any]) -> tuple[str, ...]:
+        if not isinstance(plan.get("api_binding"), dict):
+            return ()
+        templates = plan.get("request_templates")
+        if not isinstance(templates, list):
+            return ()
+        return tuple(dict.fromkeys(
+            shape["source_exchange_id"] for shape in templates[:4]
+            if isinstance(shape, dict) and
+            shape.get("binding") in {"API_OBSERVED_READ_V1", "API_OBSERVED_BATCH_V1"} and
+            isinstance(shape.get("source_exchange_id"), str)))[:4]
+
+    def _context_for_plan(self, hypothesis: Any, profile: Any,
+                          package: TargetPackage, plan: dict[str, Any]) -> Any:
+        refs = self._api_context_refs(plan)
+        if refs:
+            return self.context.build(hypothesis, profile, package,
+                                      traffic_exchange_ids=refs)
+        return self.context.build(hypothesis, profile, package)
 
     def start(self, plan_id: str, package_id: str, *, rerun: bool = False) -> dict[str, object]:
         package = self.targets.get_target_package(package_id)
@@ -210,7 +232,9 @@ class PlanOrchestrator:
         hypothesis = self.hypotheses.get(str(plan["hypothesis_id"]), package.target.id)
         if hypothesis is None:
             raise PlanRunError("hypothesis unavailable")
-        current = self.context.build(hypothesis, self.hypotheses.latest_profile(package.target.id), package)
+        current = self._context_for_plan(
+            hypothesis, self.hypotheses.latest_profile(package.target.id), package,
+            plan)
         prereq = self.checker.check_requirements(required, category, current)
         if prereq.state is not PrerequisiteState.READY:
             raise PlanRunError("current prerequisites are not ready")
@@ -1048,11 +1072,43 @@ class PlanOrchestrator:
                               identity["verified_session_id"] == action.session_id
                               for identity in context.identities)
                 auth = self.executor.auth.get(run.target_id, action.identity_id)
-                if (not matched or auth is None or auth.status is not AuthStatus.VALID or
-                        auth.browser_session_ref != action.session_id or
-                        auth.mechanism is AuthMechanism.MANUAL_LOGIN or not auth.secret_ref):
+                ready = bool(matched and auth is not None and
+                             auth.status is AuthStatus.VALID and
+                             auth.browser_session_ref == action.session_id and
+                             (auth.expires_at is None or
+                              auth.expires_at > datetime.now(timezone.utc)))
+                if ready and auth is not None and auth.mechanism is AuthMechanism.MANUAL_LOGIN:
+                    browser = self.executor.browser
+                    try:
+                        session = (browser.session_context(action.session_id)
+                                   if browser is not None and action.session_id else None)
+                    except (BrowserError, ValueError):
+                        session = None
+                    ready = bool(session is not None and
+                                 session.target_id == run.target_id and
+                                 session.identity_id == action.identity_id and
+                                 session.auth_context_id == auth.id and
+                                 session.browser_status is BrowserStatus.VALID and
+                                 session.verification_status is VerificationStatus.MATCH and
+                                 session.authentication_status == "VALID" and
+                                 session.browser_available and
+                                 session.proxy_capture_required)
+                elif ready:
+                    ready = bool(auth and auth.secret_ref)
+                if not ready:
                     return self._finish(run, step, status=RuntimeStepStatus.BLOCKED,
                                         reason="BOUND_IDENTITY_UNVERIFIED", waiting=RunStatus.BLOCKED)
+            if self.policy.rate is not None:
+                deadline = time.monotonic() + 61.0
+                while True:
+                    delay = self.policy.rate.retry_after_seconds(
+                        action.target_id, package.rate)
+                    if delay is None or delay <= 0:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(max(0.01, delay + 0.01), remaining))
             decision = self.policy.evaluate(package, action, record=True)
             self.runs.policy(run.id, step.id, decision.id, decision.approval_id, decision.reason_code)
             if decision.result is PolicyDecision.DENY:

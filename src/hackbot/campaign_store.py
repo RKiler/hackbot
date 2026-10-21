@@ -505,6 +505,41 @@ class CampaignStore:
         assert work is not None
         return work
 
+    def reserve_object_recheck(self, target_id: str, campaign_id: str,
+                               planner_work_id: str, object_id: str) -> bool:
+        """Charge one owner read-back before reusing a released Hunt fixture."""
+        reason = "RECHECK_" + hashlib.sha256(object_id.encode()).hexdigest()[:16].upper()
+        at = _now()
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT c.*,w.status AS work_status,w.kind AS work_kind "
+                "FROM campaigns c JOIN campaign_work w ON w.campaign_id=c.campaign_id "
+                "WHERE c.campaign_id=? AND c.target_id=? AND w.work_id=?",
+                (campaign_id, target_id, planner_work_id)).fetchone()
+            item = db.execute("SELECT lifecycle FROM test_objects WHERE test_object_id=? "
+                              "AND target_id=? AND package_id=?",
+                              (object_id, target_id, row["package_id"] if row else "")).fetchone()
+            if (row is None or row["status"] != "RUNNING" or
+                    row["work_status"] != "LINKED" or row["work_kind"] != "PLANNER" or
+                    item is None or item["lifecycle"] != "CLEANUP_PENDING"):
+                return False
+            if db.execute("SELECT 1 FROM campaign_events WHERE campaign_id=? AND work_id=? "
+                          "AND event_type='OBJECT_RECHECK_RESERVED' AND reason_code=?",
+                          (campaign_id, planner_work_id, reason)).fetchone():
+                return False
+            if (row["started_at"] is None or (datetime.fromisoformat(at) -
+                    datetime.fromisoformat(row["started_at"])).total_seconds() >=
+                    row["seconds_limit"] or
+                    row["requests_used"] + row["cleanup_used"] + 1 >
+                    row["requests_limit"] - row["cleanup_reserve"]):
+                return False
+            db.execute("UPDATE campaigns SET requests_used=requests_used+1,updated_at=? "
+                       "WHERE campaign_id=?", (at, campaign_id))
+            self._event(db, campaign_id, "OBJECT_RECHECK_RESERVED", reason,
+                        cycle=row["current_cycle"], work_id=planner_work_id)
+        return True
+
     def work(self, target_id: str, campaign_id: str, work_id: str) -> CampaignWork | None:
         if not _WORK_ID.fullmatch(work_id):
             raise ValueError("Invalid campaign work ID")

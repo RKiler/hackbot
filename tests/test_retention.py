@@ -908,7 +908,7 @@ class ArtifactCollectionTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceReferenceError, "direct reference schema requires review"):
                 has_evidence_reference(db, evidence.evidence_id)
             db.execute("DROP TABLE fixture_evidence_owner")
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package", datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
                        ("PRINCIPAL-fixture", "TARGET-fixture", "fixture", None, "OBSERVED",
@@ -942,7 +942,7 @@ class ArtifactCollectionTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceReferenceError, "schema requires review"):
                 evidence_reference_inventory(db)
             db.execute("DROP TABLE unreviewed_direct")
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package", datetime.now(timezone.utc).isoformat()))
             with self.assertRaisesRegex(sqlite3.IntegrityError, "invalid JSON reference column"):
                 db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
@@ -962,7 +962,7 @@ class ArtifactCollectionTests(unittest.TestCase):
         evidence = self._evidence(b"schema43-evidence-reference")
         with sqlite3.connect(self.store.db_path) as db:
             drop_evidence_json_index_schema(db)
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package", datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
                        ("PRINCIPAL-fixture", "TARGET-fixture", "fixture", None, "OBSERVED",
@@ -971,7 +971,7 @@ class ArtifactCollectionTests(unittest.TestCase):
             db.execute("PRAGMA user_version=43")
         self.store.initialize(allow_existing_migration=True)
         with self.store._connection() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertEqual(db.execute(
                 "SELECT ref_count FROM evidence_json_reference_counts WHERE ref_id=?",
                 (evidence.evidence_id,),
@@ -982,7 +982,7 @@ class ArtifactCollectionTests(unittest.TestCase):
         with sqlite3.connect(self.store.db_path) as db:
             drop_evidence_json_index_schema(db)
             db.execute("DROP TRIGGER traffic_json_ref_registry_principals_insert")
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package", datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
                        ("PRINCIPAL-fixture", "TARGET-fixture", "fixture", None, "OBSERVED",
@@ -1003,7 +1003,7 @@ class ArtifactCollectionTests(unittest.TestCase):
     def test_evidence_json_index_counts_repeated_ids_and_delete(self):
         evidence = self._evidence(b"evidence-index-counts")
         with self.store._connection() as db:
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package", datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
                        ("PRINCIPAL-fixture", "TARGET-fixture", "fixture", None, "OBSERVED",
@@ -1162,7 +1162,7 @@ class ArtifactCollectionTests(unittest.TestCase):
                     (json.dumps({"nested": [candidate.evidence_id]}),),
                 )
         with self.store._connection() as db:
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-fixture", "fixture-package",
                         datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT INTO registry_principals VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1318,7 +1318,7 @@ class JsonReferenceAuditTests(unittest.TestCase):
                                        StoreSettings(artifacts.root))
         self.store.initialize()
         with self.store._connection() as db:
-            db.execute("INSERT INTO registry_targets VALUES (?,?,?)",
+            db.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
                        ("TARGET-audit", "fixture-package",
                         datetime.now(timezone.utc).isoformat()))
 

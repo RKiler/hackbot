@@ -3,8 +3,28 @@
 import sqlite3
 
 
+def drop_hunt_supervisor_schema(connection: sqlite3.Connection) -> None:
+    """Remove post-Phase-33 hunt state before historical schema fixtures."""
+    for (name,) in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND "
+        "name LIKE 'retired_dom_link_hunt_%'"
+    ).fetchall():
+        connection.execute(f'DROP TRIGGER "{name}"')
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='dom_retirement_guard_sources'"
+    ).fetchone():
+        connection.execute("DELETE FROM dom_retirement_guard_sources WHERE "
+                           "source_table LIKE 'hunt_%'")
+    connection.execute("DROP TABLE IF EXISTS hunt_fixtures")
+    connection.execute("DROP TABLE IF EXISTS hunt_mapping_sessions")
+    connection.execute("DROP TABLE IF EXISTS hunt_events")
+    connection.execute("DROP TABLE IF EXISTS hunt_runs")
+
+
 def drop_phase32_schema(connection: sqlite3.Connection) -> None:
     """Remove continuous-delta tables before a schema-47 fixture."""
+    drop_hunt_supervisor_schema(connection)
     connection.execute("DROP TRIGGER IF EXISTS delta_candidate_evidence_no_retirement")
     for (name,) in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='trigger' AND "

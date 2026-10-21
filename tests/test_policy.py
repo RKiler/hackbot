@@ -9,12 +9,14 @@ from types import SimpleNamespace
 import json
 import shutil
 import unittest
+import uuid
 
 from hackbot.browser import BrowserStatus, SessionContext, VerificationStatus
 from hackbot.cli import main
 from hackbot.config import TargetSettings, load_config
 from hackbot.identity import IdentityStatus
-from hackbot.policy import PolicyEngine, ScopeGuard, SideEffectClassifier, policy_version
+from hackbot.policy import (PolicyEngine, ScopeGuard, SideEffectClassifier,
+                            policy_version, supervised_hunt_policy)
 from hackbot.policy_models import (
     ActionCategory, ActorMode, ApprovalStatus, ProposedAction, SideEffect,
 )
@@ -229,6 +231,51 @@ class PolicyTests(unittest.TestCase):
                                                disposable_intent=False), package=package).result,
                          PolicyDecision.DENY)
 
+    def test_supervised_context_requires_approval_without_relaxing_package_policy(self):
+        package = replace(self.package, autonomy=replace(
+            self.package.autonomy, state_changing=PolicyDecision.ALLOW,
+            create_disposable_objects=PolicyDecision.ALLOW,
+            modify_disposable_objects=PolicyDecision.ALLOW,
+            delete_disposable_objects=PolicyDecision.ALLOW))
+        create = self.action(category=ActionCategory.OBJECT_CREATE, method="POST",
+                             object_type="dashboard", disposable_intent=True)
+        self.assertEqual(self.evaluate(create, package=package).result, PolicyDecision.ALLOW)
+        with supervised_hunt_policy(package):
+            decision = self.evaluate(replace(create, id="ACTION-" + "b" * 32), package=package)
+            self.assertEqual(decision.result, PolicyDecision.REQUIRE_APPROVAL)
+            self.assertEqual(decision.reason_code, "SUPERVISED_APPROVAL_REQUIRED")
+            factory_create = replace(create, id="ACTION-" + "d" * 32,
+                                     source="object_factory")
+            self.assertEqual(self.evaluate(factory_create, package=package).result,
+                             PolicyDecision.ALLOW)
+            owned_engine = PolicyEngine(audit=self.audit, owned_object=lambda _: True)
+            for category, method, operation in (
+                    (ActionCategory.OBJECT_UPDATE, "PATCH", "renameDashboard"),
+                    (ActionCategory.OBJECT_DELETE, "DELETE", "deleteDashboard")):
+                action = replace(factory_create, id="ACTION-" + uuid.uuid4().hex,
+                                 category=category, method=method,
+                                 operation=operation, object_ref_hash="a" * 64)
+                self.assertEqual(self.evaluate(action, engine=owned_engine,
+                                               package=package).result,
+                                 PolicyDecision.ALLOW)
+            self.assertEqual(self.evaluate(replace(factory_create,
+                                                   id="ACTION-" + "e" * 32,
+                                                   cross_identity=True),
+                                           package=package).result,
+                             PolicyDecision.DENY)
+            self.assertEqual(self.evaluate(self.action(), package=package).result,
+                             PolicyDecision.ALLOW)
+            self.assertEqual(self.evaluate(self.action("https://unrelated.test/"),
+                                           package=package).result, PolicyDecision.DENY)
+            denied = replace(package, autonomy=replace(package.autonomy,
+                                                       state_changing=PolicyDecision.DENY))
+            self.assertEqual(self.evaluate(self.action(
+                category=ActionCategory.OBJECT_CREATE, method="POST",
+                object_type="dashboard", disposable_intent=True),
+                package=denied).result, PolicyDecision.DENY)
+        self.assertEqual(self.evaluate(replace(create, id="ACTION-" + "c" * 32),
+                                       package=package).result, PolicyDecision.ALLOW)
+
     def test_identity_verified_unverified_disabled_wrong_target_anonymous(self):
         action = self.action(actor=ActorMode.AUTHENTICATED, identity_id=IDENTITY, session_id=SESSION)
         verified = PolicyEngine(audit=self.audit, registry=FakeRegistry(),
@@ -310,6 +357,7 @@ class RateTests(unittest.TestCase):
         first = limiter.reserve("target-a", policy, experiment_id="exp")
         self.assertTrue(first.allowed)
         self.assertEqual(limiter.reserve("target-a", policy).reason_code, "CONCURRENCY_LIMIT")
+        self.assertEqual(limiter.retry_after_seconds("target-a", policy), 0.1)
         self.assertTrue(limiter.reserve("target-b", policy).allowed)
         self.assertTrue(limiter.release(first.reservation_id))
         second = limiter.reserve("target-a", policy, experiment_id="exp")
@@ -317,7 +365,9 @@ class RateTests(unittest.TestCase):
         limiter.release(second.reservation_id)
         now[0] = 1.0
         self.assertEqual(limiter.reserve("target-a", policy).reason_code, "RATE_PER_MINUTE")
+        self.assertAlmostEqual(limiter.retry_after_seconds("target-a", policy), 59.0)
         now[0] = 60.0
+        self.assertEqual(limiter.retry_after_seconds("target-a", policy), 0.0)
         self.assertTrue(limiter.reserve("target-a", policy).allowed)
         limited = RateLimiter(clock=lambda: now[0])
         budget = ExperimentBudget(max_requests=1, max_mutations=1, max_creations=1, max_retries=0)
@@ -326,6 +376,8 @@ class RateTests(unittest.TestCase):
         limited.release(one.reservation_id)
         self.assertEqual(limited.reserve("target-c", policy, experiment_id="exp",
                                          budget=budget).reason_code, "EXPERIMENT_REQUEST_BUDGET")
+        self.assertIsNone(limited.retry_after_seconds(
+            "target-c", policy, experiment_id="exp", budget=budget))
 
 
 class PolicyApiTests(unittest.TestCase):

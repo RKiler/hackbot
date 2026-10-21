@@ -50,6 +50,8 @@ _ACTION_FIELD = {
     AutonomyAction.PERMISSION_CHANGE: "permission_changes",
     AutonomyAction.FINANCIAL: "financial",
 }
+AUTONOMY_RISK_FIELDS = tuple(_RISK_FIELD.values())
+AUTONOMY_ACTION_FIELDS = tuple(_ACTION_FIELD.values())
 _OWNED_OBJECT_ACTIONS = frozenset({
     AutonomyAction.MODIFY_DISPOSABLE_OBJECT,
     AutonomyAction.DELETE_DISPOSABLE_OBJECT,

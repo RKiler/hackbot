@@ -30,6 +30,23 @@ function literal(node) {
   return null;
 }
 
+function routeLiteral(node) {
+  const fixed = literal(node);
+  if (fixed !== null) return fixed;
+  if (!node || node.type !== "BinaryExpression" || node.operator !== "+") return null;
+  const base = routeLiteral(node.left);
+  const suffix = literal(node.right);
+  if (base && base.endsWith("{id}") && suffix && /^\/[A-Za-z0-9_-]{1,64}$/.test(suffix))
+    return base + suffix;
+  const prefix = literal(node.left);
+  const right = node.right;
+  if (!prefix || !prefix.endsWith("/") || !right || right.type !== "CallExpression" ||
+      member(right.callee) !== "encodeURIComponent" || right.arguments.length !== 1 ||
+      right.arguments[0].type !== "Identifier" ||
+      !/^(?:id|[A-Za-z][A-Za-z0-9]*Id)$/.test(right.arguments[0].name)) return null;
+  return prefix + "{id}";
+}
+
 function record(node, path) {
   const value = literal(node);
   if (!value || value.length > 16384 || !/\b(?:query|mutation|subscription|fragment)\s+[A-Za-z_]/.test(value)) return;
@@ -51,8 +68,9 @@ function property(object, key) {
 }
 
 function recordRoute(node, method, path) {
-  const value = literal(node);
-  if (!value || !/^\/api\/[A-Za-z0-9_./:-]{1,500}$/.test(value) ||
+  const value = routeLiteral(node);
+  if (!value || !/^\/api\/[A-Za-z0-9_./:{}-]{1,500}$/.test(value) ||
+      (value.includes("{") && !/^\/api\/[A-Za-z0-9_./:-]+\/\{id\}(?:\/[A-Za-z0-9_-]{1,64})?$/.test(value)) ||
       value.includes("..") || value.includes("//") || !/^(GET|HEAD|POST|PUT|PATCH|DELETE)$/.test(method)) return;
   const key = method + " " + value;
   if (routeSeen.has(key)) return;

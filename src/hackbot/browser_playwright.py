@@ -5,19 +5,42 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
+import time
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
 import uuid
 
 from .browser import (BrowserError, BrowserProxyConfig, IdentityObservation,
                       IdentityVerificationRule)
+from .browser_proxy_guard import BrowserProxyGuard, BrowserProxyGuardError
 from .browser_trust import ProfileTrustError, install_profile_ca
 from .domxss_browser import DOMBrowserObservation
+from .logging import is_sensitive_key
 from .postmessage_browser import (MessageBrowserObservation, MessageExperimentBinding,
                                   MessageVariant, lookalike_origin)
 from .secrets import SecretValue
+from .target_scope import ScopeResult
+
+
+_COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserNavigationObservation:
+    url: str = field(repr=False)
+    status_code: int | None
+    scripts: tuple[str, ...] = field(repr=False)
+    links: tuple[str, ...] = field(repr=False)
+    forms: tuple[tuple[str, str], ...] = field(repr=False)
+    buttons: tuple[tuple[str, str], ...] = field(repr=False)
+    request_count: int
+    denied_count: int
+    redirect_count: int
+    error_code: str | None
+    form_fields: tuple[tuple[tuple[str, str], ...], ...] = field(default=(), repr=False)
 
 
 class PlaywrightBrowserDriver:
@@ -33,6 +56,9 @@ class PlaywrightBrowserDriver:
         self._playwright = None
         self._contexts: dict[str, object] = {}
         self._proxy_settings: dict[str, BrowserProxyConfig] = {}
+        self._proxy_guards: dict[str, BrowserProxyGuard] = {}
+        self._mapping_active: set[str] = set()
+        self._websocket_routed: set[str] = set()
 
     def start(self, session_id: str, profile: Path, *, display: str | None,
               proxy: BrowserProxyConfig) -> None:
@@ -40,6 +66,8 @@ class PlaywrightBrowserDriver:
             raise BrowserError("Browser session is already running")
         if proxy.ca_reference is not None and proxy.ca_certificate is None:
             raise BrowserError("Profile CA certificate is required")
+        if proxy.capture_required and proxy.guard_scope is None:
+            raise BrowserError("Captured browser requires target-scoped transport guard")
         if proxy.ca_certificate is not None:
             try:
                 install_profile_ca(profile, proxy.ca_certificate)
@@ -49,12 +77,28 @@ class PlaywrightBrowserDriver:
             from playwright.sync_api import sync_playwright
         except ImportError:
             raise BrowserError("Install the browser extra to use Playwright") from None
-        if self._playwright is None:
-            self._playwright = sync_playwright().start()
+        guard = None
+        if proxy.capture_required:
+            try:
+                assert proxy.proxy_url is not None and proxy.guard_scope is not None
+                guard = BrowserProxyGuard(proxy.guard_scope, proxy.proxy_url)
+            except BrowserProxyGuardError:
+                raise BrowserError("Target-scoped browser transport is unavailable") from None
+        try:
+            if self._playwright is None:
+                self._playwright = sync_playwright().start()
+        except Exception:
+            if guard is not None:
+                guard.close()
+            raise BrowserError("Playwright could not start") from None
         browser_env = {"PATH": "/usr/bin:/bin", "HOME": str(profile.parent),
                        "LANG": os.environ.get("LANG", "C.UTF-8")}
         options = {"headless": display is None, "chromium_sandbox": False,
                    "ignore_https_errors": False, "accept_downloads": False,
+                   "service_workers": "block",
+                   "args": ["--disable-background-networking", "--disable-component-update",
+                            "--disable-domain-reliability", "--disable-sync",
+                            "--metrics-recording-only", "--no-first-run"],
                    "env": browser_env}
         if display is not None:
             browser_env["DISPLAY"] = display
@@ -62,9 +106,9 @@ class PlaywrightBrowserDriver:
                 browser_env["XAUTHORITY"] = os.environ["XAUTHORITY"]
         if proxy.enabled:
             assert proxy.proxy_url is not None
-            options["proxy"] = {"server": proxy.proxy_url}
+            options["proxy"] = {"server": guard.proxy_url if guard else proxy.proxy_url}
             if proxy.capture_required:
-                options["args"] = ["--proxy-bypass-list=<-loopback>"]
+                options["args"].append("--proxy-bypass-list=<-loopback>")
         if self._executable_path is not None:
             if not self._executable_path.is_file():
                 raise BrowserError("Configured Chromium executable is unavailable")
@@ -72,24 +116,87 @@ class PlaywrightBrowserDriver:
         try:
             context = self._playwright.chromium.launch_persistent_context(str(profile), **options)
         except Exception:
+            if guard is not None:
+                guard.close()
             raise BrowserError("Chromium launch failed") from None
         self._contexts[session_id] = context
-        self._proxy_settings[session_id] = proxy
+        self._proxy_settings[session_id] = replace(proxy, proxy_url=guard.proxy_url) if guard else proxy
+        if guard is not None:
+            self._proxy_guards[session_id] = guard
 
     def stop(self, session_id: str) -> None:
         context = self._contexts.pop(session_id, None)
         self._proxy_settings.pop(session_id, None)
+        guard = self._proxy_guards.pop(session_id, None)
+        self._mapping_active.discard(session_id)
+        self._websocket_routed.discard(session_id)
         if context is not None:
             try:
                 context.close()
             except Exception:
                 raise BrowserError("Chromium close failed") from None
+            finally:
+                if guard is not None:
+                    guard.close()
+        elif guard is not None:
+            guard.close()
         if not self._contexts and self._playwright is not None:
             self._playwright.stop()
             self._playwright = None
 
     def is_running(self, session_id: str) -> bool:
         return session_id in self._contexts
+
+    def cookie_header_for(self, session_id: str, url: str) -> SecretValue:
+        """Return a current matching cookie header only at the trusted execution boundary."""
+        context = self._contexts.get(session_id)
+        proxy = self._proxy_settings.get(session_id)
+        if context is None or proxy is None or not proxy.capture_required or proxy.guard_scope is None:
+            raise BrowserError("Verified captured browser session is required")
+        try:
+            parsed = urlsplit(url)
+            if (parsed.scheme not in {"http", "https"} or parsed.hostname is None
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.fragment or proxy.guard_scope.evaluate_url(url).result
+                    is not ScopeResult.IN_SCOPE):
+                raise ValueError
+        except ValueError:
+            raise BrowserError("Cookie destination is outside the captured scope") from None
+        host = parsed.hostname.lower()
+        path = parsed.path or "/"
+        try:
+            cookies = context.cookies(urls=[url])
+        except Exception:
+            raise BrowserError("Browser cookies are unavailable") from None
+        selected = []
+        for cookie in cookies:
+            name, value = cookie.get("name"), cookie.get("value")
+            domain, cookie_path = cookie.get("domain"), cookie.get("path")
+            if (not isinstance(domain, str) or not isinstance(cookie_path, str)
+                    or not isinstance(name, str) or not isinstance(value, str)
+                    or not _COOKIE_NAME.fullmatch(name)
+                    or any(ord(char) < 33 or ord(char) > 126 or char in ";\\" for char in value)):
+                raise BrowserError("Browser cookie cannot be used safely")
+            domain = domain.lower()
+            if domain.startswith("."):
+                if host != domain[1:] and not host.endswith(domain):
+                    continue
+            elif host != domain:
+                continue
+            if (not cookie_path.startswith("/") or not path.startswith(cookie_path)
+                    or (len(path) > len(cookie_path) and not cookie_path.endswith("/")
+                        and path[len(cookie_path)] != "/")):
+                continue
+            if cookie.get("secure") and parsed.scheme != "https":
+                continue
+            expires = cookie.get("expires")
+            if isinstance(expires, (int, float)) and expires >= 0 and expires <= time.time():
+                continue
+            selected.append(f"{name}={value}")
+        header = "; ".join(selected)
+        if not header or len(header) > 8192:
+            raise BrowserError("No usable browser cookie is available")
+        return SecretValue(header)
 
     def active_session_count(self) -> int:
         return len(self._contexts)
@@ -170,6 +277,155 @@ class PlaywrightBrowserDriver:
         except Exception:
             return None
 
+    def navigate_readonly(self, session_id: str, url: str,
+                          gate: Callable[[str, str, bool], object],
+                          redirect_allowed: Callable[[str], bool], *,
+                          request_cap: int = 24, timeout_ms: int = 20000,
+                          response_cap: int = 2_097_152) -> BrowserNavigationObservation:
+        """Inspect one page with every HTTP request intercepted and separately authorized."""
+        context = self._contexts.get(session_id)
+        proxy = self._proxy_settings.get(session_id)
+        if context is None or proxy is None or not proxy.enabled or not proxy.capture_required:
+            raise BrowserError("Captured browser session is required for mapping")
+        if (session_id in self._mapping_active or not 1 <= request_cap <= 96
+                or not 1000 <= timeout_ms <= 30000
+                or not 65536 <= response_cap <= 2_097_152):
+            raise BrowserError("Invalid or concurrent browser mapping request")
+        if context.service_workers:
+            raise BrowserError("Existing service workers prevent policy-gated mapping")
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise BrowserError("Invalid browser navigation URL")
+        self._mapping_active.add(session_id)
+        if session_id not in self._websocket_routed:
+            context.route_web_socket("**/*", lambda ws: ws.close() if session_id in self._mapping_active
+                                     else ws.connect())
+            self._websocket_routed.add(session_id)
+        page = None
+        current_url = url
+        redirect_to = None
+        request_count = denied_count = redirect_count = 0
+        status_code = None
+        error_code = None
+        route_failure = None
+
+        def handle(route) -> None:
+            nonlocal request_count, denied_count, redirect_to, status_code, route_failure
+            request = route.request
+            request_count += 1
+            if (request_count > request_cap or request.method not in {"GET", "HEAD"}
+                    or request.resource_type not in {
+                        "document", "script", "stylesheet", "xhr", "fetch"}):
+                denied_count += 1
+                route.abort()
+                return
+            try:
+                ticket = gate(request.url, request.method, request.is_navigation_request())
+            except Exception:
+                ticket = None
+            if not ticket:
+                denied_count += 1
+                route.abort()
+                return
+            release = getattr(gate, "release", None)
+            succeeded = False
+            stage = "FETCH"
+            try:
+                response = route.fetch(max_redirects=0, timeout=min(timeout_ms, 10000))
+                if 300 <= response.status < 400:
+                    destination = response.headers.get("location")
+                    if (request.resource_type == "document" and request.url == current_url
+                            and destination):
+                        redirect_to = urljoin(request.url, destination)
+                    denied_count += 1
+                    route.abort()
+                    return
+                length = response.headers.get("content-length", "0")
+                if length.isdecimal() and int(length) > response_cap:
+                    denied_count += 1
+                    route.abort()
+                    return
+                body = response.body()
+                if len(body) > response_cap:
+                    denied_count += 1
+                    route.abort()
+                    return
+                if request.resource_type == "document" and request.url == current_url:
+                    status_code = response.status
+                stage = "FULFILL"
+                route.fulfill(response=response)
+                succeeded = True
+            except Exception:
+                route_failure = "BROWSER_" + stage + "_FAILED"
+                denied_count += 1
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+            finally:
+                if callable(release):
+                    release(ticket, succeeded)
+
+        try:
+            context.route("**/*", handle)
+            for _ in range(5):
+                if page is not None:
+                    page.close()
+                page = context.new_page()
+                redirect_to = None
+                try:
+                    page.goto(current_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception:
+                    if redirect_to is None:
+                        error_code = route_failure or "NAVIGATION_FAILED"
+                if redirect_to is None:
+                    break
+                redirect_count += 1
+                if redirect_count > 4 or not redirect_allowed(redirect_to):
+                    error_code = "REDIRECT_DENIED"
+                    break
+                current_url = redirect_to
+            if error_code is None:
+                page.wait_for_timeout(200)
+            scripts = tuple((item.get_attribute("src", timeout=500) or "")
+                            for item in page.locator("script[src]").all()[:24]) if error_code is None else ()
+            links = tuple((item.get_attribute("href", timeout=500) or "")
+                          for item in page.locator("a[href]").all()[:40]) if error_code is None else ()
+            form_nodes = page.locator("form").all()[:16] if error_code is None else ()
+            forms = tuple(((item.get_attribute("action", timeout=500) or ""),
+                           (item.get_attribute("method", timeout=500) or "GET").upper())
+                          for item in form_nodes)
+            form_fields = []
+            for form in form_nodes:
+                fields = []
+                for control in form.locator("input[name], select[name], textarea[name]").all()[:16]:
+                    name = control.get_attribute("name", timeout=500) or ""
+                    tag = control.evaluate("element => element.tagName.toLowerCase()")
+                    kind = control.get_attribute("type", timeout=500) or (
+                        "text" if tag == "input" else tag)
+                    if (re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) and
+                            not is_sensitive_key(name) and
+                            kind in {"text", "search", "textarea", "select", "number", "checkbox"}):
+                        fields.append((name, kind))
+                form_fields.append(tuple(dict.fromkeys(fields)))
+            buttons = tuple(((item.get_attribute("type", timeout=500) or "button"),
+                             (item.get_attribute("aria-label", timeout=500) or "")[:80])
+                            for item in page.locator("button").all()[:24]) if error_code is None else ()
+            return BrowserNavigationObservation(
+                current_url, status_code, tuple(item for item in scripts if item),
+                tuple(item for item in links if item), forms, buttons,
+                request_count, denied_count, redirect_count, error_code,
+                tuple(form_fields))
+        finally:
+            try:
+                if page is not None:
+                    page.close()
+            finally:
+                try:
+                    context.unroute("**/*", handle)
+                finally:
+                    self._mapping_active.discard(session_id)
+
     def execute_dom_variant(self, session_id: str, url: str, marker: str,
                             expected_asset_url: str,
                             gate: Callable[[str, str, bool], bool], *,
@@ -220,12 +476,11 @@ class PlaywrightBrowserDriver:
                     return
                 try:
                     response = route.fetch(max_redirects=0, timeout=min(timeout_ms, 5000))
-                    if response.status in {301, 302, 303, 307, 308}:
-                        destination = response.headers.get("location")
-                        if not destination or not gate(urljoin(request.url, destination), "GET", True):
-                            denied += 1
-                            route.abort()
-                            return
+                    if 300 <= response.status < 400:
+                        # Fulfilled browser redirects bypass route interception on later hops.
+                        denied += 1
+                        route.abort()
+                        return
                     if int(response.headers.get("content-length", "0")) > 2_097_152:
                         denied += 1
                         route.abort()

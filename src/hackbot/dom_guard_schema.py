@@ -129,6 +129,16 @@ def dom_guard_extension_sql(migration: str, *, table_prefix: str) -> str:
     return "\n".join(statements)
 
 
+def dom_guard_rebuilt_table_sql(table: str, columns: tuple[str, ...]) -> str:
+    """Restore retirement guards after a referenced table is rebuilt in place."""
+    statements = [
+        f"INSERT OR IGNORE INTO {_q(_SOURCE_TABLE)} VALUES ({_literal(table)},{_literal(column)});"
+        for column in columns
+    ]
+    statements.extend(_trigger(table, columns, action) for action in ("insert", "update"))
+    return "\n".join(statements)
+
+
 def verify_dom_retirement_guards(db: sqlite3.Connection) -> None:
     if db.execute("PRAGMA user_version").fetchone()[0] < 46:
         raise ValueError("DOM retirement requires schema 46 guards")

@@ -23,7 +23,8 @@ import unittest
 
 from hackbot.artifacts import ArtifactStore
 from hackbot.auth import AuthContextManager, AuthMechanism, AuthStatus
-from hackbot.browser import BrowserSessionManager, IdentityObservation, IdentityVerificationRule
+from hackbot.browser import (BrowserProxyConfig, BrowserSessionManager,
+                            IdentityObservation, IdentityVerificationRule)
 from hackbot.config import (BrowserSettings, ExecutorSettings, RetentionSettings,
                             SecretBindingConfig, SecretSettings, StoreSettings)
 from hackbot.domxss import DOMAcquisitionStatus, DOMXSSSpecialist
@@ -37,7 +38,7 @@ from hackbot.policy_models import ActionCategory, ActorMode, ProposedAction
 from hackbot.policy_store import PolicyStore
 from hackbot.rate_limit import ExperimentBudget, RateLimiter
 from hackbot.recon import Page, Provenance, ReconJsAsset, ReconTarget
-from hackbot.secrets import RoutedSecretProvider
+from hackbot.secrets import RoutedSecretProvider, SecretValue
 from hackbot.store import EvidenceFactStore
 from hackbot.target_loader import load_target_package
 from hackbot.target_policy import RatePolicy
@@ -494,7 +495,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         target = self.server.target
         connection = http.client.HTTPConnection("127.0.0.1", target.server_port, timeout=1)
         try:
-            connection.request("GET", "/ok")
+            cookie_request = self.path.endswith("/cookie")
+            connection.request("GET", "/cookie" if cookie_request else "/ok",
+                               headers={"Cookie": self.headers.get("Cookie", "")}
+                               if cookie_request else {})
             response = connection.getresponse()
             body = response.read()
         finally:
@@ -951,6 +955,60 @@ class ExecutorTests(ExecutorFixture):
                                     identity_id=manual.id, session_id=browser_session.id)
         self.assertEqual(self.run_action(manual_action).error, ExecutionError.AUTH_UNAVAILABLE)
         self.assertEqual(self.server.received, [])
+
+    def test_manual_browser_cookie_requires_verified_captured_session(self):
+        identity = self.registry.register_identity(
+            self.package.target.id, "captured_manual", status=IdentityStatus.ACTIVE)
+        self.auth.prepare(self.package.target.id, identity.id,
+                          mechanism=AuthMechanism.MANUAL_LOGIN)
+        proxy = BrowserProxyConfig(enabled=True, proxy_url="http://127.0.0.1:38080",
+                                   capture_required=True, guard_scope=self.package.scope)
+        session = self.browser.create(self.package.target.id, identity.id, proxy=proxy)
+        self.browser.start(session.id, proxy=proxy, package=self.package,
+                           proxy_health_check=lambda _proxy: True)
+        self.browser.login_complete(session.id)
+        self.driver.observations[session.id] = IdentityObservation(user_id="captured_manual")
+        self.browser.verify(session.id, IdentityVerificationRule(
+            self.package.target.id, identity.id, "[data-user]", None, None,
+            "captured_manual", None, None))
+        action = self.action("/cookie", actor=ActorMode.AUTHENTICATED,
+                             identity_id=identity.id, session_id=session.id)
+        self.assertEqual(self.run_action(action).error, ExecutionError.AUTH_UNAVAILABLE)
+        self.assertEqual(self.server.received, [])
+
+        self.driver.cookie_header_for = lambda browser_id, url: SecretValue(
+            "fixture-cookie=owned" if browser_id == session.id and url == action.url else "")
+        self.assertEqual(self.executor._authentication(action),
+                         ("Cookie", "fixture-cookie=owned"))
+        proxy_server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        proxy_server.received = []
+        proxy_server.target = self.server
+        proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+        proxy_thread.start()
+        self.addCleanup(proxy_server.server_close)
+        self.addCleanup(proxy_server.shutdown)
+
+        class LocalCaptureRoute:
+            def route(self, _action):
+                return ProxyRoute(f"http://127.0.0.1:{proxy_server.server_port}")
+
+        self.executor.proxy = LocalCaptureRoute()
+        self.executor.settings = replace(self.executor.settings,
+                                         allow_direct=False, capture_required=True)
+        self.assertEqual(self.run_action(action).status_code, 200)
+        self.assertEqual(self.server.received[-1],
+                         ("GET", "/cookie", "fixture-cookie=owned"))
+        dispatched_count = len(self.server.received)
+        self.driver.cookie_header_for = lambda *_args: "fixture-cookie=wrong-type"
+        self.assertEqual(self.run_action(action).error, ExecutionError.AUTH_UNAVAILABLE)
+        self.driver.cookie_header_for = lambda *_args: SecretValue("bad\r\nheader")
+        self.assertEqual(self.run_action(action).error, ExecutionError.AUTH_UNAVAILABLE)
+        self.assertEqual(len(self.server.received), dispatched_count)
+        self.browser.stop(session.id)
+        self.driver.cookie_header_for = lambda *_args: SecretValue("fixture-cookie=owned")
+        with self.assertRaises(PermitError):
+            self.run_action(action)
+        self.assertEqual(len(self.server.received), dispatched_count)
 
     def test_body_cap_gzip_and_timeout(self):
         for path in ("/large", "/gzip"):

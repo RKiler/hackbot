@@ -429,7 +429,7 @@ class BurpTests(unittest.TestCase):
             exchange.response.body_evidence_id, allow_sensitive=True), b'{"ok":true}')
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM burp_capture_index").fetchone()[0], 1)
-        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
 
     def test_retired_burp_capture_rejects_late_retry_without_rehydrating_payload(self) -> None:
         self.traffic.retention_policy = TrafficRetentionPolicy(1, 1, 1)
@@ -740,9 +740,13 @@ class BurpTests(unittest.TestCase):
         profile.mkdir()
         driver = PlaywrightBrowserDriver()
         with patch.dict(sys.modules, {"playwright": root, "playwright.sync_api": sync}):
-            driver.start("fixture", profile, display=None, proxy=self.proxy.proxy_config(38080))
+            driver.start("fixture", profile, display=None,
+                         proxy=replace(self.proxy.proxy_config(38080),
+                                       guard_scope=replace(self.package.scope,
+                                                           include_paths=(), exclude_paths=())))
             driver.stop("fixture")
-        self.assertEqual(captured["proxy"], {"server": "http://127.0.0.1:38080"})
+        self.assertTrue(captured["proxy"]["server"].startswith("http://127.0.0.1:"))
+        self.assertNotEqual(captured["proxy"]["server"], "http://127.0.0.1:38080")
         self.assertIn("--proxy-bypass-list=<-loopback>", captured["args"])
         self.assertFalse(captured["ignore_https_errors"])
 

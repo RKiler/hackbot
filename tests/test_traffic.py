@@ -847,7 +847,7 @@ class TrafficTests(unittest.TestCase):
 
     def test_schema_indexes_migration_and_no_production_dependency(self):
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             indexes = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'traffic_%'")}
             for name in ("traffic_exchanges_target_recent_idx", "traffic_exchanges_identity_recent_idx",
@@ -914,7 +914,7 @@ class TrafficTests(unittest.TestCase):
         self.evidence.initialize(allow_existing_migration=True)
         self.traffic.initialize()
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertEqual(connection.execute("SELECT package_id FROM registry_targets WHERE target_id=?",
                                                 (self.target,)).fetchone()[0], self.package.id)
 
@@ -939,7 +939,7 @@ class TrafficTests(unittest.TestCase):
         self.evidence.initialize(allow_existing_migration=True)
         self.assertIsNotNone(self.traffic.get_exchange(exchange.id))
         with self.evidence._connection() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertTrue(has_external_traffic_reference(connection, **values))
             self.assertIn("retired_traffic_link_burp_capture_index_insert", {
                 row[0] for row in connection.execute(
@@ -970,7 +970,7 @@ class TrafficTests(unittest.TestCase):
             self.assertTrue(has_external_traffic_reference(connection, **values))
         self.evidence.initialize(allow_existing_migration=True)
         with self.evidence._connection() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
             self.assertTrue(has_external_traffic_reference(connection, **values))
 
     def test_schema_42_upgrade_refuses_invalid_json_without_advancing(self):

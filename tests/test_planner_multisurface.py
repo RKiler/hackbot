@@ -27,7 +27,7 @@ from hackbot.exposure_models import ExposureCategory, ExposureStatus
 from hackbot.exposure_store import ExposureStore
 from hackbot.orchestrator import PlanOrchestrator
 from hackbot.notification_store import NotificationStore
-from hackbot.planner import CrossSpecialistPlanner
+from hackbot.planner import CrossSpecialistPlanner, _Signal
 from hackbot.planner_context import PlannerContextBuilder
 from hackbot.planner_models import (CandidateStatus, PlannerLimits, PlannerMode,
                                     PlannerStatus, PlannerTaskStatus, PlannerTaskType,
@@ -123,6 +123,53 @@ class PlannerMultisurfaceTests(unittest.TestCase):
             exposure=self.exposure, research=SimpleNamespace(), objects=self.fx.objects,
             object_factory=self.fx.factory, browser=self.fx.browser,
             orchestrator=orchestrator, validator=validator)
+
+    def test_autonomous_portfolio_defers_api_leads_without_proof_prerequisites(self) -> None:
+        limits = PlannerLimits(requests=30, browser_actions=0, candidates=2,
+                               per_specialist=2, cleanup_reserve=2)
+        run = self.planner_store.create(
+            self.package, PlannerMode.BOUNDED_AUTONOMOUS, limits,
+            policy_version(self.package))
+        context = self.planner.context.build(self.package, limits)
+
+        def signal(source_id: str, surface: str) -> _Signal:
+            return _Signal("API_GRAPHQL", source_id, Specialist.API_GRAPHQL,
+                           "OBJECT_AUTH", surface, "CROSS_TENANT", 90, 70, 1,
+                           "CURRENT", "LOW", 5, 0, 0, (), (source_id,))
+
+        owned = "TESTOBJ-" + "d" * 32
+        context = replace(context, ready_object_ids=(owned,))
+        sources = (replace(signal("ready", "/api/documents/{id}/preview"),
+                           object_id=owned),
+                   replace(signal("same-object", "/api/documents/{id}"),
+                           object_id=owned, score=80),
+                   signal("plan-only", "/api/documents/{id}/history"))
+        with patch.object(self.api_registry, "get_candidate", side_effect=lambda _, key:
+                          SimpleNamespace(status="PLAN_ONLY" if key == "plan-only" else "READY")):
+            ranked = self.planner._rank(run, context, sources)
+        statuses = {item.source_id: item for item in ranked}
+        self.assertEqual(statuses["ready"].status, CandidateStatus.SELECTED)
+        self.assertEqual(statuses["same-object"].status, CandidateStatus.DEFERRED)
+        self.assertIn("OWNED_OBJECT_RESERVED_FOR_BRANCH",
+                      statuses["same-object"].reason_codes)
+        self.assertEqual(statuses["plan-only"].status, CandidateStatus.DEFERRED)
+        self.assertIn("API_PROOF_PREREQUISITES_MISSING",
+                      statuses["plan-only"].reason_codes)
+        with patch.object(self.api_registry, "get_candidate",
+                          return_value=SimpleNamespace(status="READY")):
+            resumed = self.planner._rank(
+                run, context, sources,
+                suppressed_sources=frozenset({("API_GRAPHQL", "ready")}))
+        resumed_statuses = {item.source_id: item for item in resumed}
+        self.assertEqual(resumed_statuses["ready"].status, CandidateStatus.SKIPPED)
+        self.assertIn("CAMPAIGN_SOURCE_ALREADY_ATTEMPTED",
+                      resumed_statuses["ready"].reason_codes)
+        not_ready = replace(context, ready_object_ids=())
+        with patch.object(self.api_registry, "get_candidate",
+                          return_value=SimpleNamespace(status="READY")):
+            deferred = self.planner._rank(run, not_ready, sources)
+        self.assertEqual(next(item for item in deferred if item.source_id == "ready").status,
+                         CandidateStatus.DEFERRED)
 
     def _exchange(self, url: str, body: bytes, status: int, session_id: str | None,
                   *, content_type: str = "application/octet-stream") -> None:

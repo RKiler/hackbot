@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
 import re
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 from urllib.parse import urlsplit
 import uuid
 
@@ -43,6 +45,18 @@ _DESTRUCTIVE_OPERATIONS = frozenset({"destroy", "purge"})
 _KNOWN_OBJECT_VERBS = frozenset({"create", "add", "make", "save", "update", "edit",
                                  "rename", "delete", "remove", "archive"})
 _NETWORK_CATEGORIES = frozenset(ActionCategory) - {ActionCategory.PASSIVE_ANALYSIS}
+_SUPERVISED_HUNT: ContextVar[tuple[str, str] | None] = ContextVar(
+    "supervised_hunt_policy", default=None)
+
+
+@contextmanager
+def supervised_hunt_policy(package: TargetPackage) -> Iterator[None]:
+    """Make a linked supervised campaign ask before higher-risk permitted actions."""
+    token = _SUPERVISED_HUNT.set((package.target.id, package.id))
+    try:
+        yield
+    finally:
+        _SUPERVISED_HUNT.reset(token)
 
 
 def _operation_tokens(value: str) -> tuple[str, ...]:
@@ -401,6 +415,21 @@ class PolicyEngine:
                         SideEffect.DESTRUCTIVE: "DESTRUCTIVE_ACTION",
                         SideEffect.UNKNOWN: "UNKNOWN_SIDE_EFFECT",
                     }.get(classification.side_effect, "POLICY_REQUIRES_APPROVAL")
+                elif (_SUPERVISED_HUNT.get() == (package.target.id, package.id)
+                      and (classification.risk not in {RiskLevel.PASSIVE,
+                                                        RiskLevel.SAFE_READ}
+                           or action.cross_identity)
+                      and not (action.source == "object_factory"
+                               and not action.cross_identity
+                               and action.disposable_intent
+                               and action.object_type not in _DANGEROUS_OBJECTS
+                               and classification.side_effect in {
+                                   SideEffect.SAFE_CREATE, SideEffect.SAFE_UPDATE,
+                                   SideEffect.SAFE_DELETE}
+                               and (classification.side_effect is SideEffect.SAFE_CREATE
+                                    or owned))):
+                    result = PolicyDecision.REQUIRE_APPROVAL
+                    code = "SUPERVISED_APPROVAL_REQUIRED"
                 elif classification.side_effect is SideEffect.UNKNOWN:
                     result = PolicyDecision.REQUIRE_APPROVAL
                     code = "UNKNOWN_SIDE_EFFECT"

@@ -183,7 +183,8 @@ class SkillPlanningTests(unittest.TestCase):
                       list_memberships=lambda identity_id, **kwargs: NS(items=memberships[identity_id]))
         req = NS(display_path="/graphql", origin="https://example.test",
                  record=NS(method="POST", endpoint_id=None, operation_id="GraphQLQuery"))
-        exchange = NS(id="EXCHANGE-1", request=req,
+        exchange = NS(id="EXCHANGE-1", target_id=self.target,
+                      package_id=self.package.id, request=req,
                       attribution=NS(auth_state=NS(value="VERIFIED"), verified_identity_id=identities[0].id),
                       response=None)
         traffic = NS(find_recent=lambda *args, **kwargs: NS(items=(exchange,)))
@@ -208,6 +209,27 @@ class SkillPlanningTests(unittest.TestCase):
         self.assertNotIn("multiple_tenants", shared.flags)
         mutation = NS(**{**vars(h), "category": "GRAPHQL_MUTATION"})
         self.assertIn("graphql_mutation", builder.build(mutation, profile, self.package).flags)
+
+    def test_explicit_traffic_refs_do_not_cross_package_boundary(self):
+        request = NS(display_path="/private", origin="https://example.test",
+                     record=NS(method="GET", endpoint_id=None, operation_id=None))
+        foreign = NS(id="EXCHANGE-foreign", target_id=self.target,
+                     package_id="PACKAGE-other", request=request,
+                     attribution=NS(auth_state=NS(value="VERIFIED"),
+                                    verified_identity_id="IDENTITY-owned"),
+                     response=None)
+        traffic = NS(get_exchange=lambda _: foreign,
+                     find_recent=lambda *args, **kwargs: NS(items=(foreign,)))
+        registry = NS(list_identities=lambda *args, **kwargs: NS(items=()))
+        builder = SkillContextBuilder(
+            NS(get_evidence=lambda _: None, get_fact=lambda _: None), registry, traffic)
+        h = NS(id="HYP-" + "1" * 32, target_id=self.target, category="EXPOSURE",
+               boundary="AUTHENTICATED", surface_key="/private", evidence_ids=(),
+               fact_ids=(), missing=())
+        result = builder.build(h, None, self.package,
+                               traffic_exchange_ids=(foreign.id,))
+        self.assertEqual(result.traffic, ())
+        self.assertNotIn("baseline_traffic", result.flags)
 
     def test_plan_dedupe_version_snapshot_and_policy_only(self):
         calls = []

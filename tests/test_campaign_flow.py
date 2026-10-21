@@ -11,10 +11,12 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from hackbot.campaign_models import CampaignLimits, CampaignStatus, CampaignWorkKind
+from hackbot.campaign_models import (CampaignLimits, CampaignPreset, CampaignStatus,
+                                     CampaignWorkKind, CampaignWorkStatus)
 from hackbot.bootstrap_store import BootstrapStatus
 from hackbot.behaviour import LearningStatus
 from hackbot.config import TargetSettings, load_config
+from hackbot.domain import TrafficSource
 from hackbot.hypotheses import Hypothesis, HypothesisSource, HypothesisStatus
 from hackbot.planner_models import (CandidateStatus, PlannerCandidate, PlannerLimits,
                                    PlannerMode, PlannerStatus, PlannerTaskType, Specialist)
@@ -23,6 +25,7 @@ from hackbot.research import ResearchStatus
 from hackbot.resources import ResourceError
 from hackbot.service import BugHunterRuntime, create_app
 from hackbot.test_objects import ObjectState
+from hackbot.traffic import CapturePacket, CapturedRequest, CapturedResponse
 
 
 EXAMPLE = Path(__file__).parent / "examples/targets/example"
@@ -43,6 +46,94 @@ class CampaignFlowTests(unittest.TestCase):
         self.admission = patch.object(self.runtime.resources, "admit", return_value=None)
         self.admission.start()
         self.addCleanup(self.admission.stop)
+
+    def test_only_viable_deferred_branch_extends_stable_cycle(self):
+        campaign = self.runtime.campaign.start(
+            self.package, mode=PlannerMode.BOUNDED_AUTONOMOUS,
+            limits=CampaignLimits(max_cycles=2), requested_by="tester")
+        candidate = SimpleNamespace(
+            status=CandidateStatus.DEFERRED, priority=70, freshness="CURRENT",
+            reason_codes=("OWNED_OBJECT_RESERVED_FOR_BRANCH",),
+            estimated_requests=1, estimated_browser=0, estimated_tokens=100,
+            gaps=("MISSING_REQUEST_TEMPLATE",))
+        with patch.object(self.runtime.planner_store, "candidates",
+                          return_value=(candidate,)):
+            self.assertTrue(self.runtime.campaign._has_viable_deferred_branch(
+                campaign, "PLRUN-" + "a" * 32))
+        ready = SimpleNamespace(**{**vars(candidate), "reason_codes": (), "gaps": ()})
+        with patch.object(self.runtime.planner_store, "candidates", return_value=(ready,)):
+            self.assertTrue(self.runtime.campaign._has_viable_deferred_branch(
+                campaign, "PLRUN-" + "a" * 32))
+        for changed in (
+                {"status": CandidateStatus.REJECTED},
+                {"reason_codes": ("API_PROOF_PREREQUISITES_MISSING",)},
+                {"reason_codes": ("BOUND_OBJECT_NOT_READY",)},
+                {"freshness": "STALE"},
+                {"priority": 49},
+                {"estimated_requests": 21},
+                {"estimated_tokens": 2001},
+                {"reason_codes": (), "gaps": ("MISSING_OBJECT",)}):
+            row = SimpleNamespace(**{**vars(candidate), **changed})
+            with patch.object(self.runtime.planner_store, "candidates",
+                              return_value=(row,)):
+                self.assertFalse(self.runtime.campaign._has_viable_deferred_branch(
+                    campaign, "PLRUN-" + "a" * 32))
+
+    def test_stable_context_continues_for_deferred_distinct_route(self):
+        campaign = self.runtime.campaign.start(
+            self.package, mode=PlannerMode.BOUNDED_AUTONOMOUS,
+            limits=CampaignLimits(max_cycles=2), requested_by="tester")
+        self.runtime.campaign.advance(self.package, campaign.id)
+        campaign = self.runtime.campaign.advance(self.package, campaign.id)
+        self.assertEqual(campaign.status, CampaignStatus.RUNNING)
+        child = SimpleNamespace(id="PLRUN-" + "a" * 32,
+                                status=PlannerStatus.COMPLETED, selected_count=1,
+                                context_hash="same-context")
+        work = SimpleNamespace(id="CWORK-" + "b" * 32,
+                               kind=CampaignWorkKind.PLANNER,
+                               status=CampaignWorkStatus.LINKED,
+                               child_id=child.id)
+        with patch.object(self.runtime.campaign.store, "works", return_value=(work,)), \
+             patch.object(self.runtime.campaign, "_resource", return_value=None), \
+             patch.object(self.runtime.planner_store, "get", return_value=child), \
+             patch.object(self.runtime.campaign, "_track_planner_objects"), \
+             patch.object(self.runtime.campaign, "_record_outcomes"), \
+             patch.object(self.runtime.campaign.store, "finish_work"), \
+             patch.object(self.runtime.campaign, "_readiness",
+                          return_value=(SimpleNamespace(snapshot_hash="same-context"), {})), \
+             patch.object(self.runtime.campaign, "_has_viable_deferred_branch",
+                          return_value=True), \
+             patch.object(self.runtime.campaign, "_cleanup",
+                          side_effect=AssertionError("deferred route was discarded")), \
+             patch.object(self.runtime.campaign.store, "transition",
+                          return_value=campaign) as transition:
+            self.runtime.campaign.advance(self.package, campaign.id)
+        self.assertEqual(transition.call_args.args[2:],
+                         (CampaignStatus.ASSESSING_READINESS,
+                          "DEFERRED_BRANCH_READY"))
+
+    def test_recent_captured_429_pauses_before_new_campaign_work(self):
+        campaign = self.runtime.campaign.start(
+            self.package, mode=PlannerMode.BOUNDED_AUTONOMOUS,
+            limits=CampaignLimits.preset(CampaignPreset.HUNT),
+            requested_by="tester")
+        self.runtime.campaign.advance(self.package, campaign.id)
+        campaign = self.runtime.campaign.advance(self.package, campaign.id)
+        self.assertEqual(campaign.status, CampaignStatus.RUNNING)
+        now = datetime.now(timezone.utc)
+        packet = CapturePacket(
+            CapturedRequest("GET", "https://example.test/probe", observed_at=now),
+            CapturedResponse(429, observed_at=now, elapsed_ms=8000))
+        self.runtime.traffic.store_exchange(
+            self.package, packet, source=TrafficSource.HACKBOT,
+            capture_provider="LOCAL_FIXTURE", anonymous=True)
+        signals = self.runtime.campaign._adaptive_signals(campaign)
+        self.assertIsNotNone(signals.latest_429_age_seconds)
+        self.assertEqual(signals.median_latency_ms, 8000)
+        paused = self.runtime.campaign._planner(
+            self.package, campaign, self.runtime.campaign._remaining(campaign))
+        self.assertEqual(paused.status, CampaignStatus.PAUSED)
+        self.assertEqual(paused.readiness_code, "TARGET_THROTTLED")
 
     def test_analyze_only_completes_without_target_execution(self):
         with patch.object(self.runtime.executor, "execute", side_effect=AssertionError("target request")):

@@ -29,6 +29,18 @@ class WorkKind(str, Enum):
     RESEARCH = "RESEARCH"
 
 
+RECOVERABLE_RESOURCE_REASONS = frozenset({
+    "CONCURRENCY_LIMIT", "LOW_MEMORY", "MEMORY_STATUS_UNKNOWN",
+    "HIGH_LOAD", "CRITICAL_LOAD", "LOAD_STATUS_UNKNOWN",
+    "HIGH_DISK", "CRITICAL_DISK", "HIGH_SYSTEM_DISK",
+    "CRITICAL_SYSTEM_DISK", "STORAGE_UNAVAILABLE",
+    "SYSTEM_STORAGE_UNAVAILABLE", "REQUIRED_MOUNT_UNAVAILABLE",
+})
+RECOVERABLE_CAMPAIGN_PAUSE_REASONS = RECOVERABLE_RESOURCE_REASONS | {
+    "TARGET_THROTTLED",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     disk_total_bytes: int
@@ -41,6 +53,7 @@ class ResourceSnapshot:
     system_disk_free_bytes: int | None = None
     system_disk_used_percent: int | None = None
     load_per_cpu: float | None = None
+    swap_used_percent: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -53,6 +66,7 @@ class ResourceSnapshot:
             "system_disk_free_bytes": self.system_disk_free_bytes,
             "system_disk_used_percent": self.system_disk_used_percent,
             "load_per_cpu": self.load_per_cpu,
+            "swap_used_percent": self.swap_used_percent,
         }
 
 
@@ -134,17 +148,34 @@ def _load_per_cpu() -> float | None:
         return None
 
 
+def _swap_used_percent(path: Path = Path("/proc/meminfo")) -> int | None:
+    try:
+        values = {}
+        for line in path.read_text(encoding="ascii").splitlines():
+            key, _, value = line.partition(":")
+            if key in {"SwapTotal", "SwapFree"}:
+                values[key] = int(value.split()[0])
+        total, free = values["SwapTotal"], values["SwapFree"]
+        if total < 0 or not 0 <= free <= total:
+            return None
+        return 0 if total == 0 else int((total - free) * 100 / total)
+    except (OSError, UnicodeError, ValueError, IndexError, KeyError):
+        return None
+
+
 class ResourceBudgetManager:
     def __init__(self, root: Path, settings: ResourceSettings,
                  *, disk_usage: Callable[[Path], shutil._ntuple_diskusage] = shutil.disk_usage,
                  memory_available: Callable[[], int | None] = _memory_available,
                  load_per_cpu: Callable[[], float | None] = _load_per_cpu,
+                 swap_used_percent: Callable[[], int | None] = _swap_used_percent,
                  system_disk_path: Path | None = None) -> None:
         self.root = root
         self.settings = settings
         self._disk_usage = disk_usage
         self._memory_available = memory_available
         self._load_per_cpu = load_per_cpu
+        self._swap_used_percent = swap_used_percent
         self.system_disk_path = system_disk_path
 
     def snapshot(self) -> ResourceSnapshot:
@@ -192,6 +223,12 @@ class ResourceBudgetManager:
             load = None
         if type(load) not in (int, float) or not math.isfinite(load) or load < 0:
             load = None
+        try:
+            swap = self._swap_used_percent()
+        except (OSError, ValueError, TypeError):
+            swap = None
+        if type(swap) is not int or not 0 <= swap <= 100:
+            swap = None
         warnings = []
         if percent >= self.settings.critical_disk_percent or free < self.settings.min_free_disk_bytes:
             warnings.append("CRITICAL_DISK")
@@ -222,7 +259,7 @@ class ResourceBudgetManager:
                  "CRITICAL_SYSTEM_DISK" in warnings or "CRITICAL_LOAD" in warnings else
                  "DEGRADED" if warnings else "OK")
         return ResourceSnapshot(total, free, percent, memory, state, tuple(warnings),
-                                system_total, system_free, system_percent, load)
+                                system_total, system_free, system_percent, load, swap)
 
     def admit(self, kind: WorkKind, *, active: int) -> ResourceSnapshot:
         if not isinstance(kind, WorkKind) or type(active) is not int or active < 0:

@@ -278,7 +278,7 @@ class AuthContextManager:
 
     def _mark_verified_in_transaction(self, connection: sqlite3.Connection, context: AuthContext,
                                       session_id: str, verified_at: datetime) -> None:
-        """Called only by the browser manager after a matching verifier result."""
+        """Called by the browser manager after automatic or explicit operator verification."""
         validate_entity_id(session_id, "BSESSION")
         updated = connection.execute("""UPDATE auth_contexts
             SET status='VALID',browser_session_ref=?,updated_at=?

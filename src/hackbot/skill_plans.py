@@ -131,9 +131,12 @@ class SkillContextBuilder:
 
     def build(self, hypothesis: Hypothesis, profile: TargetProfile | None,
               package: TargetPackage | None = None,
-              skill: SkillMetadata | None = None) -> SkillContext:
+              skill: SkillMetadata | None = None,
+              traffic_exchange_ids: tuple[str, ...] = ()) -> SkillContext:
         if profile is not None and profile.target_id != hypothesis.target_id:
             raise ValueError("profile target mismatch")
+        if package is not None and package.target.id != hypothesis.target_id:
+            raise ValueError("package target mismatch")
         signals = tuple(_safe(item.code) for item in (profile.signals if profile else ())
                         if item.surface_key == hypothesis.surface_key)[:8]
         evidence = []
@@ -162,7 +165,14 @@ class SkillContextBuilder:
                                                       hypothesis.surface_key, limit=12)
                         if hypothesis.surface_key.startswith(("GQL-", "OPERATION-")) else
                         self.traffic.find_recent(hypothesis.target_id, limit=12))
-        for exchange in traffic_page.items:
+        exact = tuple(self.traffic.get_exchange(ref) for ref in traffic_exchange_ids[:4])
+        seen_exchanges: set[str] = set()
+        for exchange in (*exact, *traffic_page.items):
+            if exchange is None or exchange.id in seen_exchanges or \
+                    exchange.target_id != hypothesis.target_id or \
+                    (package is not None and exchange.package_id != package.id):
+                continue
+            seen_exchanges.add(exchange.id)
             req = exchange.request
             if hypothesis.surface_key not in (req.display_path, req.origin + req.display_path,
                                               req.record.endpoint_id, req.record.operation_id):
@@ -205,8 +215,6 @@ class SkillContextBuilder:
             identities.append({"id": identity.id, "principal_id": identity.principal_id,
                                "tenants": tenants, "roles": roles, "verified_session_id": session_id})
         flags: set[str] = set()
-        if package is not None and package.target.id != hypothesis.target_id:
-            raise ValueError("package target mismatch")
         if package is not None and package.status is PackageStatus.TRACKED:
             flags.add("in_scope_target")
         if any(set(a["tenants"]).isdisjoint(b["tenants"]) and a["tenants"] and b["tenants"]

@@ -19,6 +19,7 @@ import zlib
 import requests
 
 from .auth import AuthContextManager, AuthMechanism, AuthStatus
+from .browser import BrowserError, BrowserStatus, VerificationStatus
 from .config import ExecutorSettings, RetentionSettings
 from .domain import TrafficSource, normalize_content_type
 from .evidence import EvidenceProvenance, EvidenceType, Retention, Sensitivity
@@ -27,7 +28,7 @@ from .permit_store import PermitError, PolicyPermitStore
 from .policy import PolicyEngine
 from .policy_models import ActionCategory, ActorMode, PolicyPermit, ProposedAction, new_action_id
 from .rate_limit import ExperimentBudget, RateLimiter
-from .secrets import SecretKind, SecretProvider, SecretUnavailable
+from .secrets import SecretKind, SecretProvider, SecretUnavailable, SecretValue
 from .target_loader import TargetPackageRepository
 from .target_policy import PolicyDecision
 from .traffic import CapturedRequest, CapturedResponse, ExchangeState, TrafficStore
@@ -278,6 +279,31 @@ class TrafficExecutor:
         identity = self.auth.registry.get_identity(action.target_id, action.identity_id)
         if identity is None or identity.secret_ref != context.secret_ref:
             raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+        if context.mechanism is AuthMechanism.MANUAL_LOGIN:
+            if self.browser is None or action.session_id is None:
+                raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+            try:
+                session = self.browser.session_context(action.session_id)
+                if (session.target_id != action.target_id
+                        or session.identity_id != action.identity_id
+                        or session.auth_context_id != context.id
+                        or session.browser_status is not BrowserStatus.VALID
+                        or session.verification_status is not VerificationStatus.MATCH
+                        or session.authentication_status != "VALID"
+                        or not session.browser_available or not session.proxy_capture_required):
+                    raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+                cookie_provider = getattr(self.browser.driver, "cookie_header_for", None)
+                if not callable(cookie_provider):
+                    raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+                material = cookie_provider(action.session_id, action.url)
+                if not isinstance(material, SecretValue):
+                    raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+                value = material.reveal(execution_boundary=True)
+            except (BrowserError, ValueError):
+                raise _Stop(ExecutionError.AUTH_UNAVAILABLE) from None
+            if not value or len(value) > 8192 or any(char in value for char in "\r\n\x00"):
+                raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
+            return "Cookie", value
         if context.mechanism not in {AuthMechanism.COOKIE, AuthMechanism.BEARER, AuthMechanism.HEADER}:
             raise _Stop(ExecutionError.AUTH_UNAVAILABLE)
         if not context.secret_ref:

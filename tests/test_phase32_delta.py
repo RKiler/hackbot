@@ -546,6 +546,18 @@ class Phase32DeltaTests(unittest.TestCase):
                                    "status": "WATCH_IN_PROGRESS"},))
         self.assertEqual(self.ledger.get(self.package.target.id)["status"], "RUNNING")
 
+    def test_scheduler_retries_only_resource_paused_hunts(self):
+        coordinator = DeltaCoordinator(self.runtime, recon=None)
+        scheduler = DeltaScheduler(self.runtime, coordinator)
+        with patch.object(scheduler._stop, "is_set", side_effect=[False, True]), \
+             patch.object(scheduler._stop, "wait") as wait, \
+             patch.object(scheduler, "tick") as delta_tick, \
+             patch.object(self.runtime, "retry_resource_paused_hunts") as retry:
+            scheduler._work()
+        delta_tick.assert_called_once_with()
+        retry.assert_called_once_with()
+        wait.assert_called_once_with(60)
+
     def test_interrupted_watch_recovers_without_advancing_checkpoint(self):
         self.ledger.configure(self.package, ContinuousSettings(enabled=True))
         watch_id = self.ledger.begin_watch(self.package, trigger="SCHEDULED")

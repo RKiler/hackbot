@@ -27,12 +27,15 @@ from hackbot.config import (BrowserSettings, BurpSettings, SecretBindingConfig,
 from hackbot.burp_storage import BurpStorageStatus
 from hackbot.domxss import DOMAcquisitionStatus
 from hackbot.domain import TrafficSource
+from hackbot.hunt_store import HuntMode, HuntState
 from hackbot.postmessage_static import PostMessageStaticAnalyzer
 from hackbot.resources import ResourceError
 from hackbot.research import GapType, KnowledgeGap, ResearchBudget, ResearchStatus
 from hackbot.service import BugHunterRuntime, create_app
 from hackbot.target_operator import TargetSetupError
 from hackbot.store import EvidenceFactStore, StoreSchemaError
+from hackbot.target_package import PackageStatus
+from hackbot.target_policy import AutonomyAction, PolicyDecision, RiskLevel
 from hackbot.planner_models import PlannerLimits, PlannerMode, PlannerStatus
 from hackbot.process_health import OwnedProcessStatus
 from hackbot.notification_store import DeliveryStatus, NotificationPriority, NotificationType
@@ -139,7 +142,19 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(saved.get_json()["configured"], 2)
         self.assertTrue(accounts_path.is_file())
         self.assertEqual(self.get("/v1/targets/local-pilot-fixture/accounts")["items"][0][
-            "registration"], "NOT_REGISTERED")
+            "registration"], "REGISTERED")
+        with patch.object(self.runtime.registry, "import_package_accounts",
+                          side_effect=ValueError("synthetic import failure")):
+            rejected = self.client.post("/v1/targets/local-pilot-fixture/accounts", json={"accounts": [
+                {"alias": "admin", "tenant": "company1", "role": "admin"},
+                {"alias": "member", "tenant": "company1", "role": "member"},
+                {"alias": "extra", "tenant": "company1", "role": "member"}]})
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(self.get("/v1/targets/local-pilot-fixture/accounts")["configured"], 2)
+        bad_alias = self.client.post("/v1/targets/local-pilot-fixture/accounts", json={"accounts": [
+            {"alias": "Admin1", "tenant": "company1", "role": "admin"}]})
+        self.assertEqual(bad_alias.status_code, 400)
+        self.assertEqual(bad_alias.get_json(), {"error": "invalid_field", "field": "accounts.alias"})
         imported = self.client.post("/v1/targets/local-pilot-fixture/import-identities", json={})
         self.assertEqual(imported.status_code, 201, imported.get_data(as_text=True))
         self.assertEqual(imported.get_json()["imported"], 2)
@@ -148,6 +163,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.post("/v1/targets/local-pilot-fixture/accounts", json={
             "accounts": [{"alias": "admin", "tenant": "company2", "role": "admin"}]}).status_code, 409)
         self.assertEqual(self.client.get("/v1/targets/local-pilot-fixture/accounts").status_code, 200)
+
+    def test_operator_target_creation_exposes_existing_action_policy(self):
+        options = self.get("/v1/targets/setup-options")
+        self.assertIn("create_disposable_objects", options["action_fields"])
+        self.assertIn("cross_identity_testing", options["action_fields"])
+        self.assertEqual(options["defaults"]["autonomy"]["create_disposable_objects"], "DENY")
+        payload = {
+            "name": "Local Action Fixture", "id": "local-action-fixture",
+            "primary_domain": "app.local.test", "confirmed": True,
+            "scope": {"include": ["app.local.test"], "schemes": ["https"], "ports": [443]},
+            "source": {"kind": "RESEARCHER", "reference": "synthetic fixture",
+                       "operator": "test-operator"},
+            "rules": {"automated_testing_allowed": True,
+                      "account_creation_allowed": False},
+            "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW",
+                         "bounded_active": "ALLOW", "state_changing": "ALLOW",
+                         "destructive": "DENY", "create_disposable_objects": "ALLOW",
+                         "modify_disposable_objects": "ALLOW",
+                         "delete_disposable_objects": "ALLOW",
+                         "cross_identity_testing": "ALLOW"},
+            "rate": {"requests_per_second": 1, "requests_per_minute": 30,
+                     "max_concurrency": 1, "burst": 1},
+        }
+        invalid = {**payload, "autonomy": {**payload["autonomy"],
+                                        "owned_test_objects_only": False}}
+        self.assertEqual(self.client.post("/v1/targets", json=invalid).get_json(),
+                         {"error": "invalid_field", "field": "autonomy"})
+        invalid = {**payload, "autonomy": {**payload["autonomy"],
+                                        "cross_identity_testing": "TRUE"}}
+        self.assertEqual(self.client.post("/v1/targets", json=invalid).get_json(),
+                         {"error": "invalid_field", "field": "autonomy.cross_identity_testing"})
+        created = self.client.post("/v1/targets", json=payload)
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        self.assertEqual(created.get_json()["network_requests_sent"], 0)
+        package = self.runtime.package("local-action-fixture")
+        self.assertEqual(package.autonomy.evaluate(
+            RiskLevel.STATE_CHANGING, AutonomyAction.CREATE_DISPOSABLE_OBJECT,
+            owned_test_object=True).decision, PolicyDecision.ALLOW)
+        self.assertEqual(package.autonomy.evaluate(
+            RiskLevel.SAFE_READ, AutonomyAction.CROSS_IDENTITY_TEST,
+            owned_test_object=True).decision, PolicyDecision.ALLOW)
+        self.assertEqual(package.autonomy.financial, PolicyDecision.DENY)
+        self.assertTrue(package.autonomy.owned_test_objects_only)
 
     def test_runtime_rejects_old_existing_schema_without_migration(self):
         database = self.runtime.store.db_path
@@ -788,14 +846,34 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 200, deleted.get_data(as_text=True))
         self.assertFalse((self.config.targets.root / "example").exists())
         self.assertEqual(self.client.get("/v1/targets/example").status_code, 404)
-        self.assertEqual(self.runtime.registry.target_id_for_package("example"), self.target)
+        self.assertIsNone(self.runtime.registry.target_id_for_package("example"))
         self.assertEqual(self.get("/v1/target-tombstones")["items"][0]["label"], "example (deleted)")
+        replacement = self.client.post("/v1/targets", json={
+            "name": "Replacement local fixture", "id": "example",
+            "primary_domain": "app.local.test", "confirmed": True,
+            "scope": {"include": ["app.local.test"], "schemes": ["https"], "ports": [443]},
+            "source": {"kind": "RESEARCHER", "reference": "synthetic fixture", "operator": "test"},
+            "rules": {"automated_testing_allowed": True, "account_creation_allowed": False},
+            "autonomy": {"passive": "ALLOW", "safe_read": "ALLOW", "bounded_active": "DENY",
+                         "state_changing": "DENY", "destructive": "DENY"},
+            "rate": {"requests_per_second": 1, "requests_per_minute": 30,
+                     "max_concurrency": 1, "burst": 1},
+        })
+        self.assertEqual(replacement.status_code, 201, replacement.get_data(as_text=True))
+        new_target = self.runtime.package("example").target.id
+        self.assertNotEqual(new_target, self.target)
+        self.runtime.registry.register_target(self.runtime.package("example"))
+        self.assertEqual(self.runtime.registry.target_id_for_package("example"), new_target)
         self.assertEqual(self.client.post("/v1/targets", json={"id": "example"}).status_code, 409)
+        self.assertEqual(self.get("/v1/target-tombstones")["items"][0]["target_id"], self.target)
         with self.runtime.store._connection() as db:
             self.assertIsNotNone(db.execute("SELECT 1 FROM browser_sessions WHERE session_id=?",
                                             (session_id,)).fetchone())
             self.assertIsNotNone(db.execute("SELECT 1 FROM service_events WHERE event_type='target_deleted' "
                                             "AND target_id=?", (self.target,)).fetchone())
+            self.assertEqual(db.execute("SELECT target_id FROM browser_sessions WHERE session_id=?",
+                                        (session_id,)).fetchone()[0], self.target)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_target_delete_rejects_paths_and_symlinks(self):
         with self.assertRaises(TargetSetupError):
@@ -812,6 +890,16 @@ class ServiceTests(unittest.TestCase):
             self.runtime.target_operator.delete("example")
         self.assertTrue((self.config.targets.root / "example" / "target.yaml").is_file())
 
+    def test_target_delete_failure_keeps_package_id_registered(self):
+        package = self.runtime.package("example")
+        with patch.object(self.runtime.target_operator, "delete", side_effect=OSError("fixture failure")):
+            response = self.client.delete("/v1/targets/example",
+                                          json={"confirm_package_id": "example"})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(self.runtime.registry.target_id_for_package("example"), package.target.id)
+        self.assertTrue((self.config.targets.root / "example" / "target.yaml").is_file())
+        self.assertEqual(self.client.post("/v1/targets", json={"id": "example"}).status_code, 409)
+
     def test_active_campaign_blocks_session_cleanup_and_target_delete(self):
         package = self.runtime.package("example")
         self.runtime.registry.register_target(package)
@@ -827,6 +915,176 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.client.delete("/v1/targets/example",
                                             json={"confirm_package_id": "example"}).status_code, 409)
         self.assertTrue((self.config.targets.root / "example" / "target.yaml").is_file())
+
+    def test_hunt_status_is_read_only_and_target_scoped(self):
+        self.assertEqual(self.get("/v1/targets/example/hunt"),
+                         {"hunt": None, "needs_you": [], "mapping": [], "events": []})
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package)
+        status = self.get("/v1/targets/example/hunt")
+        self.assertEqual(status["hunt"]["id"], run.id)
+        self.assertEqual(status["hunt"]["state"], "PREPARING")
+        self.assertEqual(status["needs_you"], [])
+        self.assertEqual(status["findings"], [])
+        self.assertEqual(len(status["events"]), 1)
+        conflict = self.client.post("/v1/targets/example/hunt", json={})
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.get_json()["hunt"]["id"], run.id)
+
+    def test_hunt_status_exposes_bounded_campaign_progress(self):
+        package = self.runtime.package("example")
+        run = self.runtime.hunt_supervisor.start(package, mode=HuntMode.PLAN_ONLY)
+        run = self.runtime.hunt_supervisor.handoff_ready(package, run.id)
+        status = self.get("/v1/targets/example/hunt")
+        self.assertEqual(status["hunt"]["campaign_id"], run.campaign_id)
+        progress = status["investigation"]
+        self.assertEqual(progress["status"], "CREATED")
+        self.assertEqual(progress["cycle"], 0)
+        self.assertEqual(progress["experiments"], 0)
+        self.assertEqual(progress["findings"], 0)
+        self.assertEqual(progress["requests_used"], 0)
+        self.assertEqual(progress["resource"]["state"], "OK")
+        self.assertEqual(status["findings"], [])
+
+    def test_start_hunt_creates_one_run_and_dispatches_async(self):
+        path = "/v1/targets/example/hunt"
+        with patch.object(self.runtime, "launch_hunt_preparation") as launch, \
+             patch.object(self.runtime.executor, "execute",
+                          side_effect=AssertionError("target traffic sent")):
+            started = self.client.post(path, json={})
+            self.assertEqual(started.status_code, 202, started.get_data(as_text=True))
+            hunt = started.get_json()["hunt"]
+            self.assertEqual(hunt["mode"], "SUPERVISED")
+            self.assertEqual(hunt["state"], "PREPARING")
+            launch.assert_called_once_with("example", hunt["id"])
+            self.assertEqual(self.get(path)["hunt"]["id"], hunt["id"])
+            duplicate = self.client.post(path, json={})
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(duplicate.get_json()["hunt"]["id"], hunt["id"])
+            self.assertEqual(self.runtime.hunts.current(self.target).id, hunt["id"])
+            launch.assert_called_once()
+
+    def test_start_hunt_rejects_bad_mode_and_pauses_on_capacity(self):
+        path = "/v1/targets/example/hunt"
+        self.assertEqual(self.client.post(path, json={"mode": "UNKNOWN"}).get_json(),
+                         {"error": "invalid_hunt_mode"})
+        self.assertEqual(self.client.post(path, json={"mode": "SUPERVISED",
+                                                        "unexpected": True}).status_code, 400)
+        with patch.object(self.runtime, "launch_hunt_preparation",
+                          side_effect=ResourceError("CONCURRENCY_LIMIT")):
+            started = self.client.post(path, json={"mode": "PLAN_ONLY"})
+        self.assertEqual(started.status_code, 202, started.get_data(as_text=True))
+        self.assertEqual(started.get_json()["hunt"]["state"], "PAUSED_RESOURCE_PRESSURE")
+        self.assertEqual(started.get_json()["hunt"]["reason_code"],
+                         "PREPARATION_CAPACITY_UNAVAILABLE")
+        self.assertEqual(self.get(path)["hunt"]["state"], "PAUSED_RESOURCE_PRESSURE")
+
+    def test_start_hunt_records_dispatch_failure_without_retrying(self):
+        path = "/v1/targets/example/hunt"
+        with patch.object(self.runtime, "launch_hunt_preparation",
+                          side_effect=RuntimeError("synthetic thread-start failure")) as launch:
+            started = self.client.post(path, json={})
+        self.assertEqual(started.status_code, 202)
+        self.assertEqual(started.get_json()["hunt"]["state"], "WAITING_HUMAN")
+        self.assertEqual(started.get_json()["hunt"]["reason_code"],
+                         "PREPARATION_DISPATCH_REVIEW_REQUIRED")
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(len(self.get(path)["events"]), 2)
+
+    def test_start_hunt_requires_tracked_target_and_program_automation(self):
+        package = self.runtime.package("example")
+        disabled = replace(package, rules=replace(package.rules,
+                                                  automated_testing_allowed=False))
+        with patch.object(self.runtime, "package", return_value=disabled), \
+             patch.object(self.runtime, "launch_hunt_preparation") as launch:
+            denied = self.client.post("/v1/targets/example/hunt", json={})
+            self.assertEqual(denied.status_code, 409)
+            self.assertEqual(denied.get_json()["reason_code"],
+                             "PROGRAM_AUTOMATION_DISABLED")
+            launch.assert_not_called()
+        untracked = replace(package, status=PackageStatus.ARCHIVED)
+        with patch.object(self.runtime, "package", return_value=untracked):
+            denied = self.client.post("/v1/targets/example/hunt", json={})
+            self.assertEqual(denied.status_code, 409)
+            self.assertEqual(denied.get_json()["reason_code"], "TARGET_NOT_TRACKED")
+        self.assertIsNone(self.runtime.hunts.current(self.target))
+
+    def test_preparation_worker_does_not_drop_a_second_wakeup(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package)
+        entered, release = Event(), Event()
+        calls = []
+
+        def step(_package, _hunt_id):
+            calls.append(_hunt_id)
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return run
+
+        with patch.object(self.runtime.hunt_supervisor, "advance", side_effect=step):
+            self.runtime.launch_hunt_preparation(package.id, run.id)
+            self.assertTrue(entered.wait(3))
+            worker = self.runtime._hunt_threads[run.id]
+            self.runtime.launch_hunt_preparation(package.id, run.id)
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(calls, [run.id, run.id])
+        self.assertNotIn(run.id, self.runtime._hunt_threads)
+
+    def test_preparation_worker_hands_plan_only_hunt_to_one_campaign(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package, mode=HuntMode.PLAN_ONLY)
+        self.runtime.hunts.transition(run.target_id, run.id, HuntState.READY,
+                                      "PASSIVE_PREPARATION_READY")
+        launched = []
+        with patch.object(self.runtime, "launch_campaign",
+                          side_effect=lambda _package, campaign_id: launched.append(campaign_id)), \
+             patch.object(self.runtime.executor, "execute",
+                          side_effect=AssertionError("target traffic sent")):
+            self.runtime._hunt_prepare_work(package.id, run.id)
+        current = self.runtime.hunts.get(run.target_id, run.id)
+        self.assertEqual(current.state, HuntState.HUNTING)
+        self.assertEqual(launched, [current.campaign_id])
+        self.assertEqual(self.runtime.campaign.store.get(run.target_id,
+                                                         current.campaign_id).mode,
+                         PlannerMode.PLAN_ONLY)
+
+    def test_campaign_dispatch_failure_does_not_leave_unowned_hunting_state(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package, mode=HuntMode.PLAN_ONLY)
+        self.runtime.hunts.transition(run.target_id, run.id, HuntState.READY,
+                                      "PASSIVE_PREPARATION_READY")
+        with patch.object(self.runtime, "launch_campaign",
+                          side_effect=RuntimeError("synthetic dispatch failure")), \
+             patch.object(self.runtime.executor, "execute",
+                          side_effect=AssertionError("target traffic sent")):
+            self.runtime._hunt_prepare_work(package.id, run.id)
+        current = self.runtime.hunts.get(run.target_id, run.id)
+        self.assertEqual(current.state, HuntState.WAITING_HUMAN)
+        self.assertEqual(current.reason_code, "CAMPAIGN_DISPATCH_REVIEW_REQUIRED")
+        self.assertIsNotNone(current.campaign_id)
+
+    def test_active_hunt_blocks_target_delete_and_runtime_cleanup(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        hunt = self.runtime.hunts.create(package)
+        preview = self.get("/v1/targets/example/delete-preview")
+        self.assertEqual(preview["dependencies"]["active_hunts"], 1)
+        self.assertFalse(preview["can_delete"])
+        self.assertEqual(self.client.post("/v1/targets/example/clean-runtime",
+                                          json={}).status_code, 409)
+        self.assertEqual(self.client.delete("/v1/targets/example",
+                                            json={"confirm_package_id": "example"}).status_code, 409)
+        self.runtime.hunts.transition(hunt.target_id, hunt.id, HuntState.FAILED,
+                                      "SYNTHETIC_TEST_SETTLED")
+        self.assertEqual(self.get("/v1/targets/example/delete-preview")[
+            "dependencies"]["active_hunts"], 0)
 
     def test_account_remove_blocks_session_and_preserves_identity(self):
         self.runtime.registry.register_target(self.runtime.package("example"))
@@ -1469,6 +1727,139 @@ class ServiceTests(unittest.TestCase):
         self.driver.running.clear()
         restarted = BugHunterRuntime(self.config, driver=FakeDriver(), vnc_ready=lambda: False)
         self.assertEqual(restarted.browser.get(session_id).status.value, "REAUTH_REQUIRED")
+
+    def test_operator_confirmed_identity_requires_exact_alias_and_completed_login(self):
+        self.client.post("/v1/targets/example/import-identities", json={})
+        identity = next(item["identity"] for item in self.get(
+            "/v1/targets/example/identities")["items"]
+                        if item["identity"]["alias"] == "org1_member")
+        self.client.post(f"/v1/identities/{identity['id']}/prepare-auth",
+                         json={"target": "example", "mechanism": "MANUAL_LOGIN"})
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity["id"]})
+        session_id = created.get_json()["id"]
+        route = f"/v1/browser/sessions/{session_id}/confirm-identity?target=example"
+        self.assertEqual(self.client.post(route, json={
+            "confirm_alias": "org1_member"}).status_code, 400)
+        self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example", json={})
+        self.client.post(f"/v1/browser/sessions/{session_id}/login-complete?target=example", json={})
+        self.assertTrue(self.get(f"/v1/browser/sessions/{session_id}?target=example")[
+            "vnc_available"])
+        self.assertEqual(self.client.post(route, json={
+            "confirm_alias": "org2_admin"}).status_code, 400)
+        confirmed = self.client.post(route, json={"confirm_alias": "org1_member"})
+        self.assertEqual(confirmed.status_code, 200, confirmed.get_data(as_text=True))
+        self.assertEqual(confirmed.get_json()["status"], "VALID")
+        self.assertEqual(confirmed.get_json()["verification_method"], "OPERATOR_CONFIRMED")
+        self.assertEqual(self.get(f"/v1/browser/sessions/{session_id}?target=example")[
+            "verification_method"], "OPERATOR_CONFIRMED")
+
+    def test_operator_confirmation_wakes_waiting_hunt(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package)
+        self.runtime.hunts.transition(run.target_id, run.id, HuntState.LOGIN_REQUIRED,
+                                      "ACCOUNT_LOGIN_REQUIRED")
+        self.client.post("/v1/targets/example/import-identities", json={})
+        identity = next(item["identity"] for item in self.get(
+            "/v1/targets/example/identities")["items"]
+                        if item["identity"]["alias"] == "org1_member")
+        self.client.post(f"/v1/identities/{identity['id']}/prepare-auth",
+                         json={"target": "example", "mechanism": "MANUAL_LOGIN"})
+        created = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity["id"]})
+        session_id = created.get_json()["id"]
+        self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example", json={})
+        with patch.object(self.runtime, "launch_hunt_preparation") as launch:
+            completed = self.client.post(
+                f"/v1/browser/sessions/{session_id}/login-complete?target=example", json={})
+            self.assertEqual(completed.get_json()["status"], "NEEDS_MANUAL_REVIEW")
+            waiting = self.get("/v1/targets/example/hunt")
+            self.assertEqual(waiting["hunt"]["state"], "WAITING_HUMAN")
+            self.assertTrue(any(item["kind"] == "CONFIRM_IDENTITY" and
+                                item["alias"] == "org1_member"
+                                for item in waiting["needs_you"]))
+            self.assertFalse(launch.called)
+            confirmed = self.client.post(
+                f"/v1/browser/sessions/{session_id}/confirm-identity?target=example",
+                json={"confirm_alias": "org1_member"})
+            self.assertEqual(confirmed.get_json()["status"], "VALID")
+            self.assertEqual(self.get("/v1/targets/example/hunt")["hunt"]["state"],
+                             "PREPARING")
+            launch.assert_called_once_with("example", run.id)
+
+    def test_one_step_login_handoff_resumes_hunt_with_operator_provenance(self):
+        package = self.runtime.package("example")
+        self.runtime.registry.register_target(package)
+        run = self.runtime.hunts.create(package)
+        self.runtime.hunts.transition(run.target_id, run.id, HuntState.LOGIN_REQUIRED,
+                                      "ACCOUNT_LOGIN_REQUIRED")
+        self.client.post("/v1/targets/example/import-identities", json={})
+        identity = next(item["identity"] for item in self.get(
+            "/v1/targets/example/identities")["items"]
+                        if item["identity"]["alias"] == "org1_member")
+        self.client.post(f"/v1/identities/{identity['id']}/prepare-auth",
+                         json={"target": "example", "mechanism": "MANUAL_LOGIN"})
+        session_id = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity["id"]}).get_json()["id"]
+        self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example", json={})
+        route = f"/v1/browser/sessions/{session_id}/login-complete?target=example"
+        self.assertEqual(self.client.post(route, json={
+            "confirm_alias": "org2_admin"}).status_code, 400)
+        self.assertEqual(self.runtime.browser.get(session_id).status.value, "WAITING_LOGIN")
+        with patch.object(self.runtime, "launch_hunt_preparation") as launch:
+            completed = self.client.post(route, json={"confirm_alias": "org1_member"})
+            self.assertEqual(completed.status_code, 200, completed.get_data(as_text=True))
+            self.assertEqual(completed.get_json()["status"], "VALID")
+            self.assertEqual(completed.get_json()["verification_method"],
+                             "OPERATOR_CONFIRMED")
+            self.assertEqual(self.get("/v1/targets/example/hunt")["hunt"]["state"],
+                             "PREPARING")
+            launch.assert_called_once_with("example", run.id)
+
+    def test_one_step_login_handoff_rejects_partial_identity_conflict(self):
+        self.client.post("/v1/targets/example/import-identities", json={})
+        identity = next(item["identity"] for item in self.get(
+            "/v1/targets/example/identities")["items"]
+                        if item["identity"]["alias"] == "org1_member")
+        self.client.post(f"/v1/identities/{identity['id']}/prepare-auth",
+                         json={"target": "example", "mechanism": "MANUAL_LOGIN"})
+        session_id = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity["id"]}).get_json()["id"]
+        self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example", json={})
+        rule = {"org1_member": {"expected_user_id": "owned-user",
+                                "user_id_selector": "[data-user]",
+                                "expected_tenant_id": "org1",
+                                "tenant_selector": "[data-tenant]"}}
+        (self.config.targets.root / "example/verification.json").write_text(json.dumps(rule))
+        self.driver.observation = IdentityObservation(user_id="wrong-user")
+        completed = self.client.post(
+            f"/v1/browser/sessions/{session_id}/login-complete?target=example",
+            json={"confirm_alias": "org1_member"})
+        self.assertEqual(completed.status_code, 200, completed.get_data(as_text=True))
+        self.assertEqual(completed.get_json()["status"], "REAUTH_REQUIRED")
+        self.assertIsNone(completed.get_json()["verification_method"])
+
+    def test_one_step_login_handoff_keeps_automatic_verification_provenance(self):
+        self.client.post("/v1/targets/example/import-identities", json={})
+        identity = next(item["identity"] for item in self.get(
+            "/v1/targets/example/identities")["items"]
+                        if item["identity"]["alias"] == "org1_member")
+        self.client.post(f"/v1/identities/{identity['id']}/prepare-auth",
+                         json={"target": "example", "mechanism": "MANUAL_LOGIN"})
+        session_id = self.client.post("/v1/browser/sessions", json={
+            "target": "example", "identity_id": identity["id"]}).get_json()["id"]
+        self.client.post(f"/v1/browser/sessions/{session_id}/start?target=example", json={})
+        rule = {"org1_member": {"expected_user_id": "owned-user",
+                                "user_id_selector": "[data-user]"}}
+        (self.config.targets.root / "example/verification.json").write_text(json.dumps(rule))
+        self.driver.observation = IdentityObservation(user_id="owned-user")
+        completed = self.client.post(
+            f"/v1/browser/sessions/{session_id}/login-complete?target=example",
+            json={"confirm_alias": "org1_member"})
+        self.assertEqual(completed.status_code, 200, completed.get_data(as_text=True))
+        self.assertEqual(completed.get_json()["status"], "VALID")
+        self.assertEqual(completed.get_json()["verification_method"], "AUTOMATIC")
 
     def test_traffic_is_empty_and_filters_reject_invalid_input(self):
         self.assertEqual(self.get("/v1/traffic?target=example")["items"], [])

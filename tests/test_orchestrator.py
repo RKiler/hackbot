@@ -20,9 +20,10 @@ from hackbot.config import SecretBindingConfig, SecretSettings
 from hackbot.identity import IdentityStatus
 from hackbot.secrets import RoutedSecretProvider
 from hackbot.policy_models import ApprovalStatus
+from hackbot.rate_limit import RateLimiter
 from hackbot.skill_plans import PrerequisiteChecker, SkillContext
 from hackbot.skills import SkillRegistry
-from hackbot.target_policy import PolicyDecision
+from hackbot.target_policy import PolicyDecision, RatePolicy
 from hackbot.target_scope import HostRule
 from hackbot.executor import RequestTemplate
 from hackbot.hypotheses import HypothesisStore
@@ -194,6 +195,30 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(db.execute("SELECT 1 FROM evidence WHERE evidence_id=?",
                                              (steps[1]["result"]["evidence_ids"][-1],)).fetchone())
         self.assertNotIn(executor_fixture.SECRET.encode(), fx.store.db_path.read_bytes())
+
+    def test_active_plan_waits_for_target_rate_slot_before_next_step(self):
+        fx = self.fixture
+        fx.package = replace(fx.package, rate=RatePolicy(
+            requests_per_second=1, requests_per_minute=30,
+            max_concurrency=1, burst=1))
+        fx.targets.package = fx.package
+        clock = [0.0]
+        limiter = RateLimiter(clock=lambda: clock[0])
+        fx.policy.rate = limiter
+        fx.executor.rate = limiter
+        plan_id = self.plan([self.action(), self.action()])
+        run_id = self.start(plan_id)
+
+        def advance_clock(seconds: float) -> None:
+            clock[0] += seconds
+
+        with patch("hackbot.orchestrator.time.sleep", side_effect=advance_clock) as sleep:
+            for _ in range(3):
+                result = self.advance(run_id)
+        self.assertEqual(result["run"]["status"], "COMPLETED")
+        self.assertEqual(result["run"]["requests_consumed"], 2)
+        self.assertTrue(sleep.called)
+        self.assertGreaterEqual(clock[0], 1.0)
 
     def test_three_identity_two_tenant_control_and_boundary_fixture(self):
         fx = self.fixture

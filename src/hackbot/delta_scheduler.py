@@ -70,4 +70,8 @@ class DeltaScheduler:
                 self.tick()
             except Exception:
                 self.runtime.logger.error("delta_scheduler_tick_failed")
+            try:
+                self.runtime.retry_resource_paused_hunts()
+            except Exception:
+                self.runtime.logger.error("hunt_resource_retry_failed")
             self._stop.wait(60)

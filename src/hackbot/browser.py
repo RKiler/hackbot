@@ -22,7 +22,7 @@ from .identity_registry import IdentityRegistry
 from .recon import Page
 from .secrets import SecretValue
 from .target_package import PackageStatus, TargetPackage
-from .target_scope import ScopeResult
+from .target_scope import ProgramScope, ScopeResult
 
 
 class BrowserError(ValueError):
@@ -59,6 +59,7 @@ class BrowserProxyConfig:
     reference: str | None = None
     capture_required: bool = False
     ca_certificate: Path | None = field(default=None, repr=False)
+    guard_scope: ProgramScope | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -83,6 +84,9 @@ class BrowserProxyConfig:
             raise BrowserError("Invalid CA reference")
         if type(self.capture_required) is not bool or (self.capture_required and not self.enabled):
             raise BrowserError("Invalid capture-required proxy configuration")
+        if self.guard_scope is not None and (not isinstance(self.guard_scope, ProgramScope)
+                                             or not self.capture_required):
+            raise BrowserError("Scoped browser guard requires captured traffic")
         if self.ca_certificate is not None and (not isinstance(self.ca_certificate, Path)
                 or not self.ca_certificate.is_absolute() or ".." in self.ca_certificate.parts
                 or not self.enabled):
@@ -204,9 +208,11 @@ class ExactSessionVerifier:
             checks.append((rule.expected_email.casefold(), observation.email.casefold() if observation.email else None))
         if rule.expected_tenant_id is not None:
             checks.append((rule.expected_tenant_id, observation.tenant_id))
+        if any(actual is not None and expected != actual for expected, actual in checks):
+            return VerificationStatus.MISMATCH
         if any(actual is None for _, actual in checks):
             return VerificationStatus.UNKNOWN
-        return VerificationStatus.MATCH if all(expected == actual for expected, actual in checks) else VerificationStatus.MISMATCH
+        return VerificationStatus.MATCH
 
 
 class BrowserDriver(Protocol):
@@ -458,6 +464,8 @@ class BrowserSessionManager:
                       package: TargetPackage | None,
                       proxy_health_check: Callable[[BrowserProxyConfig], bool] | None) -> BrowserSession:
         session = self._required(session_id)
+        if package is not None and package.target.id != session.target_id:
+            raise BrowserError("TargetPackage does not match browser session")
         if session.driver != self.driver.name:
             raise BrowserError("Browser driver does not match stored session")
         if session.status not in {BrowserStatus.CREATED, BrowserStatus.STOPPED, BrowserStatus.FAILED,
@@ -546,27 +554,7 @@ class BrowserSessionManager:
         except Exception:
             verdict = VerificationStatus.UNKNOWN
         if verdict is VerificationStatus.MATCH:
-            context = self.auth.get(session.target_id, session.identity_id)
-            if context is None or context.id != session.auth_context_id:
-                raise BrowserError("AuthContext changed during verification")
-            now = max(datetime.now(timezone.utc), session.updated_at + timedelta(microseconds=1),
-                      context.updated_at + timedelta(microseconds=1))
-            with self.registry.store._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                identity_row = connection.execute("""SELECT status FROM registry_identities
-                    WHERE target_id=? AND identity_id=?""",
-                    (session.target_id, session.identity_id)).fetchone()
-                if identity_row is None or identity_row["status"] != IdentityStatus.ACTIVE.value:
-                    raise BrowserError("Identity changed during session verification")
-                self.auth._mark_verified_in_transaction(connection, context, session.id, now)
-                updated = connection.execute("""UPDATE browser_sessions SET status='VALID',
-                    verification_status='MATCH',updated_at=?,last_verified_at=?
-                    WHERE session_id=? AND updated_at=?""",
-                    (now.isoformat(), now.isoformat(), session.id, session.updated_at.isoformat())).rowcount
-                if updated != 1:
-                    raise BrowserError("Browser session changed during verification")
-                self._event(connection, session.id, "identity_verified", now)
-            return self._required(session.id)
+            return self._complete_verification(session, "identity_verified")
         if verdict is VerificationStatus.MISMATCH:
             result = self._transition(session, BrowserStatus.REAUTH_REQUIRED,
                                       "identity_verification_failed", verdict)
@@ -577,6 +565,100 @@ class BrowserSessionManager:
             return result
         return self._transition(session, BrowserStatus.NEEDS_MANUAL_REVIEW,
                                 "identity_verification_unknown", VerificationStatus.UNKNOWN)
+
+    def _complete_verification(self, session: BrowserSession, event: str) -> BrowserSession:
+        context = self.auth.get(session.target_id, session.identity_id)
+        if context is None or context.id != session.auth_context_id:
+            raise BrowserError("AuthContext changed during verification")
+        now = max(datetime.now(timezone.utc), session.updated_at + timedelta(microseconds=1),
+                  context.updated_at + timedelta(microseconds=1))
+        with self.registry.store._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            identity_row = connection.execute("""SELECT status FROM registry_identities
+                WHERE target_id=? AND identity_id=?""",
+                (session.target_id, session.identity_id)).fetchone()
+            if identity_row is None or identity_row["status"] != IdentityStatus.ACTIVE.value:
+                raise BrowserError("Identity changed during session verification")
+            self.auth._mark_verified_in_transaction(connection, context, session.id, now)
+            updated = connection.execute("""UPDATE browser_sessions SET status='VALID',
+                verification_status='MATCH',updated_at=?,last_verified_at=?
+                WHERE session_id=? AND updated_at=?""",
+                (now.isoformat(), now.isoformat(), session.id, session.updated_at.isoformat())).rowcount
+            if updated != 1:
+                raise BrowserError("Browser session changed during verification")
+            self._event(connection, session.id, event, now)
+        return self._required(session.id)
+
+    def confirm_operator_identity(self, session_id: str, *, alias: str) -> BrowserSession:
+        """Bind an owned visible login explicitly; never override a verifier mismatch."""
+        session = self._required(session_id)
+        if (session.identity_id is None or session.status is not BrowserStatus.NEEDS_MANUAL_REVIEW
+                or session.verification_status is not VerificationStatus.UNKNOWN
+                or not self.driver.is_running(session_id)):
+            raise BrowserError("Session is not awaiting operator confirmation")
+        identity = self.registry.get_identity(session.target_id, session.identity_id)
+        if identity is None or identity.status is not IdentityStatus.ACTIVE or alias != identity.alias:
+            raise BrowserError("Confirmed alias does not match this session")
+        with self.registry.store._connection() as connection:
+            login = connection.execute("""SELECT max(event_id) FROM browser_session_events
+                WHERE session_id=? AND event_type='login_completed'""", (session_id,)).fetchone()[0]
+            started = connection.execute("""SELECT max(event_id) FROM browser_session_events
+                WHERE session_id=? AND event_type='browser_starting'""", (session_id,)).fetchone()[0]
+        if login is None or started is None or login <= started:
+            raise BrowserError("Current browser login was not completed")
+        if session.expires_at is not None and session.expires_at <= datetime.now(timezone.utc):
+            raise BrowserError("Browser session has expired")
+        return self._complete_verification(session, "identity_operator_confirmed")
+
+    def verification_method(self, session_id: str) -> str | None:
+        session = self._required(session_id)
+        if session.status is not BrowserStatus.VALID:
+            return None
+        with self.registry.store._connection() as connection:
+            row = connection.execute("""SELECT event_type FROM browser_session_events
+                WHERE session_id=? AND event_type IN
+                    ('identity_verified','identity_operator_confirmed')
+                ORDER BY event_id DESC LIMIT 1""", (session_id,)).fetchone()
+        if row is None:
+            return None
+        return ("AUTOMATIC" if row["event_type"] == "identity_verified"
+                else "OPERATOR_CONFIRMED")
+
+    def reverify_automatic(self, session_id: str,
+                           rule: IdentityVerificationRule) -> BrowserSession:
+        """Upgrade an operator binding when the current page provides a stable identity."""
+        session = self._required(session_id)
+        if (session.status is not BrowserStatus.VALID or session.identity_id is None
+                or session.target_id != rule.target_id
+                or session.identity_id != rule.identity_id
+                or not self.driver.is_running(session_id)):
+            raise BrowserError("Automatic re-verification requires a valid matching session")
+        if self.verification_method(session_id) != "OPERATOR_CONFIRMED":
+            return session
+        try:
+            verdict = self.verifier.verify(rule,
+                                           self.driver.observe_identity(session_id, rule))
+        except Exception:
+            verdict = VerificationStatus.UNKNOWN
+        if verdict is VerificationStatus.UNKNOWN:
+            return session
+        if verdict is VerificationStatus.MISMATCH:
+            result = self._transition(session, BrowserStatus.REAUTH_REQUIRED,
+                                      "identity_verification_failed", verdict)
+            context = self.auth.get(session.target_id, session.identity_id)
+            if context is not None and context.browser_session_ref == session.id:
+                self.auth.mark_reauth_required(session.target_id, session.identity_id)
+            return result
+        now = max(datetime.now(timezone.utc), session.updated_at + timedelta(microseconds=1))
+        with self.registry.store._connection() as connection:
+            updated = connection.execute("""UPDATE browser_sessions SET updated_at=?,
+                last_verified_at=? WHERE session_id=? AND updated_at=? AND status='VALID'""",
+                (now.isoformat(), now.isoformat(), session_id,
+                 session.updated_at.isoformat())).rowcount
+            if updated != 1:
+                raise BrowserError("Browser session changed during re-verification")
+            self._event(connection, session_id, "identity_verified", now)
+        return self._required(session_id)
 
     def stop(self, session_id: str) -> BrowserSession:
         session = self._required(session_id)

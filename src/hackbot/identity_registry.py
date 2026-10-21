@@ -136,20 +136,39 @@ class IdentityRegistry:
         if not isinstance(package, TargetPackage):
             raise ValueError("Target Package is required")
         with self.store._connection() as connection:
-            row = connection.execute("SELECT target_id,package_id FROM registry_targets WHERE target_id=? OR package_id=? LIMIT 2",
-                                     (package.target.id, package.id)).fetchall()
+            row = connection.execute("SELECT target_id,package_id,deleted_at FROM registry_targets WHERE target_id=?",
+                                     (package.target.id,)).fetchone()
             if row:
-                if len(row) != 1 or row[0]["target_id"] != package.target.id or row[0]["package_id"] != package.id:
+                if row["package_id"] != package.id or row["deleted_at"] is not None:
                     raise RegistryConflict("Target Package ID conflicts with registered target")
             else:
-                connection.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
-                                   (package.target.id, package.id, _now().isoformat()))
+                try:
+                    connection.execute("INSERT INTO registry_targets(target_id,package_id,registered_at) VALUES (?,?,?)",
+                                       (package.target.id, package.id, _now().isoformat()))
+                except sqlite3.IntegrityError:
+                    raise RegistryConflict("Target Package ID conflicts with registered target") from None
         return package.target
+
+    def mark_target_deleted(self, target_id: str) -> None:
+        validate_entity_id(target_id, "TARGET")
+        with self.store._connection() as connection:
+            changed = connection.execute(
+                "UPDATE registry_targets SET deleted_at=? WHERE target_id=? AND deleted_at IS NULL",
+                (_now().isoformat(), target_id),
+            )
+            if changed.rowcount != 1:
+                raise RegistryConflict("Target Package is not an active registered target")
+
+    def restore_target(self, target_id: str) -> None:
+        validate_entity_id(target_id, "TARGET")
+        with self.store._connection() as connection:
+            connection.execute("UPDATE registry_targets SET deleted_at=NULL WHERE target_id=?",
+                               (target_id,))
 
     def target_id_for_package(self, package_id: str) -> str | None:
         validate_package_id(package_id)
         with self.store._connection() as connection:
-            row = connection.execute("SELECT target_id FROM registry_targets WHERE package_id=? LIMIT 1",
+            row = connection.execute("SELECT target_id FROM registry_targets WHERE package_id=? AND deleted_at IS NULL LIMIT 1",
                                      (package_id,)).fetchone()
             return row["target_id"] if row else None
 

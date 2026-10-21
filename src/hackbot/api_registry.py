@@ -577,6 +577,29 @@ class APIOperationRegistry:
         assert result is not None
         return result
 
+    def retain_control_exchanges(self, target_id: str, operation_id: str,
+                                 exchange_ids: tuple[str, ...]) -> APIOperation:
+        """Keep validated plan controls within the operation's bounded reference set."""
+        if (not exchange_ids or len(exchange_ids) > 4 or
+                any(not re.fullmatch(r"EXCHANGE-[0-9a-f]{32}", ref)
+                    for ref in exchange_ids)):
+            raise ValueError("Invalid API control references")
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state,exchange_ids_json FROM api_operations WHERE "
+                             "target_id=? AND operation_id=?",
+                             (target_id, operation_id)).fetchone()
+            if row is None or row["state"] != "CURRENT":
+                raise ValueError("API operation is unavailable or stale")
+            refs = tuple(dict.fromkeys((*exchange_ids,
+                                        *json.loads(row["exchange_ids_json"]))))[:16]
+            db.execute("UPDATE api_operations SET exchange_ids_json=? WHERE "
+                       "target_id=? AND operation_id=?",
+                       (json.dumps(refs), target_id, operation_id))
+        result = self.get_operation(target_id, operation_id)
+        assert result is not None
+        return result
+
     def counts(self, target_id: str) -> dict[str, int]:
         with self.store._connection() as db:
             operations = db.execute("SELECT state,count(*) AS n FROM api_operations WHERE target_id=? "

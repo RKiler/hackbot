@@ -73,6 +73,11 @@ def run_browser_campaign(package_template: Path, work_root: Path, *,
                 executor=ExecutorSettings(allow_direct=True, max_redirects=0,
                                           max_response_bytes=8192))
             runtime = BugHunterRuntime(settings, vnc_ready=lambda: False)
+            # Keep synthetic scoring independent of the host's ambient swap/load.
+            # Resource-pressure admission is exercised by its dedicated tests.
+            runtime.resources._memory_available = lambda: 4 * 1024 ** 3
+            runtime.resources._load_per_cpu = lambda: 0.0
+            runtime.resources._swap_used_percent = lambda: 0
             package = runtime.package("benchmark")
             if (package.scope.evaluate_url(fixture.base_url + "/").result is not
                     ScopeResult.IN_SCOPE or

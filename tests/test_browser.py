@@ -122,6 +122,89 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.auth.get(self.target, identity.id).status, AuthStatus.REAUTH_REQUIRED)
         self.assertEqual(self.manager.restart(session.id).status, BrowserStatus.WAITING_LOGIN)
 
+    def test_partial_identity_conflict_is_mismatch_not_unknown(self):
+        identity, _ = self.manual("partial_signal")
+        rule = self.rule(identity)
+        verifier = ExactSessionVerifier()
+        self.assertEqual(verifier.verify(rule, IdentityObservation(
+            user_id="other-user")), VerificationStatus.MISMATCH)
+        self.assertEqual(verifier.verify(rule, IdentityObservation(
+            tenant_id="other-tenant")), VerificationStatus.MISMATCH)
+        self.assertEqual(verifier.verify(rule, IdentityObservation(
+            user_id="user-a")), VerificationStatus.UNKNOWN)
+
+        session = self.manager.create(self.target, identity.id)
+        self.manager.start(session.id)
+        self.manager.login_complete(session.id)
+        self.driver.observations[session.id] = IdentityObservation(user_id="other-user")
+        self.assertEqual(self.manager.verify(session.id, rule).status,
+                         BrowserStatus.REAUTH_REQUIRED)
+        with self.assertRaises(BrowserError):
+            self.manager.confirm_operator_identity(session.id, alias="partial_signal")
+
+    def test_operator_confirmation_has_distinct_provenance_and_cannot_override_mismatch(self):
+        identity, _ = self.manual("owned_admin")
+        session = self.manager.create(self.target, identity.id)
+        self.manager.start(session.id)
+        self.manager.login_complete(session.id)
+        self.manager.verify(session.id, None)
+        with self.assertRaises(BrowserError):
+            self.manager.confirm_operator_identity(session.id, alias="another_account")
+        confirmed = self.manager.confirm_operator_identity(session.id, alias="owned_admin")
+        self.assertEqual(confirmed.status, BrowserStatus.VALID)
+        self.assertEqual(self.manager.verification_method(session.id), "OPERATOR_CONFIRMED")
+        self.assertEqual(self.manager.get_active_session(self.target, identity.id).id, session.id)
+
+        self.manager.stop(session.id)
+        self.assertIsNone(self.manager.verification_method(session.id))
+        self.manager.restart(session.id)
+        with self.assertRaises(BrowserError):
+            self.manager.confirm_operator_identity(session.id, alias="owned_admin")
+        self.manager.login_complete(session.id)
+        self.driver.observations[session.id] = IdentityObservation(user_id="wrong",
+                                                                   tenant_id="tenant-a")
+        mismatch = self.manager.verify(session.id, self.rule(identity))
+        self.assertEqual(mismatch.status, BrowserStatus.REAUTH_REQUIRED)
+        with self.assertRaises(BrowserError):
+            self.manager.confirm_operator_identity(session.id, alias="owned_admin")
+        self.assertIsNone(self.manager.get_active_session(self.target, identity.id))
+
+    def test_automatic_verification_method_is_not_operator_confirmed(self):
+        identity, _ = self.manual("auto_admin")
+        session = self.manager.create(self.target, identity.id)
+        self.manager.start(session.id)
+        self.manager.login_complete(session.id)
+        self.driver.observations[session.id] = IdentityObservation(user_id="user-a",
+                                                                   tenant_id="tenant-a")
+        self.manager.verify(session.id, self.rule(identity))
+        self.assertEqual(self.manager.verification_method(session.id), "AUTOMATIC")
+
+    def test_operator_binding_upgrades_or_fails_closed_on_later_identity_signal(self):
+        identity, _ = self.manual("later_signal")
+        session = self.manager.create(self.target, identity.id)
+        self.manager.start(session.id)
+        self.manager.login_complete(session.id)
+        self.manager.verify(session.id, None)
+        self.manager.confirm_operator_identity(session.id, alias="later_signal")
+        self.assertEqual(self.manager.reverify_automatic(session.id, self.rule(identity)).status,
+                         BrowserStatus.VALID)
+        self.assertEqual(self.manager.verification_method(session.id), "OPERATOR_CONFIRMED")
+        self.driver.observations[session.id] = IdentityObservation(user_id="user-a",
+                                                                   tenant_id="tenant-a")
+        self.manager.reverify_automatic(session.id, self.rule(identity))
+        self.assertEqual(self.manager.verification_method(session.id), "AUTOMATIC")
+
+        second = self.manager.create(self.target, identity.id)
+        self.manager.start(second.id)
+        self.manager.login_complete(second.id)
+        self.manager.verify(second.id, None)
+        self.manager.confirm_operator_identity(second.id, alias="later_signal")
+        self.driver.observations[second.id] = IdentityObservation(user_id="other-user",
+                                                                  tenant_id="tenant-a")
+        result = self.manager.reverify_automatic(second.id, self.rule(identity))
+        self.assertEqual(result.status, BrowserStatus.REAUTH_REQUIRED)
+        self.assertIsNone(self.manager.get_active_session(self.target, identity.id))
+
     def test_wrong_identity_and_wrong_tenant_are_rejected(self):
         for alias, observation in (
             ("wrong_user", IdentityObservation(user_id="user-b", tenant_id="tenant-a")),
@@ -378,7 +461,7 @@ class BrowserTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=3")
         self.store.initialize(allow_existing_migration=True)
         with sqlite3.connect(self.store.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 51)
         self.assertEqual(self.auth.get(self.target, identity.id).id, context.id)
 
     def test_playwright_import_adapter_rejects_foreign_or_malformed_before_cookies(self):

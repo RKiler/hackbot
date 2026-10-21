@@ -29,7 +29,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_target_package.py", "test_policy.py", "test_skills.py",
         "test_domxss_maps.py", "test_domxss_static.py", "test_postmessage_static.py",
         "test_exposure_static.py", "test_research_sources.py", "test_test_matrix.py",
-        "test_resources.py", "test_db_maintenance.py", "test_process_health.py",
+        "test_resources.py", "test_adaptive_hunt.py", "test_db_maintenance.py", "test_process_health.py",
         "test_systemd_unit.py", "test_burp_storage.py", "test_notification_recovery.py",
         "test_benchmark_advice.py", "test_benchmark_authorization.py",
         "test_benchmark_acceptance.py",
@@ -41,6 +41,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_benchmark_local.py",
         "test_benchmark_cli.py",
         "test_benchmark_compare.py",
+        "test_recipe_learning.py", "test_synthetic_saas.py",
     ),
     "store-migrations": (
         "test_store.py", "test_backup.py", "test_retention.py", "test_maintenance.py",
@@ -50,9 +51,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_recon.py", "test_target_recon_resolver.py", "test_object_factory.py", "test_phase12.py",
         "test_profile_retention.py", "test_research_retention.py",
         "test_benchmark_store.py",
+        "test_hunt_store.py", "test_identity_observation.py",
     ),
     "api-specialists": (
         "test_api_graphql.py", "test_api_runtime.py", "test_api_specialist.py",
+        "test_captured_js.py",
     ),
     "authorization-specialists": (
         "test_authorization.py", "test_authorization_mutations.py",
@@ -67,6 +70,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_phase32_delta.py",
         "test_benchmark_runner.py",
         "test_benchmark_local_runner.py",
+        "test_hunt_supervisor.py", "test_application_mapper.py",
     ),
     "execution-specialists": (
         "test_executor.py", "test_orchestrator.py", "test_typed_mutations.py",
@@ -76,10 +80,14 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "test_browser.py", "test_browser_playwright_integration.py",
         "test_domxss_playwright_fixture.py", "test_domxss_browser.py",
         "test_postmessage_browser.py",
+        "test_browser_actor.py", "test_browser_cookie_bridge.py",
+        "test_browser_navigation.py", "test_browser_proxy_guard.py",
+        "test_synthetic_capture.py",
     ),
     "service-gateway": (
         "test_service.py", "test_phase29.py", "test_burp.py",
         "test_benchmark_api.py",
+        "test_hunt_operator_local_e2e.py",
     ),
 }
 

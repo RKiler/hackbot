@@ -106,17 +106,36 @@ class DOMXSSStore:
                 raise ValueError("Retired DOM Evidence still has protected references")
 
     def _verify_exchange(self, target_id: str, exchange_id: str, digest: str,
-                         size: int) -> None:
+                         size: int, *, source: str,
+                         capture_session_id: str | None = None) -> None:
         with self.evidence._connection() as connection:
             exchange = connection.execute("""
-                SELECT e.target_id,e.source,e.state,r.status_code,r.body_hash,r.body_size
-                FROM traffic_exchanges e JOIN traffic_responses r ON r.request_id=e.request_id
+                SELECT e.target_id,e.source,e.capture_provider,e.state,e.auth_state,
+                       e.verified_identity_id,e.browser_session_id,e.scope_result,
+                       q.method,r.status_code,r.content_type,r.body_hash,r.body_size
+                FROM traffic_exchanges e
+                JOIN traffic_requests q ON q.request_id=e.request_id
+                JOIN traffic_responses r ON r.request_id=e.request_id
                 WHERE e.exchange_id=? LIMIT 1
             """, (exchange_id,)).fetchone()
-        if (exchange is None or exchange["target_id"] != target_id or exchange["source"] != "HACKBOT"
+        if (exchange is None or exchange["target_id"] != target_id
                 or exchange["state"] != "COMPLETE" or exchange["status_code"] != 200
                 or exchange["body_hash"] != digest or exchange["body_size"] != size):
             raise ValueError("Controlled retrieval evidence does not match artifact")
+        if source == "CONTROLLED_HTTP" and exchange["source"] == "HACKBOT":
+            return
+        if (source == "CAPTURED_BURP" and exchange["source"] == "BURP"
+                and exchange["capture_provider"] == "MONTOYA_V1"
+                and exchange["auth_state"] == "VERIFIED"
+                and exchange["verified_identity_id"] is not None
+                and exchange["browser_session_id"] == capture_session_id
+                and exchange["scope_result"] == "IN_SCOPE"
+                and exchange["method"] == "GET"
+                and exchange["content_type"] in {
+                    "application/javascript", "text/javascript", "application/x-javascript",
+                    "application/ecmascript", "text/ecmascript"}):
+            return
+        raise ValueError("Controlled retrieval evidence does not match artifact")
 
     @staticmethod
     def _asset(row: object) -> DOMAssetRecord:
@@ -169,15 +188,19 @@ class DOMXSSStore:
     def record_artifact(self, *, target_id: str, asset_url: str, body: bytes,
                         recon_asset_id: int | None, recon_sha256: str | None,
                         source: str, retrieval_exchange_id: str | None = None,
-                        capture_evidence_id: str | None = None) -> DOMAssetRecord:
+                        capture_evidence_id: str | None = None,
+                        capture_session_id: str | None = None) -> DOMAssetRecord:
         if not isinstance(body, bytes) or len(body) > MAX_ASSET_BYTES:
             raise ValueError("JS artifact exceeds Phase 21 size limit")
-        if source not in {"CONTROLLED_HTTP", "FIXTURE", "IMPORTED"}:
+        if source not in {"CONTROLLED_HTTP", "CAPTURED_BURP", "FIXTURE", "IMPORTED"}:
             raise ValueError("Invalid JS artifact source")
-        if source == "CONTROLLED_HTTP" and (not retrieval_exchange_id or not capture_evidence_id):
+        controlled = source in {"CONTROLLED_HTTP", "CAPTURED_BURP"}
+        if controlled and (not retrieval_exchange_id or not capture_evidence_id):
             raise ValueError("Controlled retrieval requires traffic and protected capture evidence")
-        if source != "CONTROLLED_HTTP" and (retrieval_exchange_id or capture_evidence_id):
+        if not controlled and (retrieval_exchange_id or capture_evidence_id):
             raise ValueError("Only controlled retrieval may cite a traffic exchange")
+        if (source == "CAPTURED_BURP") != (capture_session_id is not None):
+            raise ValueError("Captured Burp artifact requires its browser session")
         try:
             parsed = urlsplit(asset_url)
             valid_url = (parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -193,14 +216,15 @@ class DOMXSSStore:
         digest = hashlib.sha256(body).hexdigest()
         url_hash = hashlib.sha256(asset_url.encode()).hexdigest()
         if retrieval_exchange_id:
-            self._verify_exchange(target_id, retrieval_exchange_id, digest, len(body))
+            self._verify_exchange(target_id, retrieval_exchange_id, digest, len(body),
+                                  source=source, capture_session_id=capture_session_id)
         with self.evidence._connection() as connection:
             row = connection.execute("""
                 SELECT * FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
                   AND artifact_sha256=? LIMIT 1
             """, (target_id, url_hash, digest)).fetchone()
             retired = row is not None and self._retired(connection, row["evidence_id"])
-        if row is not None and row["state"] == "CURRENT" and source != "CONTROLLED_HTTP" and not retired:
+        if row is not None and row["state"] == "CURRENT" and not controlled and not retired:
             self.evidence.artifacts.get_bytes(digest, max_bytes=MAX_ASSET_BYTES)
             return self._asset(row)
         if retired:
@@ -228,13 +252,13 @@ class DOMXSSStore:
                 retention=Retention(retain=True, expires_at=(
                     datetime.now(timezone.utc) + timedelta(hours=self.js_retention_hours))),
             )
-        state = ("CURRENT" if recon_sha256 is None and source == "CONTROLLED_HTTP" else
+        state = ("CURRENT" if recon_sha256 is None and controlled else
                  "UNVERIFIED_CURRENT" if recon_sha256 is None else
                  "CURRENT" if recon_sha256 == digest else "RECON_HASH_DRIFT")
         now = datetime.now(timezone.utc)
         artifact_id = "DOMART-" + uuid.uuid4().hex
         with self.evidence._connection() as connection:
-            if state == "CURRENT" or source == "CONTROLLED_HTTP":
+            if state == "CURRENT" or controlled:
                 stale = connection.execute("""
                     SELECT artifact_id FROM dom_js_artifacts WHERE target_id=? AND asset_url_sha256=?
                       AND artifact_sha256<>? AND state='CURRENT'
@@ -318,7 +342,7 @@ class DOMXSSStore:
         with self.evidence._connection() as connection:
             rows = connection.execute("""SELECT * FROM dom_js_artifacts AS asset
                 WHERE target_id=? AND state='CURRENT' AND (recon_sha256=artifact_sha256
-                    OR (recon_sha256 IS NULL AND source='CONTROLLED_HTTP'))
+                    OR (recon_sha256 IS NULL AND source IN ('CONTROLLED_HTTP','CAPTURED_BURP')))
                     AND NOT EXISTS (SELECT 1 FROM evidence_payload_retirements AS retired
                                     WHERE retired.evidence_id=asset.evidence_id)""" +
                 condition + " ORDER BY retrieved_at DESC, artifact_id DESC LIMIT ?",
@@ -399,7 +423,8 @@ class DOMXSSStore:
         if retired:
             self._check_retired_owner(existing["evidence_id"], map_id=existing["map_id"])
         if retrieval_exchange_id:
-            self._verify_exchange(target_id, retrieval_exchange_id, digest, len(body))
+            self._verify_exchange(target_id, retrieval_exchange_id, digest, len(body),
+                                  source=source)
             observation = self.evidence.get_evidence(capture_evidence_id)
             if (observation is None or observation.target_ref != target_id
                     or observation.evidence_type != EvidenceType.SOURCE_MAP.value

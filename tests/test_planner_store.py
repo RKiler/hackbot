@@ -359,7 +359,7 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.assessment.potential_impact, "UNSPECIFIED")
         with sqlite3.connect(self.runtime.store.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 48)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 51)
 
     def test_candidate_assessment_is_immutable(self):
         run, (candidate,) = self.portfolio()
@@ -1413,7 +1413,9 @@ class PlannerStoreTests(unittest.TestCase):
                          90, 70, 1, "STALE", "LOW", 9, 0, 0,
                          ("MISSING_OBJECT", "STALE_TRAFFIC"), ())
         planner = self.planner()
-        with patch.object(planner, "_signals", return_value=(signal,)):
+        with patch.object(planner, "_signals", return_value=(signal,)), \
+             patch.object(planner.api, "get_candidate",
+                          return_value=SimpleNamespace(status="READY")):
             run = planner.start(self.package, mode=PlannerMode.BOUNDED_AUTONOMOUS,
                                 limits=PlannerLimits(requests=20, cleanup_reserve=2))
         tasks = self.store.tasks(run.target_id, run.id)
